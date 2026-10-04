@@ -1,0 +1,157 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="theme-color" content="#142326">
+  <meta name="description" content="线斗：56关火柴人闯关与双人联机对战。">
+  <title>线斗 · 火柴人竞技场</title>
+  <link rel="stylesheet" href="./styles.css">
+  <script type="module" src="/app.js"></script>
+</head>
+<body>
+  <!--
+    THESIS: The battle is the first viewport; navigation and the 56-stage route frame it without competing for attention.
+    OWN-WORLD: An ink-dark arena chassis, mineral-paper route sheet, warm signal orange, and four hand-drawn procedural landscapes.
+    STORY: Choose a checkpoint, step into a readable fight, or open a two-person room.
+    FIRST VIEWPORT: A dominant 16:9 battleground at left, slim fight HUD on its edge, and a vertical route/room console at right.
+    FORM: Responsive arena console, code-led within the three-file implementation boundary.
+  -->
+  <div class="app-shell">
+    <header class="masthead">
+      <div class="brand" aria-label="线斗，火柴人竞技场">
+        <span class="brand-mark" aria-hidden="true"><i></i><i></i><i></i></span>
+        <span class="brand-word">线斗<span class="brand-slash">/</span><small>STICK ARENA</small></span>
+      </div>
+
+      <nav class="mode-switch" aria-label="游戏模式">
+        <button id="campaign-button" class="mode-tab is-active" type="button" aria-pressed="true">
+          <span>闯关战役</span><small>56 STAGES</small>
+        </button>
+        <button id="duel-button" class="mode-tab" type="button" aria-pressed="false">
+          <span>联机对战</span><small>1 VS 1</small>
+        </button>
+      </nav>
+
+      <div class="masthead-tools">
+        <span id="session-status" class="session-status" role="status"><span class="status-dot" aria-hidden="true"></span>准备就绪</span>
+        <button id="sound-toggle" class="icon-button sound-button" type="button" aria-label="切换音效" aria-pressed="true" title="切换音效">
+          <svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M4 9v6h4l5 4V5L8 9H4Z"/><path d="M16 8.5a5 5 0 0 1 0 7M18.7 5.8a8.8 8.8 0 0 1 0 12.4"/></svg>
+          <span>音效</span>
+        </button>
+      </div>
+    </header>
+
+    <main class="arena-layout">
+      <section class="stage-section" aria-label="对战舞台">
+        <div class="stage-heading">
+          <div>
+            <div class="stage-eyeline"><span id="theme-label">森林 · 破晓林地</span><span class="eyeline-divider" aria-hidden="true"></span><span id="stage-label">关卡 01 / 56</span></div>
+            <h1 id="stage-title">林间试锋</h1>
+            <p id="stage-subtitle">看准出手时机，向前迈出第一步。</p>
+          </div>
+          <div class="stage-glyph" aria-hidden="true"><span class="glyph-strike"></span><span class="glyph-strike glyph-strike--two"></span><span class="glyph-ring"></span></div>
+        </div>
+
+        <div class="arena-frame">
+          <div class="frame-corner frame-corner--tl" aria-hidden="true"></div>
+          <div class="frame-corner frame-corner--tr" aria-hidden="true"></div>
+          <div class="frame-corner frame-corner--bl" aria-hidden="true"></div>
+          <div class="frame-corner frame-corner--br" aria-hidden="true"></div>
+
+          <div class="fight-hud" aria-label="对战状态">
+            <div class="fighter-status fighter-status--player">
+              <div class="fighter-status__head"><span class="fighter-status__tag">P1</span><strong id="player-name">挑战者</strong><span id="player-health-text" class="health-value">100 / 100</span></div>
+              <div class="health-track"><div id="player-health" class="health-fill" style="width:100%"></div></div>
+            </div>
+            <div class="match-timer"><span>VS</span><strong id="match-clock">—</strong></div>
+            <div class="fighter-status fighter-status--opponent">
+              <div class="fighter-status__head"><span class="fighter-status__tag">P2</span><strong id="opponent-name">守关者</strong><span id="opponent-health-text" class="health-value">100 / 100</span></div>
+              <div class="health-track"><div id="opponent-health" class="health-fill" style="width:100%"></div></div>
+            </div>
+          </div>
+
+          <canvas id="game-canvas" width="960" height="540" aria-label="火柴人对战画面">你的浏览器需要支持 Canvas 才能显示游戏画面。</canvas>
+
+          <div id="screen-overlay" class="screen-overlay">
+            <div class="overlay-content">
+              <span class="overlay-rule" aria-hidden="true"></span>
+              <span class="overlay-kicker">STICK ARENA</span>
+              <h2 id="overlay-title">准备开战</h2>
+              <p id="overlay-body">踏上56关的旅程。出招、跃起、闪避，把每一次落点都变成反击的机会。</p>
+              <div class="overlay-actions">
+                <button id="overlay-primary" class="button button--signal" type="button">开始挑战<span class="button-chevron" aria-hidden="true"></span></button>
+                <button id="overlay-secondary" class="button button--outline" type="button">查看关卡</button>
+              </div>
+            </div>
+          </div>
+          <span class="arena-corner-label" aria-hidden="true">LINE / IMPACT / REPEAT</span>
+        </div>
+
+        <div class="arena-tail">
+          <div class="checkpoint-status"><span class="checkpoint-diamond" aria-hidden="true"></span><span id="checkpoint-label">最近存档 · 第 01 关</span><span class="tail-separator" aria-hidden="true"></span><span id="progress-label">征途 01 / 56</span></div>
+          <div class="keyboard-guide" aria-label="键盘操作说明"><span><kbd>A</kbd><kbd>D</kbd> 移动</span><span><kbd>J</kbd> 攻击</span><span><kbd>K</kbd> 踢腿 / 空中跳踢</span><span><kbd>SPACE</kbd> 跳跃</span><span><kbd>SHIFT</kbd> 闪避</span></div>
+        </div>
+
+        <div class="touch-controls" aria-label="触控操作">
+          <div class="touch-movement">
+            <button class="touch-key touch-key--direction" data-key="left" type="button" aria-label="向左移动"><svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="m15 5-7 7 7 7"/></svg></button>
+            <button class="touch-key touch-key--direction" data-key="right" type="button" aria-label="向右移动"><svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="m9 5 7 7-7 7"/></svg></button>
+          </div>
+          <div class="touch-actions">
+            <button class="touch-key touch-key--dodge" data-key="dodge" type="button">闪避</button>
+            <button class="touch-key touch-key--jump" data-key="jump" type="button">跳跃</button>
+            <button class="touch-key touch-key--kick" data-key="kick" type="button" aria-label="踢腿，空中使用可释放跳踢大招">踢腿</button>
+            <button class="touch-key touch-key--attack" data-key="attack" type="button">攻击</button>
+          </div>
+          <span class="touch-tip">空中按「踢腿」释放跳踢大招</span>
+        </div>
+      </section>
+
+      <aside class="route-panel" aria-label="关卡路线与联机房间">
+        <div class="panel-header"><h2>战斗路线</h2><p>四方战场 · 五十六场试炼</p></div>
+
+        <div id="campaign-panel" class="panel-body">
+          <div class="route-intro"><span class="route-intro__number">56</span><span>从林地出发，越过城市、海洋与荒原。<br>每个存档点，都是新的起跑线。</span></div>
+          <div class="theme-route-key" aria-label="关卡主题分布"><span>01–14 森林</span><span>15–28 城市</span><span>29–42 海洋</span><span>43–56 陆地</span></div>
+          <div id="map-grid" class="map-grid" role="group" aria-label="56关关卡选择">
+            <p class="map-loading">关卡路线载入中…</p>
+          </div>
+          <div class="map-legend"><span><i class="legend-dot legend-dot--current"></i>当前</span><span><i class="legend-dot legend-dot--checkpoint"></i>存档</span><span><i class="legend-dot legend-dot--locked"></i>未解锁</span></div>
+          <p class="panel-note">失败后会回到最近激活的存档原点。闯关进度不会被联机战绩改写。</p>
+        </div>
+
+        <div id="duel-panel" class="panel-body duel-panel" hidden>
+          <h3>现在，轮到真人出招。</h3>
+          <p class="duel-lead">双方需访问同一台游戏服务的地址。创建房间并分享编号，或输入朋友的六位房间码；两人就位后即可开战。</p>
+
+          <div class="room-ticket">
+            <span>我的房间编号</span>
+            <div class="room-ticket__value"><output id="room-code" aria-live="polite">等待创建</output><button id="copy-room" class="text-action" type="button">复制</button></div>
+          </div>
+
+          <label class="input-label" for="duel-theme">选择对战场景</label>
+          <select id="duel-theme" class="theme-select">
+            <option value="forest">森林 · 破晓林地</option>
+            <option value="city" selected>城市 · 天际街区</option>
+            <option value="ocean">海洋 · 潮汐甲板</option>
+            <option value="land">陆地 · 赤色荒原</option>
+          </select>
+          <button id="create-room" class="button button--dark button--wide" type="button">创建对战房间<span class="button-chevron" aria-hidden="true"></span></button>
+          <div class="room-or"><span>或</span></div>
+          <label class="input-label" for="room-input">加入现有房间</label>
+          <div class="room-join"><input id="room-input" type="text" inputmode="numeric" maxlength="6" pattern="[0-9]*" placeholder="输入6位房间编号" autocomplete="off" spellcheck="false"><button id="join-room" class="button button--signal" type="button">加入</button></div>
+          <p id="room-message" class="room-message" role="status" aria-live="polite">房间状态将在这里显示。</p>
+          <div class="room-footer-actions"><button id="rematch" class="button button--dark" type="button" hidden>再战一局</button><button id="leave-room" class="button button--quiet" type="button" hidden>退出房间</button></div>
+          <p class="panel-note">联机对战使用独立房间，不消耗或重置闯关存档。</p>
+        </div>
+
+        <div class="panel-bottom"><span class="panel-bottom__line" aria-hidden="true"></span><span>ATTACK · KICK · JUMP · DODGE</span><span class="panel-bottom__line" aria-hidden="true"></span></div>
+      </aside>
+    </main>
+
+    <footer class="site-footer"><span>线斗 / STICK ARENA</span><span>按住方向键移动，找准时机出手。</span><span>闯关存档保存在本机</span></footer>
+    <div id="toast" class="toast" role="status" aria-live="polite" hidden></div>
+  </div>
+</body>
+</html>

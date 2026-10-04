@@ -1,0 +1,6 @@
+node_modules/
+.npm-cache/
+/pic/
+.DS_Store
+Thumbs.db
+*.log

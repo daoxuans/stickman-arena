@@ -1,0 +1,1168 @@
+import { attackOf, kickOf } from '../shared/combat.js';
+
+// All world coordinates are in a fixed 960 × 540 arena. The canvas backing
+// store is scaled for high-density screens; combat state remains unscaled.
+const W = 960;
+const H = 540;
+const TAU = Math.PI * 2;
+const HEAD_RADIUS = 22;
+const TOMATO_DROP_MS = 180;
+const TOMATO_LIFE_MS = 1080;
+const TOMATO_FALL_MS = 270;
+
+const THEMES = {
+  forest: {
+    sky: ['#234d59', '#82ada0', '#efc995'],
+    sun: '#f6d7a2',
+    ground: ['#395845', '#1f3d38'],
+    rim: '#a8be87',
+    platform: '#554b37',
+    platformTop: '#8eaa71',
+    label: 'FOREST',
+  },
+  city: {
+    sky: ['#35344f', '#76647c', '#e2a17b'],
+    sun: '#f4c3a5',
+    ground: ['#455458', '#253c43'],
+    rim: '#b8b5a3',
+    platform: '#586e76',
+    platformTop: '#b5b8ad',
+    label: 'CITY',
+  },
+  ocean: {
+    sky: ['#37728b', '#8dc0be', '#f8d3a0'],
+    sun: '#fff0c7',
+    ground: ['#876b53', '#4b4b44'],
+    rim: '#e9c18a',
+    platform: '#715948',
+    platformTop: '#d6ad78',
+    label: 'OCEAN',
+  },
+  land: {
+    sky: ['#845769', '#c98969', '#f3d2a0'],
+    sun: '#f9d39b',
+    ground: ['#9b6950', '#5f4843'],
+    rim: '#e2b881',
+    platform: '#86634e',
+    platformTop: '#cc9b6c',
+    label: 'LAND',
+  },
+};
+
+const PHOTO_THEMES = ['forest', 'city', 'ocean', 'land'];
+const PHOTO_BACKGROUNDS = Object.fromEntries(PHOTO_THEMES.map((theme) => [theme,
+  ['', '-2', '-3', '-4'].map((suffix) => `./assets/backgrounds/${theme}${suffix}.webp`),
+]));
+
+const number = (value, fallback = 0) => Number.isFinite(Number(value)) ? Number(value) : fallback;
+const clamp = (value, low, high) => Math.max(low, Math.min(high, value));
+const hash = (n) => {
+  const x = Math.sin(n * 127.1 + 78.233) * 43758.5453;
+  return x - Math.floor(x);
+};
+const PHOTO_STAGES = [];
+for (let chapter = 0; chapter < PHOTO_THEMES.length; chapter++) {
+  const previousEndsChapter = PHOTO_STAGES[chapter - 1]?.has(14) ?? false;
+  const candidates = Array.from({ length: 14 }, (_, index) => index + 1)
+    .filter((stage) => !previousEndsChapter || stage !== 1)
+    .sort((a, b) => hash(a * 19.19 + chapter * 43.7) - hash(b * 19.19 + chapter * 43.7));
+  const chosen = [];
+  for (const stage of candidates) {
+    if (chosen.length < 4 && chosen.every((previous) => Math.abs(previous - stage) > 1)) chosen.push(stage);
+  }
+  // Assign each of the chapter's four photos once. Ordering by stage keeps
+  // the mapping identical after a refresh or a checkpoint retry.
+  const backgrounds = PHOTO_BACKGROUNDS[PHOTO_THEMES[chapter]];
+  PHOTO_STAGES.push(new Map(chosen.sort((a, b) => a - b)
+    .map((stage, index) => [stage, backgrounds[index]])));
+}
+
+// A seeded draw keeps reloads and checkpoint retries visually consistent.
+// Most stages retain the illustrated scene; campaign photos always match
+// the chapter's theme. Online duels never request photos.
+export function photoForLevel(theme, level) {
+  if (!Number.isInteger(level) || level < 1 || level > 56) return null;
+  const chapter = Math.floor((level - 1) / 14);
+  if (PHOTO_THEMES[chapter] !== theme) return null;
+  const stage = (level - 1) % 14 + 1;
+  return PHOTO_STAGES[chapter].get(stage) ?? null;
+}
+
+function normalizedTheme(value) {
+  const theme = String(value || 'forest').toLowerCase();
+  if (theme.includes('city') || theme.includes('城市')) return 'city';
+  if (theme.includes('ocean') || theme.includes('sea') || theme.includes('海')) return 'ocean';
+  if (theme.includes('land') || theme.includes('desert') || theme.includes('陆')) return 'land';
+  return 'forest';
+}
+
+function polygon(ctx, points, color) {
+  if (!points.length) return;
+  ctx.beginPath();
+  ctx.moveTo(points[0][0], points[0][1]);
+  for (let i = 1; i < points.length; i++) ctx.lineTo(points[i][0], points[i][1]);
+  ctx.closePath();
+  ctx.fillStyle = color;
+  ctx.fill();
+}
+
+function ellipse(ctx, x, y, rx, ry, color, rotation = 0) {
+  ctx.beginPath();
+  ctx.ellipse(x, y, Math.max(.1, rx), Math.max(.1, ry), rotation, 0, TAU);
+  ctx.fillStyle = color;
+  ctx.fill();
+}
+
+function line(ctx, points, color, width = 1) {
+  if (points.length < 2) return;
+  ctx.beginPath();
+  ctx.moveTo(points[0][0], points[0][1]);
+  for (let i = 1; i < points.length; i++) ctx.lineTo(points[i][0], points[i][1]);
+  ctx.strokeStyle = color;
+  ctx.lineWidth = width;
+  ctx.lineCap = 'round';
+  ctx.lineJoin = 'round';
+  ctx.stroke();
+}
+
+function sky(ctx, colors) {
+  const gradient = ctx.createLinearGradient(0, 0, 0, H);
+  gradient.addColorStop(0, colors[0]);
+  gradient.addColorStop(.57, colors[1]);
+  gradient.addColorStop(1, colors[2]);
+  ctx.fillStyle = gradient;
+  ctx.fillRect(0, 0, W, H);
+}
+
+function sun(ctx, x, y, radius, color) {
+  const bloom = ctx.createRadialGradient(x, y, radius * .45, x, y, radius * 3);
+  bloom.addColorStop(0, 'rgba(255,225,174,.25)');
+  bloom.addColorStop(1, 'rgba(255,225,174,0)');
+  ctx.fillStyle = bloom;
+  ctx.fillRect(x - radius * 3, y - radius * 3, radius * 6, radius * 6);
+  ellipse(ctx, x, y, radius, radius, color);
+}
+
+function cloud(ctx, x, y, scale, color) {
+  ctx.save();
+  ctx.globalAlpha = .48;
+  ellipse(ctx, x, y, 46 * scale, 11 * scale, color);
+  ellipse(ctx, x - 25 * scale, y + 5 * scale, 38 * scale, 8 * scale, color);
+  ellipse(ctx, x + 29 * scale, y + 4 * scale, 42 * scale, 8 * scale, color);
+  ctx.restore();
+}
+
+function drawForest(ctx, tick, groundY, seed) {
+  sky(ctx, THEMES.forest.sky);
+  sun(ctx, 744, 133, 50, THEMES.forest.sun);
+  const drift = Math.sin(tick * .002) * 7;
+  cloud(ctx, 196 + drift, 83, 1.15, '#d3dad2');
+  cloud(ctx, 506 - drift * .5, 133, .58, '#d7e0d0');
+
+  polygon(ctx, [[0, 300], [125, 269], [242, 294], [356, 245], [468, 281], [593, 241], [730, 282], [845, 245], [960, 276], [960, groundY], [0, groundY]], '#71988a');
+  polygon(ctx, [[0, 332], [95, 304], [186, 325], [317, 291], [459, 332], [587, 288], [728, 328], [850, 296], [960, 319], [960, groundY], [0, groundY]], '#48776c');
+
+  ctx.save();
+  ctx.globalAlpha = .48;
+  for (let i = -1; i < 14; i++) {
+    const x = i * 83 + hash(i + seed) * 32;
+    const top = 181 + hash(i * 8 + seed) * 60;
+    const height = groundY - top;
+    polygon(ctx, [[x - 6, groundY], [x - 5, top + 42], [x, top], [x + 6, top + 40], [x + 7, groundY]], '#254c4d');
+    line(ctx, [[x, top + 95], [x - 22, top + 48]], '#254c4d', 5);
+    line(ctx, [[x, top + 74], [x + 18, top + 34]], '#254c4d', 4);
+    ellipse(ctx, x, top + 8, 35, 22, '#315d59');
+    ellipse(ctx, x - 23, top + 34, 28, 19, '#315d59');
+    ellipse(ctx, x + 26, top + 31, 30, 20, '#315d59');
+    if (height > 200) ellipse(ctx, x + 3, top + 40, 33, 17, '#315d59');
+  }
+  ctx.restore();
+
+  const mist = ctx.createLinearGradient(0, 255, 0, groundY);
+  mist.addColorStop(0, 'rgba(218,224,190,0)');
+  mist.addColorStop(.6, 'rgba(209,224,190,.13)');
+  mist.addColorStop(1, 'rgba(210,228,197,.27)');
+  ctx.fillStyle = mist;
+  ctx.fillRect(0, 255, W, groundY - 255);
+
+  for (let i = 0; i < 19; i++) {
+    const x = hash(i * 24 + seed) * W;
+    const y = 205 + hash(i * 17 + seed) * (groundY - 235);
+    const glimmer = .2 + .2 * Math.sin(tick * .04 + i * 3);
+    ellipse(ctx, x, y, 1.4, 1.4, `rgba(246,226,165,${glimmer})`);
+  }
+}
+
+function drawCity(ctx, tick, groundY, seed) {
+  sky(ctx, THEMES.city.sky);
+  sun(ctx, 752, 135, 43, THEMES.city.sun);
+  cloud(ctx, 174 + Math.sin(tick * .002) * 6, 122, .75, '#a6a0ab');
+
+  for (let layer = 0; layer < 2; layer++) {
+    const step = layer ? 72 : 50;
+    const color = layer ? '#334552' : '#586475';
+    for (let i = -1; i < Math.ceil(W / step) + 1; i++) {
+      const x = i * step + (layer ? 0 : -17);
+      const width = step - (layer ? 6 : 3);
+      const top = (layer ? 198 : 240) - hash(i * 7 + layer * 20 + seed) * (layer ? 115 : 95);
+      ctx.fillStyle = color;
+      ctx.fillRect(x, top, width, groundY - top);
+      if (layer) {
+        ctx.fillStyle = '#647580';
+        ctx.fillRect(x + 8, top - 5, Math.max(8, width - 16), 5);
+        for (let row = top + 15; row < groundY - 16; row += 18) {
+          for (let col = x + 11; col < x + width - 7; col += 16) {
+            const lit = hash(row * .37 + col * .73 + seed);
+            ctx.fillStyle = lit > .55 ? 'rgba(252,205,151,.5)' : 'rgba(158,190,188,.17)';
+            ctx.fillRect(col, row, 7, 9);
+          }
+        }
+      }
+    }
+  }
+
+  line(ctx, [[0, 254], [235, 277], [502, 248], [768, 268], [960, 250]], 'rgba(38,58,68,.75)', 2);
+  line(ctx, [[0, 263], [235, 287], [502, 259], [768, 279], [960, 261]], 'rgba(38,58,68,.5)', 1);
+  for (const x of [115, 386, 672, 908]) {
+    line(ctx, [[x, 263], [x, 226]], '#405260', 3);
+    line(ctx, [[x - 13, 226], [x + 14, 226]], '#405260', 2);
+  }
+  const haze = ctx.createLinearGradient(0, 300, 0, groundY);
+  haze.addColorStop(0, 'rgba(245,174,131,0)');
+  haze.addColorStop(1, 'rgba(247,183,139,.22)');
+  ctx.fillStyle = haze;
+  ctx.fillRect(0, 300, W, groundY - 300);
+}
+
+function drawOcean(ctx, tick, groundY, seed) {
+  sky(ctx, THEMES.ocean.sky);
+  sun(ctx, 720, 126, 51, THEMES.ocean.sun);
+  cloud(ctx, 194 + Math.sin(tick * .0018) * 8, 95, 1.03, '#eff1dc');
+  cloud(ctx, 477 - Math.sin(tick * .0015) * 5, 155, .6, '#f9eed6');
+
+  polygon(ctx, [[0, 292], [65, 288], [123, 292], [167, 284], [225, 291], [960, 291], [960, groundY], [0, groundY]], '#6d9897');
+  polygon(ctx, [[0, 296], [370, 296], [499, 283], [556, 287], [645, 296], [960, 296], [960, groundY], [0, groundY]], '#427f88');
+  const sea = ctx.createLinearGradient(0, 295, 0, groundY);
+  sea.addColorStop(0, '#539aa1');
+  sea.addColorStop(1, '#1b5a6a');
+  ctx.fillStyle = sea;
+  ctx.fillRect(0, 295, W, Math.max(0, groundY - 295));
+
+  for (let row = 0; row < 8; row++) {
+    const y = 306 + row * 16;
+    const alpha = .25 - row * .016;
+    ctx.beginPath();
+    for (let x = -10; x <= W + 10; x += 6) {
+      const waveY = y + Math.sin(x * .02 + tick * .025 + row) * (2 + row * .38);
+      if (x === -10) ctx.moveTo(x, waveY); else ctx.lineTo(x, waveY);
+    }
+    ctx.strokeStyle = `rgba(231,241,210,${alpha})`;
+    ctx.lineWidth = row % 3 === 0 ? 2 : 1;
+    ctx.stroke();
+  }
+
+  // A distant vessel and its rigging keep the ocean legible even when the
+  // foreground fight covers most of the water.
+  const shipX = 218 + hash(seed) * 42;
+  polygon(ctx, [[shipX - 57, 323], [shipX + 64, 323], [shipX + 39, 339], [shipX - 30, 338]], '#315665');
+  line(ctx, [[shipX + 3, 323], [shipX + 3, 252]], '#315665', 3);
+  polygon(ctx, [[shipX + 7, 261], [shipX + 7, 312], [shipX + 44, 313]], 'rgba(235,222,190,.75)');
+  polygon(ctx, [[shipX - 1, 270], [shipX - 1, 307], [shipX - 32, 312]], 'rgba(230,218,188,.48)');
+  for (const [x, y] of [[540, 134], [561, 143], [883, 201]]) {
+    ctx.beginPath();
+    ctx.arc(x, y, 7, Math.PI * 1.08, Math.PI * 1.83);
+    ctx.arc(x + 14, y, 7, Math.PI * 1.16, Math.PI * 1.95);
+    ctx.strokeStyle = 'rgba(35,74,83,.65)';
+    ctx.lineWidth = 2;
+    ctx.stroke();
+  }
+}
+
+function drawLand(ctx, tick, groundY, seed) {
+  sky(ctx, THEMES.land.sky);
+  sun(ctx, 722, 117, 55, THEMES.land.sun);
+  cloud(ctx, 267 + Math.sin(tick * .0012) * 7, 133, .65, '#ead0ba');
+
+  polygon(ctx, [[0, 310], [105, 299], [137, 264], [195, 264], [226, 300], [345, 301], [412, 274], [493, 274], [539, 310], [699, 300], [760, 255], [843, 255], [888, 303], [960, 297], [960, groundY], [0, groundY]], '#ad7a68');
+  polygon(ctx, [[0, 327], [70, 311], [109, 277], [133, 278], [154, 320], [301, 322], [364, 291], [385, 291], [418, 329], [601, 315], [659, 282], [682, 281], [731, 320], [960, 317], [960, groundY], [0, groundY]], '#875d59');
+  polygon(ctx, [[0, 348], [170, 330], [290, 349], [449, 325], [602, 345], [751, 322], [960, 350], [960, groundY], [0, groundY]], '#b07b61');
+
+  for (let i = 0; i < 7; i++) {
+    const x = 40 + i * 151 + hash(i + seed) * 31;
+    const y = groundY - 50 - hash(i * 5 + seed) * 22;
+    polygon(ctx, [[x - 29, groundY], [x - 20, y + 15], [x - 6, y], [x + 14, y + 8], [x + 33, groundY]], 'rgba(103,70,66,.46)');
+    line(ctx, [[x - 18, y + 28], [x + 9, y + 17]], 'rgba(241,189,136,.21)', 2);
+  }
+
+  const dust = ctx.createLinearGradient(0, 275, 0, groundY);
+  dust.addColorStop(0, 'rgba(239,186,135,0)');
+  dust.addColorStop(1, 'rgba(241,197,146,.24)');
+  ctx.fillStyle = dust;
+  ctx.fillRect(0, 275, W, groundY - 275);
+  for (let i = 0; i < 17; i++) {
+    const x = hash(i * 3 + seed) * W;
+    const y = 286 + hash(i * 9 + seed) * Math.max(15, groundY - 310);
+    ellipse(ctx, x + Math.sin(tick * .005 + i) * 4, y, 1.2, 1.2, 'rgba(255,220,170,.25)');
+  }
+}
+
+function drawPhotoBackdrop(ctx, image, theme, groundY, opacity) {
+  const colors = {
+    forest: ['rgba(8,30,27,.17)', 'rgba(8,30,27,.47)'],
+    city: ['rgba(15,27,37,.16)', 'rgba(13,29,34,.46)'],
+    ocean: ['rgba(8,35,48,.14)', 'rgba(8,39,49,.45)'],
+    land: ['rgba(15,37,31,.15)', 'rgba(13,38,31,.43)'],
+  }[theme];
+  ctx.save();
+  ctx.globalAlpha = opacity;
+  ctx.drawImage(image, 0, 0, W, H);
+  const veil = ctx.createLinearGradient(0, 0, 0, groundY);
+  veil.addColorStop(0, colors[0]);
+  veil.addColorStop(1, colors[1]);
+  ctx.fillStyle = veil;
+  ctx.fillRect(0, 0, W, groundY);
+  ctx.restore();
+}
+
+function drawGround(ctx, theme, groundY, tick, seed, photoGrassland = false) {
+  const style = THEMES[theme];
+  const gradient = ctx.createLinearGradient(0, groundY, 0, H);
+  gradient.addColorStop(0, photoGrassland ? '#53694e' : style.ground[0]);
+  gradient.addColorStop(1, photoGrassland ? '#253e39' : style.ground[1]);
+  ctx.fillStyle = gradient;
+  ctx.fillRect(0, groundY, W, H - groundY);
+  ctx.fillStyle = photoGrassland ? '#a2bb8d' : style.rim;
+  ctx.fillRect(0, groundY, W, theme === 'ocean' ? 8 : 6);
+
+  if (theme === 'forest') {
+    ctx.fillStyle = '#253f38';
+    ctx.fillRect(0, groundY + 16, W, 8);
+    for (let i = 0; i < 54; i++) {
+      const x = i * 19 + hash(i + seed) * 8;
+      const h = 3 + hash(i * 7) * 8;
+      line(ctx, [[x - 3, groundY], [x, groundY - h], [x + 2, groundY - 2]], i % 3 ? '#8fae7b' : '#bed098', 1.5);
+    }
+    for (let i = 0; i < 12; i++) {
+      const x = i * 90 + hash(i + 31) * 31;
+      line(ctx, [[x, groundY + 28], [x + 21, groundY + 52], [x + 59, groundY + 57]], 'rgba(15,44,39,.39)', 3);
+    }
+  } else if (theme === 'city') {
+    ctx.fillStyle = '#243d43';
+    ctx.fillRect(0, groundY + 17, W, 9);
+    for (let x = 0; x < W; x += 72) {
+      line(ctx, [[x, groundY + 26], [x + 14, H]], 'rgba(189,201,189,.16)', 1);
+      ctx.fillStyle = 'rgba(235,215,157,.42)';
+      ctx.fillRect(x + 20, groundY + 11, 25, 2);
+    }
+    for (let x = 44; x < W; x += 217) {
+      ctx.fillStyle = '#293f43';
+      ctx.fillRect(x, groundY - 8, 43, 8);
+      ctx.fillStyle = '#b3aa8d';
+      ctx.fillRect(x + 5, groundY - 9, 34, 2);
+    }
+  } else if (theme === 'ocean') {
+    ctx.fillStyle = '#493d36';
+    ctx.fillRect(0, groundY + 21, W, 10);
+    for (let y = groundY + 13; y < H; y += 23) {
+      line(ctx, [[0, y], [W, y]], 'rgba(239,205,155,.24)', 2);
+      for (let x = ((y - groundY) % 46) * 5 - 30; x < W; x += 140) {
+        line(ctx, [[x, y], [x, y + 22]], 'rgba(41,48,44,.31)', 2);
+        ellipse(ctx, x + 10, y + 7, 1.4, 1.4, 'rgba(247,214,165,.3)');
+      }
+    }
+    for (let x = 95; x < W; x += 215) {
+      ctx.fillStyle = '#344a49';
+      ctx.fillRect(x, groundY + 14, 6, 53);
+    }
+  } else if (photoGrassland) {
+    for (let i = 0; i < 43; i++) {
+      const x = hash(i * 13 + seed) * W;
+      const height = 3 + hash(i * 5 + seed) * 9;
+      line(ctx, [[x - 3, groundY], [x, groundY - height], [x + 3, groundY - 2]], i % 3 ? '#78936a' : '#b8c99a', 1.4);
+    }
+    for (let y = groundY + 21; y < H; y += 24) {
+      line(ctx, [[0, y], [W, y + 5]], 'rgba(184,206,158,.13)', 2);
+    }
+  } else {
+    for (let i = 0; i < 38; i++) {
+      const x = hash(i * 13 + seed) * W;
+      const y = groundY + 17 + hash(i * 31 + seed) * (H - groundY - 20);
+      line(ctx, [[x, y], [x + 15 + hash(i * 5) * 24, y + 2]], 'rgba(246,207,151,.2)', 1.3);
+    }
+    for (let x = 23; x < W; x += 66) {
+      const height = 3 + hash(x + seed) * 8;
+      line(ctx, [[x - 4, groundY], [x, groundY - height]], '#d1aa79', 1.2);
+      line(ctx, [[x, groundY - height], [x + 5, groundY - height - 2]], '#d1aa79', 1.2);
+    }
+    line(ctx, [[0, groundY + 43], [155, groundY + 49], [318, groundY + 41], [489, groundY + 47], [668, groundY + 39], [960, groundY + 48]], 'rgba(57,45,45,.23)', 3);
+  }
+}
+
+function drawPlatforms(ctx, platforms, theme) {
+  const style = THEMES[theme];
+  for (const platform of platforms || []) {
+    const x = number(platform.x);
+    const y = number(platform.y);
+    const w = Math.max(0, number(platform.w));
+    const h = Math.max(6, number(platform.h, 14));
+    if (!w) continue;
+    ctx.fillStyle = 'rgba(12,33,34,.18)';
+    ctx.fillRect(x + 5, y + 8, w, h);
+    ctx.fillStyle = style.platform;
+    ctx.fillRect(x, y + 3, w, h);
+    ctx.fillStyle = style.platformTop;
+    ctx.fillRect(x, y, w, 6);
+    if (theme === 'forest') {
+      for (let i = 0; i < w; i += 27) line(ctx, [[x + i + 9, y + 10], [x + i + 15, y + h - 1]], 'rgba(31,54,42,.27)', 1.5);
+    } else if (theme === 'city') {
+      for (let i = 12; i < w; i += 28) ellipse(ctx, x + i, y + 10, 2, 2, '#bdc7b9');
+      ctx.fillStyle = 'rgba(30,46,48,.45)';
+      ctx.fillRect(x + 4, y + h - 3, Math.max(0, w - 8), 3);
+    } else if (theme === 'ocean') {
+      for (let i = 20; i < w; i += 40) line(ctx, [[x + i, y + 6], [x + i, y + h]], 'rgba(49,45,38,.3)', 2);
+    } else {
+      polygon(ctx, [[x + w * .2, y + 6], [x + w * .31, y + h], [x + w * .38, y + 6]], 'rgba(66,49,46,.15)');
+      line(ctx, [[x + w * .57, y + 7], [x + w * .48, y + h - 2]], 'rgba(245,207,151,.25)', 2);
+    }
+  }
+}
+
+function drawHazards(ctx, hazards, theme, tick) {
+  for (const hazard of hazards || []) {
+    const x = number(hazard.x);
+    const y = number(hazard.y);
+    const w = Math.max(0, number(hazard.w));
+    const h = Math.max(0, number(hazard.h));
+    if (!w || !h) continue;
+    const type = String(hazard.type || '').toLowerCase();
+    // Match shared/combat.js hazardActive exactly: the graphic is a contract
+    // with the player about the ticks on which this rectangle can deal damage.
+    const periodic = Number.isFinite(hazard.period) && hazard.period > 0;
+    const period = periodic ? Math.max(1, Math.floor(hazard.period)) : 1;
+    const activeTicks = clamp(Math.floor(hazard.activeTicks ?? period * .56), 0, period);
+    const phase = Math.floor(hazard.phase ?? 0);
+    const cycle = ((tick + phase) % period + period) % period;
+    const active = !periodic || cycle < activeTicks;
+    ctx.save();
+    ctx.fillStyle = 'rgba(17,37,39,.66)';
+    ctx.fillRect(x, y + h - 3, w, 3);
+    if (type.includes('water') || type.includes('tide') || type.includes('wave')) {
+      if (active) {
+        const gradient = ctx.createLinearGradient(0, y, 0, y + h);
+        gradient.addColorStop(0, 'rgba(172,243,229,.9)');
+        gradient.addColorStop(1, 'rgba(27,113,134,.84)');
+        ctx.fillStyle = gradient;
+        ctx.fillRect(x, y + 2, w, h - 2);
+        ctx.beginPath();
+        for (let px = x; px <= x + w; px += 4) {
+          const py = y + 2 + Math.sin(px * .035 + tick * .06) * 2;
+          if (px === x) ctx.moveTo(px, py); else ctx.lineTo(px, py);
+        }
+        ctx.strokeStyle = '#e0fff0';
+        ctx.lineWidth = 2.5;
+        ctx.stroke();
+      } else {
+        ctx.fillStyle = '#335b62';
+        ctx.fillRect(x, y + h - 6, w, 6);
+        line(ctx, [[x + 2, y + h - 7], [x + w - 2, y + h - 7]], 'rgba(182,218,203,.34)', 1);
+      }
+    } else if (type.includes('traffic')) {
+      ctx.fillStyle = active ? '#4c4544' : '#3c4d50';
+      ctx.fillRect(x, y + 1, w, h - 1);
+      for (let px = x + 3; px < x + w - 4; px += 14) {
+        polygon(ctx, [[px, y + h - 2], [px + 7, y + 2], [px + 12, y + 2], [px + 5, y + h - 2]], active ? '#f6ad60' : '#68777a');
+      }
+      if (active) {
+        ctx.fillStyle = tick % 18 < 9 ? '#ffe7a2' : '#e87b57';
+        ctx.fillRect(x + 2, y - 4, 6, 4);
+        ctx.fillRect(x + w - 8, y - 4, 6, 4);
+        line(ctx, [[x + 2, y], [x + w - 2, y]], '#fce0a7', 2);
+      } else {
+        line(ctx, [[x + 3, y + 1], [x + w - 3, y + 1]], '#5e7273', 1.4);
+      }
+    } else if (type.includes('fissure')) {
+      ctx.fillStyle = active ? '#5a3c3c' : '#4e4141';
+      ctx.fillRect(x, y + 3, w, h - 3);
+      const teeth = [];
+      for (let i = 0; i <= 8; i++) {
+        const px = x + (i / 8) * w;
+        teeth.push([px, y + 3 + (i % 2 ? 4 : 0)]);
+      }
+      line(ctx, teeth, active ? '#ffbd73' : '#735a56', active ? 4 : 2);
+      if (active) {
+        for (let px = x + 9; px < x + w; px += 19) {
+          ellipse(ctx, px, y + h - 3, 3, 2, '#f37250');
+          line(ctx, [[px, y + 1], [px + Math.sin(tick * .12 + px) * 3, y - 5]], 'rgba(255,193,116,.66)', 1.5);
+        }
+      }
+    } else if (type.includes('thorn')) {
+      ctx.fillStyle = active ? '#315348' : '#334941';
+      ctx.fillRect(x, y + h - 5, w, 5);
+      const count = Math.max(1, Math.ceil(w / 12));
+      for (let i = 0; i < count; i++) {
+        const left = x + i * (w / count);
+        const height = active ? h - 2 : 4;
+        polygon(ctx, [[left, y + h - 4], [left + w / count / 2, y + h - height], [left + w / count, y + h - 4]], active ? (i % 2 ? '#ce765a' : '#db9471') : '#53675b');
+      }
+    } else if (type.includes('electric') || type.includes('shock')) {
+      ctx.fillStyle = active ? 'rgba(52,91,103,.72)' : 'rgba(48,65,70,.52)';
+      ctx.fillRect(x, y, w, h);
+      if (active) {
+        for (let px = x + 7; px < x + w - 7; px += 17) {
+          line(ctx, [[px, y + 3], [px + 6, y + h * .4], [px + 1, y + h * .66], [px + 10, y + h - 2]], '#e9db86', 2.5);
+        }
+      }
+    } else if (type.includes('fire') || type.includes('lava')) {
+      ctx.fillStyle = active ? 'rgba(194,82,53,.7)' : 'rgba(95,65,59,.58)';
+      ctx.fillRect(x, y, w, h);
+      if (active) {
+        for (let px = x + 4; px < x + w; px += 17) {
+          polygon(ctx, [[px, y + h], [px + 3, y + 2 + Math.sin(tick * .08 + px) * 4], [px + 9, y + h]], '#f9bf69');
+        }
+      }
+    } else {
+      ctx.fillStyle = 'rgba(53,47,47,.72)';
+      ctx.fillRect(x, y + h - 6, w, 6);
+      const count = Math.max(1, Math.ceil(w / 17));
+      for (let i = 0; i < count; i++) {
+        const left = x + i * (w / count);
+        polygon(ctx, [[left, y + h - 5], [left + w / count / 2, active ? y + 2 : y + h - 9], [left + w / count, y + h - 5]], active ? (theme === 'city' ? '#f1b174' : '#d77d61') : '#61706a');
+      }
+    }
+    ctx.restore();
+  }
+}
+
+function bone(ctx, joints, outline, core, width = 8) {
+  line(ctx, joints, outline, width + 3);
+  line(ctx, joints, core, width);
+}
+
+function drawWholeTomato(ctx, x, y, tilt) {
+  ctx.save();
+  ctx.translate(x, y);
+  ctx.rotate(tilt);
+  ellipse(ctx, 0, 1, 17, 15, '#702d2a');
+  ellipse(ctx, -2, -1, 14.5, 12.5, '#d6533d');
+  ellipse(ctx, 7, 4, 5, 3.5, '#a83f33', -.4);
+  ellipse(ctx, -8, -5, 4, 2.2, '#ed9b74', -.5);
+  // An uneven calyx and bruised skin keep it a rotten tomato, not a red ball.
+  polygon(ctx, [[-13, -11], [-6, -14], [-3, -10], [0, -17], [4, -11],
+    [12, -13], [7, -7], [1, -9], [-7, -7]], '#4f7850');
+  line(ctx, [[0, -11], [2, -19], [6, -20]], '#315543', 2.7);
+  ctx.restore();
+}
+
+function drawTomatoOnHead(ctx, head, knockout, time, reducedMotion) {
+  const elapsed = Math.max(0, time - knockout.born);
+  if (elapsed >= TOMATO_LIFE_MS) return;
+  const [x, y] = head;
+  const crown = y - HEAD_RADIUS;
+  if (elapsed < TOMATO_DROP_MS) {
+    const fall = reducedMotion ? 1 : (elapsed / TOMATO_DROP_MS) ** 2;
+    drawWholeTomato(ctx, x, crown - 16 - (1 - fall) * 115, -.16 + fall * .19);
+    return;
+  }
+
+  const age = elapsed - TOMATO_DROP_MS;
+  const fade = clamp((TOMATO_LIFE_MS - elapsed) / 280, 0, 1);
+  const spread = 1 + .13 * clamp(age / 85, 0, 1);
+  ctx.save();
+  ctx.globalAlpha *= fade;
+  ellipse(ctx, x, crown + 1, 25 * spread, 7, '#702d2a');
+  ellipse(ctx, x - 2, crown - 3, 23 * spread, 7.5, '#d6533d');
+  polygon(ctx, [[x - 24, crown - 1], [x - 31, crown - 4], [x - 26, crown + 5],
+    [x - 15, crown + 3], [x + 11, crown + 4], [x + 28, crown + 7],
+    [x + 26, crown - 2], [x + 16, crown - 5]], '#a83f33');
+  // A little pulp and a torn leaf stay stuck to the oversized head as it falls.
+  ellipse(ctx, x - 10, y - 10, 6, 4.5, '#a83f33', -.35);
+  ellipse(ctx, x + 11, y - 14, 5, 3.5, '#d6533d', .42);
+  line(ctx, [[x + 12, y - 12], [x + 14, y - 4]], '#a83f33', 2.4);
+  polygon(ctx, [[x - 6, crown - 9], [x + 2, crown - 14], [x + 5, crown - 7],
+    [x + 15, crown - 10], [x + 8, crown - 3], [x - 4, crown - 5]], '#4f7850');
+  ctx.restore();
+}
+
+function drawTomatoBurst(ctx, knockout, time, reducedMotion) {
+  const age = time - knockout.born - TOMATO_DROP_MS;
+  if (age < 0 || age > 520) return;
+  const seconds = reducedMotion ? 0 : age / 1000;
+  const count = reducedMotion ? 3 : 11;
+  ctx.save();
+  ctx.globalAlpha *= 1 - age / 520;
+  for (let i = 0; i < count; i++) {
+    const spread = i - (count - 1) / 2;
+    const velocityX = spread * (reducedMotion ? 9 : 34);
+    const velocityY = -90 - (i % 3) * 32;
+    const px = knockout.impactX + spread * 2 + velocityX * seconds;
+    const py = knockout.impactY - 2 + velocityY * seconds + 260 * seconds * seconds;
+    ellipse(ctx, px, py, i % 3 === 0 ? 4.2 : 2.8, i % 3 === 0 ? 3.2 : 2.6,
+      i % 4 === 0 ? '#d6533d' : '#a83f33');
+  }
+  ctx.restore();
+}
+
+function drawBossWindup(ctx, { hand, head, tick, attackTick, activeFrom, stage, bob, reducedMotion }) {
+  const charge = clamp((attackTick + 1) / activeFrom, 0, 1);
+  const pulse = reducedMotion ? 0 : Math.sin(tick * .65) * .055;
+  const intensity = clamp(.38 + charge * .48 + pulse, .3, .95);
+  const signal = stage === 3 ? '#f59b77' : '#ffd09a';
+  ctx.save();
+
+  // The raised warning mark stays readable against all four landscapes. Its
+  // opacity and the fist arc fill across the exact non-damaging windup ticks.
+  const markX = head[0];
+  const markY = head[1] - 40;
+  const triangle = [[markX, markY - 15], [markX + 17, markY + 13], [markX - 17, markY + 13]];
+  ctx.globalAlpha = intensity;
+  polygon(ctx, triangle, '#313b3d');
+  const inset = [[markX, markY - 9], [markX + 11, markY + 9], [markX - 11, markY + 9]];
+  polygon(ctx, inset, signal);
+  line(ctx, [[markX, markY - 2], [markX, markY + 3]], '#423b38', 3);
+  ellipse(ctx, markX, markY + 6.5, 1.6, 1.6, '#423b38');
+
+  const radius = 12 + charge * 15;
+  ctx.beginPath();
+  ctx.arc(hand[0], hand[1], radius, -Math.PI / 2, -Math.PI / 2 + TAU * charge);
+  ctx.strokeStyle = signal;
+  ctx.lineWidth = 2.5 + charge * 2.5;
+  ctx.lineCap = 'round';
+  ctx.stroke();
+  ellipse(ctx, hand[0], hand[1], 7 + charge * 4, 7 + charge * 4, stage === 3 ? 'rgba(242,112,83,.42)' : 'rgba(255,198,132,.36)');
+
+  // A restrained reach cue points toward the threatened side without
+  // pretending to be a pixel-perfect collision-box preview.
+  ctx.globalAlpha = .15 + charge * .38;
+  ctx.setLineDash([6, 5]);
+  line(ctx, [[29, -55 - bob], [58 + stage * 5, -55 - bob]], signal, 2);
+  ctx.setLineDash([]);
+  polygon(ctx, [[66 + stage * 5, -55 - bob], [61 + stage * 5, -60 - bob], [61 + stage * 5, -50 - bob]], signal);
+  ctx.restore();
+}
+
+function drawLightArrow(ctx, hand, strike, stage, attackTick, index, reducedMotion, boss) {
+  const tailX = hand[0] + 2;
+  const tipX = strike.reach + 12;
+  const centerY = hand[1];
+  const wing = (4 + stage * 2) * (boss ? 1.12 : 1);
+  const accent = index ? '#ec7d6a' : '#f5b66d';
+  const core = index ? '#fff0e7' : '#fff9e3';
+  const glow = ctx.createLinearGradient(tailX - 11, centerY, tipX, centerY);
+  glow.addColorStop(0, 'rgba(245,182,109,0)');
+  glow.addColorStop(.55, index ? 'rgba(236,125,106,.3)' : 'rgba(245,182,109,.3)');
+  glow.addColorStop(1, index ? 'rgba(255,226,204,.72)' : 'rgba(255,246,203,.72)');
+
+  const inTick = attackTick - strike.activeFrom + 1;
+  const outTick = strike.activeTo - attackTick + 1;
+  const crest = Math.min(1, inTick / 2, outTick / 2);
+  ctx.save();
+  ctx.globalAlpha = reducedMotion ? .86 : .7 + crest * .3;
+  // The arrow remains attached to the fist and ends near the melee reach.
+  // The stage changes its silhouette, not the authoritative hit area.
+  polygon(ctx, [
+    [tailX - 11, centerY - wing * .55], [tipX - 14, centerY - wing * 1.35],
+    [tipX + 4, centerY], [tipX - 14, centerY + wing * 1.35],
+    [tailX - 11, centerY + wing * .55],
+  ], glow);
+  polygon(ctx, [
+    [tailX, centerY - 2.8], [tipX - 13, centerY - 2.8],
+    [tipX - 13, centerY - wing], [tipX, centerY],
+    [tipX - 13, centerY + wing], [tipX - 13, centerY + 2.8],
+    [tailX, centerY + 2.8],
+  ], accent);
+  polygon(ctx, [
+    [tailX + 2, centerY - 1.25], [tipX - 10, centerY - 1.25],
+    [tipX - 10, centerY - wing * .48], [tipX - 2, centerY],
+    [tipX - 10, centerY + wing * .48], [tipX - 10, centerY + 1.25],
+    [tailX + 2, centerY + 1.25],
+  ], core);
+  if (!reducedMotion) {
+    line(ctx, [[tailX + 7, centerY], [tailX - 5, centerY - 7]], accent, 1.8);
+    line(ctx, [[tailX + 7, centerY], [tailX - 5, centerY + 7]], accent, 1.8);
+    if (stage >= 2) {
+      line(ctx, [[tailX - 12, centerY - wing - 2], [tipX - 24, centerY - wing - 2]], core, 1.4);
+      if (stage === 3) line(ctx, [[tailX - 18, centerY + wing + 3], [tipX - 22, centerY + wing + 3]], core, 1.7);
+    }
+  }
+  ctx.restore();
+}
+
+function kickExtension(kick, kickTick) {
+  if (!kick) return 0;
+  if (kickTick < kick.activeFrom) return clamp((kickTick - kick.activeFrom + 3) / 3, 0, 1) * .34;
+  if (kickTick <= kick.activeTo) return 1;
+  return clamp(1 - (kickTick - kick.activeTo) / (kick.duration - kick.activeTo), 0, 1);
+}
+
+function drawKickEnergy(ctx, foot, kick, kickTick, active, airborne, index, reducedMotion) {
+  const accent = airborne ? (index ? '#ffad8b' : '#8de9df') : (index ? '#ffb296' : '#ffe0a3');
+  const core = airborne ? '#f7fff0' : '#fff4d6';
+  const [x, y] = foot;
+  ctx.save();
+  if (!active) {
+    if (airborne && kickTick > 0 && kickTick < kick.activeFrom) {
+      const charge = clamp(kickTick / kick.activeFrom, 0, 1);
+      ctx.globalAlpha = reducedMotion ? .33 : .2 + charge * .28;
+      ctx.beginPath();
+      ctx.arc(x, y, 7 + charge * 11, 0, TAU);
+      ctx.strokeStyle = accent;
+      ctx.lineWidth = 2.5;
+      ctx.stroke();
+    }
+    ctx.restore();
+    return;
+  }
+
+  if (airborne) {
+    const tipX = kick.reach + 11;
+    const wake = ctx.createLinearGradient(x - 75, y, tipX, y);
+    wake.addColorStop(0, 'rgba(112,226,222,0)');
+    wake.addColorStop(.7, index ? 'rgba(255,135,105,.36)' : 'rgba(92,222,221,.36)');
+    wake.addColorStop(1, index ? 'rgba(255,199,164,.68)' : 'rgba(206,255,230,.7)');
+    ctx.globalAlpha = reducedMotion ? .7 : .85;
+    polygon(ctx, [
+      [x - 75, y - 7], [x - 14, y - 21], [tipX, y],
+      [x - 14, y + 21], [x - 75, y + 7],
+    ], wake);
+    polygon(ctx, [[x - 31, y - 2], [tipX - 15, y - 5], [tipX, y],
+      [tipX - 15, y + 5], [x - 31, y + 2]], accent);
+    if (!reducedMotion) {
+      line(ctx, [[x - 69, y - 21], [x - 19, y - 14], [tipX - 9, y - 3]], accent, 2.2);
+      line(ctx, [[x - 80, y + 22], [x - 24, y + 14], [tipX - 10, y + 4]], accent, 2.2);
+    }
+    ellipse(ctx, x, y, 9, 8, core);
+  } else {
+    ctx.globalAlpha = .7;
+    line(ctx, [[x - 25, y - 11], [x + 4, y - 6], [x + 13, y]], accent, 4);
+    ellipse(ctx, x + 2, y, 6, 5, core);
+  }
+  ctx.restore();
+}
+
+function drawFighter(ctx, fighter, index, groundY, tick, reducedMotion = false, knockout = null, time = 0) {
+  const x = number(fighter.x, index ? 684 : 284);
+  const y = number(fighter.y, groundY);
+  const vx = number(fighter.vx);
+  const vy = number(fighter.vy);
+  const grounded = fighter.grounded !== false;
+  const facing = number(fighter.facing, index ? -1 : 1) < 0 ? -1 : 1;
+  const dodge = number(fighter.dodgeTicks) > 0;
+  const stun = number(fighter.stun) > 0;
+  const attackStage = clamp(Math.floor(number(fighter.attackStage)), 0, 3);
+  const attackTick = number(fighter.attackTick);
+  const strike = attackStage ? attackOf({ kind: fighter.kind, attackStage }) : null;
+  const attacking = Boolean(strike);
+  const strikeActive = Boolean(strike && attackTick >= strike.activeFrom && attackTick <= strike.activeTo);
+  const kick = kickOf(fighter);
+  const kickTick = number(fighter.kickTick);
+  const kicking = Boolean(kick);
+  const airKick = fighter.kickType === 'air' && kicking;
+  const kickActive = Boolean(kick && kickTick >= kick.activeFrom && kickTick <= kick.activeTo);
+  const hit = number(fighter.hurtFlash) > 0;
+  const invulnerable = Boolean(fighter.invulnerable) || dodge;
+  const defeated = number(fighter.hp, 100) <= 0;
+  const bossWindup = fighter.kind === 'boss' && attacking
+    && attackTick < strike.activeFrom && !defeated;
+  const core = hit ? '#fff9e8' : index ? '#f5ddcf' : '#f5ecd7';
+  const outline = index ? '#663f41' : '#173b3b';
+  const accent = index ? '#ec7d6a' : '#f5b66d';
+
+  const altitude = clamp(groundY - y, 0, 180);
+  ellipse(ctx, x, groundY + 6, Math.max(15, 25 - altitude * .05), 5, `rgba(10,28,28,${Math.max(.09,.3 - altitude * .001)})`);
+
+  ctx.save();
+  ctx.translate(x, y);
+  ctx.scale(facing, 1);
+  if (defeated) {
+    const elapsed = knockout ? time - knockout.born : Infinity;
+    const progress = knockout
+      ? reducedMotion ? Number(elapsed >= TOMATO_DROP_MS)
+        : clamp((elapsed - TOMATO_DROP_MS) / TOMATO_FALL_MS, 0, 1)
+      : 1;
+    const fall = progress * progress * (3 - 2 * progress);
+    ctx.translate(0, -6 * fall);
+    ctx.rotate(-Math.PI * .46 * fall);
+  }
+
+  const stride = grounded && !stun ? Math.sin(tick * .29 + index) * clamp(Math.abs(vx) / 3.2, 0, 1) : 0;
+  const bob = grounded && !defeated ? Math.abs(stride) * 2 + Math.sin(tick * .065 + index) * 1.2 : 0;
+  const lean = dodge ? 13 : bossWindup ? -7 : airKick ? 11 : kicking ? -5
+    : attacking ? 6 : stun ? -9 : clamp(vx * 1.05, -6, 6);
+  const hip = [lean * .45, -36 - bob];
+  const shoulder = [lean, -68 - bob];
+  // Keep the crown near its old height while making the head unmistakably
+  // larger than the slim, single-stroke body.
+  const head = [lean + 1, -83 - bob];
+
+  if (dodge) {
+    ctx.save();
+    ctx.globalAlpha = .27;
+    line(ctx, [[-28, -11], [-25, -60], [-13, -84]], accent, 5);
+    ellipse(ctx, -12, -84, 19, 19, accent);
+    ctx.restore();
+    for (let i = 0; i < 3; i++) line(ctx, [[-28 - i * 12, -45 + i * 12], [-56 - i * 10, -45 + i * 12]], 'rgba(249,226,181,.65)', 2 - i * .3);
+  }
+
+  const rearElbow = kicking ? [-13 + lean * .5, -65 - bob] : [-13 + lean * .5, -55 - bob];
+  const rearHand = kicking ? [-8 + lean * .4, -75 - bob]
+    : [-19 + lean * .42, attacking ? -36 - bob : -39 - bob];
+  bone(ctx, [shoulder, rearElbow, rearHand], outline, core, 4.2);
+
+  let kneeBack, footBack, kneeFront, footFront;
+  if (kicking && !defeated) {
+    const extension = kickExtension(kick, kickTick);
+    kneeBack = airKick ? [-18, -22] : [-13, -20];
+    footBack = airKick ? [-31, -30] : [-25, -2];
+    kneeFront = [17 + extension * (airKick ? 25 : 20), -20 - extension * (airKick ? 7 : 12)];
+    footFront = [airKick ? 27 + extension * (kick.reach - 27) : 22 + extension * (kick.reach - 25),
+      (airKick ? -14 : -1) - extension * (airKick ? 24 : 38)];
+  } else if (!grounded && !defeated) {
+    kneeBack = [-17, -16]; footBack = [-24, -26 + clamp(vy * .8, -5, 7)];
+    kneeFront = [15, -21]; footFront = [27, -14 - clamp(vy * .5, -4, 5)];
+  } else if (dodge) {
+    kneeBack = [-25, -18]; footBack = [-42, -3];
+    kneeFront = [24, -22]; footFront = [40, -3];
+  } else {
+    kneeBack = [-12 - stride * 11, -18]; footBack = [-21 - stride * 18, -1 + Math.max(0, stride) * 5];
+    kneeFront = [12 + stride * 11, -18]; footFront = [22 + stride * 18, -1 + Math.max(0, -stride) * 5];
+  }
+  bone(ctx, [hip, kneeBack, footBack], outline, core, 4.8);
+  bone(ctx, [hip, kneeFront, footFront], outline, core, 4.8);
+  if (kicking && !defeated) drawKickEnergy(ctx, footFront, kick, kickTick, kickActive, airKick, index, reducedMotion);
+  bone(ctx, [hip, shoulder], outline, core, 4.8);
+
+  ctx.beginPath();
+  ctx.arc(head[0], head[1], HEAD_RADIUS, 0, TAU);
+  ctx.fillStyle = outline;
+  ctx.fill();
+  ctx.beginPath();
+  ctx.arc(head[0], head[1], HEAD_RADIUS - 4, 0, TAU);
+  ctx.fillStyle = core;
+  ctx.fill();
+  if (defeated) {
+    for (const eye of [-8, 8]) {
+      line(ctx, [[head[0] + eye - 3, head[1] - 4], [head[0] + eye + 3, head[1] + 2]], outline, 2.2);
+      line(ctx, [[head[0] + eye + 3, head[1] - 4], [head[0] + eye - 3, head[1] + 2]], outline, 2.2);
+    }
+  } else {
+    line(ctx, [[head[0] + 2, head[1] - 1], [head[0] + 11, head[1] - 3]], accent, 3);
+    line(ctx, [[head[0] - 10, head[1] - 14], [head[0] + 7, head[1] - 16]], accent, 3);
+  }
+  if (defeated && knockout) drawTomatoOnHead(ctx, head, knockout, time, reducedMotion);
+
+  const recovery = attacking && attackTick > strike.activeTo
+    ? clamp((attackTick - strike.activeTo) / (strike.duration - strike.activeTo), 0, 1) : 0;
+  const reach = strikeActive ? 25 + 25 * clamp((attackTick - strike.activeFrom + 1) / 2, 0, 1)
+    : recovery ? 50 - 28 * recovery : 12;
+  const armHeight = attackStage === 2 ? -4 : attackStage === 3 ? 5 : 0;
+  const frontElbow = kicking ? [15 + lean * .3, -64 - bob]
+    : bossWindup ? [-3 + lean * .5, -72 - bob]
+    : attacking ? [12 + reach * .23 + lean * .35, -68 - bob + armHeight * .5] : [15 + lean * .5, -55 - bob];
+  const frontHand = kicking ? [20 + lean * .25, -80 - bob]
+    : bossWindup ? [-12 + lean * .5, -57 - bob]
+    : attacking ? [reach, -63 - bob + armHeight] : [22 + lean * .4, -39 - bob];
+  bone(ctx, [shoulder, frontElbow, frontHand], outline, core, 4.4);
+  ellipse(ctx, frontHand[0], frontHand[1], 4.4, 4.4, accent);
+  ellipse(ctx, rearHand[0], rearHand[1], 3.8, 3.8, accent);
+
+  if (bossWindup) {
+    drawBossWindup(ctx, {
+      hand: frontHand, head, tick, attackTick: number(fighter.attackTick),
+      activeFrom: strike.activeFrom, stage: attackStage, bob, reducedMotion,
+    });
+  }
+  if (strikeActive && !defeated) drawLightArrow(ctx, frontHand, strike, attackStage, attackTick, index, reducedMotion, fighter.kind === 'boss');
+  if (invulnerable && !defeated) {
+    ctx.save();
+    ctx.setLineDash([5, 8]);
+    ctx.lineDashOffset = -tick * .8;
+    ctx.strokeStyle = 'rgba(222,247,218,.65)';
+    ctx.lineWidth = 1.7;
+    ctx.beginPath();
+    ctx.ellipse(lean * .5, -47, 26, 51, 0, 0, TAU);
+    ctx.stroke();
+    ctx.restore();
+  }
+  ctx.restore();
+
+  if (hit && !defeated) {
+    ctx.save();
+    ctx.globalAlpha = .28;
+    ellipse(ctx, x, y - 48, 29, 52, '#fff5d4');
+    ctx.restore();
+  }
+}
+
+function drawAtmosphere(ctx, theme, tick, level) {
+  // A quiet front layer integrates the figures with the background without
+  // covering their silhouette or making the collision plane ambiguous.
+  const vignette = ctx.createRadialGradient(W / 2, H / 2, 160, W / 2, H / 2, 620);
+  vignette.addColorStop(0, 'rgba(8,27,28,0)');
+  vignette.addColorStop(1, 'rgba(8,27,28,.25)');
+  ctx.fillStyle = vignette;
+  ctx.fillRect(0, 0, W, H);
+
+  ctx.save();
+  ctx.globalAlpha = .78;
+  ctx.fillStyle = '#f7f0d8';
+  ctx.font = '800 10px Bahnschrift, Arial, sans-serif';
+  ctx.letterSpacing = '2px';
+  const stage = Number.isFinite(Number(level)) ? ` / ${String(level).padStart(2, '0')}` : '';
+  ctx.fillText(`${THEMES[theme].label}${stage}`, 28, H - 24);
+  line(ctx, [[28, H - 40], [112, H - 40]], 'rgba(248,234,197,.72)', 2);
+  ctx.restore();
+}
+
+export function createRenderer(canvas) {
+  if (!canvas || typeof canvas.getContext !== 'function') throw new TypeError('createRenderer 需要有效的 Canvas 元素');
+  const ctx = canvas.getContext('2d', { alpha: false });
+  if (!ctx) throw new Error('当前浏览器不支持 Canvas 2D');
+
+  const particles = [];
+  const rings = [];
+  const seenIds = new Set();
+  const seenOrder = [];
+  const recentAnonymous = new Map();
+  const photoCache = new Map();
+  const knockouts = new Map();
+  let lastFighters = new Map();
+  let lastTick = -1;
+  let lastScene = '';
+  let shakeUntil = 0;
+  let shakeStrength = 0;
+  let pixelRatio = 0;
+  const motionMedia = typeof matchMedia === 'function' ? matchMedia('(prefers-reduced-motion: reduce)') : null;
+  let reducedMotion = Boolean(motionMedia?.matches);
+  const now = () => (typeof performance !== 'undefined' ? performance.now() : Date.now());
+
+  function scaleCanvas() {
+    const next = clamp(number(globalThis.devicePixelRatio, 1), 1, 2);
+    if (next !== pixelRatio || canvas.width !== Math.round(W * next) || canvas.height !== Math.round(H * next)) {
+      pixelRatio = next;
+      canvas.width = Math.round(W * next);
+      canvas.height = Math.round(H * next);
+    }
+    ctx.setTransform(pixelRatio, 0, 0, pixelRatio, 0, 0);
+  }
+
+  function loadedPhoto(path) {
+    if (!path || typeof Image !== 'function') return null;
+    let entry = photoCache.get(path);
+    if (!entry) {
+      const image = new Image();
+      entry = { image, readyAt: 0, failed: false };
+      image.decoding = 'async';
+      image.onload = () => { entry.readyAt = now(); };
+      image.onerror = () => { entry.failed = true; };
+      image.src = new URL(path, import.meta.url).href;
+      photoCache.set(path, entry);
+    }
+    if (entry.failed || !entry.image.complete || !entry.image.naturalWidth) return null;
+    if (!entry.readyAt) entry.readyAt = now();
+    return entry;
+  }
+
+  function effect(event) {
+    if (!event || typeof event !== 'object') return;
+    reducedMotion = Boolean(motionMedia?.matches);
+    const type = String(event.type || '').toLowerCase();
+    if (!['hit', 'dodge', 'land', 'ko', 'kick', 'jump-kick'].includes(type)) return;
+
+    const stamp = now();
+    const stableId = event.id ?? event.eventId ?? event.uid;
+    if (stableId != null) {
+      const key = String(stableId);
+      if (seenIds.has(key)) return;
+      seenIds.add(key);
+      seenOrder.push(key);
+      if (seenOrder.length > 700) seenIds.delete(seenOrder.shift());
+    } else {
+      const key = `${type}:${number(event.tick, -1)}:${Math.round(number(event.x))}:${Math.round(number(event.y))}`;
+      if (stamp - (recentAnonymous.get(key) ?? -Infinity) < 180) return;
+      recentAnonymous.set(key, stamp);
+      if (recentAnonymous.size > 120) {
+        for (const [oldKey, oldTime] of recentAnonymous) if (stamp - oldTime > 800) recentAnonymous.delete(oldKey);
+      }
+    }
+
+    const x = clamp(number(event.x, W / 2), -50, W + 50);
+    const y = clamp(number(event.y, H / 2), -50, H + 50);
+    if (type === 'ko') {
+      const target = String(event.target ?? `ko:${stableId ?? `${Math.round(x)}:${Math.round(y)}:${stamp}`}`);
+      const previous = lastFighters.get(target);
+      const facing = number(previous?.fighter.facing ?? event.facing, 1) < 0 ? -1 : 1;
+      // Normal KO events report the point above the feet. Use their current
+      // height, not a stale interpolated frame, so an airborne fighter never
+      // snaps backward just as the tomato arrives. A pit fall stays at the rim.
+      const footY = event.source === 'fall' ? H + 8
+        : event.y == null ? number(previous?.fighter.y, y + 40)
+          : y + number(previous?.fighter.height ?? event.height, 88) * .45;
+      const pose = {
+        ...(previous?.fighter ?? {}), id: target, kind: previous?.fighter.kind ?? event.kind ?? 'hero',
+        x: clamp(x, 22, W - 22),
+        // Off-screen falls get a visible, bounded final gag at the arena edge.
+        y: clamp(footY, 80, H + 8), facing,
+        hp: 0, vx: 0, vy: 0, grounded: true, stun: 0, dodgeTicks: 0,
+        attackStage: 0, attackTick: 0, kickType: null, kickTick: 0,
+        hurtFlash: 0, invulnerable: 0,
+      };
+      knockouts.set(target, {
+        target, born: stamp, fighter: pose, index: previous?.index ?? (pose.team === 1 ? 1 : 0),
+        reducedMotion,
+        impactX: pose.x + facing, impactY: pose.y - 83 - HEAD_RADIUS,
+      });
+      if (knockouts.size > 24) knockouts.delete(knockouts.keys().next().value);
+      return;
+    }
+    const ultimate = type === 'jump-kick';
+    const heavy = type === 'hit' && Boolean(event.heavy);
+    const facing = number(event.facing, 1) < 0 ? -1 : 1;
+    const count = reducedMotion ? 5 : ultimate ? 28
+      : heavy ? 23 : type === 'hit' ? 17 : type === 'land' ? 10 : type === 'kick' ? 7 : 9;
+    const speed = ultimate ? 205 : type === 'hit' ? 180
+      : type === 'dodge' ? 80 : 60;
+    const palette = ultimate ? ['#eaffec', '#8de9df', '#f5d995']
+      : type === 'dodge' ? ['#e9f9df', '#8bbec0', '#c1e6d6']
+      : type === 'land' ? ['#e9d1a5', '#b4a580', '#f6e9c8']
+      : ['#fff4ca', '#f5a96c', '#e97157'];
+    for (let i = 0; i < count; i++) {
+      const angle = ultimate
+        ? (facing < 0 ? Math.PI : 0) + (i / Math.max(1, count - 1) - .5) * 1.65
+        : (i / count) * TAU + hash(i * 11 + x + y) * .3;
+      const force = speed * (.35 + hash(i * 7 + x) * .8);
+      particles.push({ x, y, vx: Math.cos(angle) * force, vy: Math.sin(angle) * force - (type === 'land' ? 45 : 0), size: 1.5 + hash(i * 13 + y) * (ultimate ? 4 : 3), color: palette[i % palette.length], born: stamp, life: ultimate ? 390 : type === 'kick' ? 210 : type === 'land' ? 340 : type === 'dodge' ? 330 : 480, dust: type === 'land' || type === 'dodge' });
+    }
+    rings.push({ x, y, born: stamp, life: ultimate ? 410 : type === 'kick' ? 190 : 300,
+      radius: ultimate ? 105 : heavy ? 70 : type === 'hit' ? 53 : type === 'kick' ? 25 : 34,
+      color: palette[0], type, facing });
+    if (!reducedMotion && (type === 'hit' || ultimate)) {
+      shakeStrength = ultimate ? 4 : clamp(3 + number(event.damage) * .13, 3, heavy ? 8 : 7);
+      shakeUntil = stamp + (ultimate ? 150 : 220);
+    }
+    // Prevent long sessions with an inactive tab from accumulating particles.
+    if (particles.length > 450) particles.splice(0, particles.length - 450);
+    if (rings.length > 45) rings.splice(0, rings.length - 45);
+  }
+
+  function drawEffects(time) {
+    for (let i = rings.length - 1; i >= 0; i--) {
+      const item = rings[i];
+      const progress = (time - item.born) / item.life;
+      if (progress >= 1) { rings.splice(i, 1); continue; }
+      ctx.save();
+      ctx.globalAlpha = (1 - progress) * (item.type === 'hit' || item.type === 'jump-kick' ? .74 : .45);
+      ctx.beginPath();
+      ctx.arc(item.x, item.y, 7 + item.radius * progress, 0, TAU);
+      ctx.strokeStyle = item.color;
+      ctx.lineWidth = item.type === 'ko' || item.type === 'jump-kick' ? 5 - 3 * progress : 3 - 2 * progress;
+      ctx.stroke();
+      if (item.type === 'jump-kick' && !reducedMotion) {
+        ctx.translate(item.x, item.y);
+        ctx.scale(item.facing, 1);
+        const travel = 25 + 63 * progress;
+        ctx.globalAlpha = (1 - progress) * .57;
+        line(ctx, [[10, -16], [travel, -25]], '#a7f3e5', 4 - 2 * progress);
+        line(ctx, [[7, 14], [travel + 8, 21]], '#f4e2ac', 3 - 1.7 * progress);
+      }
+      ctx.restore();
+    }
+    for (let i = particles.length - 1; i >= 0; i--) {
+      const item = particles[i];
+      const elapsed = (time - item.born) / 1000;
+      const progress = (time - item.born) / item.life;
+      if (progress >= 1) { particles.splice(i, 1); continue; }
+      const px = item.x + item.vx * elapsed;
+      const py = item.y + item.vy * elapsed + (item.dust ? 70 : 230) * elapsed * elapsed;
+      ctx.save();
+      ctx.globalAlpha = (1 - progress) * .94;
+      if (item.dust) ellipse(ctx, px, py, item.size * (1 + progress), item.size * .55, item.color);
+      else line(ctx, [[px, py], [px - item.vx * .027, py - item.vy * .027]], item.color, item.size);
+      ctx.restore();
+    }
+  }
+
+  function render(state = {}, meta = {}) {
+    reducedMotion = Boolean(motionMedia?.matches);
+    const arena = state.arena || {};
+    const theme = normalizedTheme(meta.theme || arena.theme);
+    const level = meta.level;
+    const groundY = clamp(number(arena.groundY, 430), 280, 510);
+    const tick = number(state.tick);
+    const scene = `${meta.mode || ''}:${theme}:${level || ''}`;
+    if (lastTick >= 0 && (tick < lastTick || scene !== lastScene)) {
+      seenIds.clear();
+      seenOrder.length = 0;
+      recentAnonymous.clear();
+      knockouts.clear();
+      lastFighters.clear();
+      particles.length = 0;
+      rings.length = 0;
+      shakeUntil = 0;
+    }
+    lastTick = tick;
+    lastScene = scene;
+    scaleCanvas();
+
+    const time = now();
+    for (const [key, knockout] of knockouts) {
+      if (time - knockout.born >= TOMATO_LIFE_MS) knockouts.delete(key);
+    }
+    let tomatoShake = 0;
+    if (!reducedMotion) {
+      for (const knockout of knockouts.values()) {
+        if (knockout.reducedMotion) continue;
+        const sinceImpact = time - knockout.born - TOMATO_DROP_MS;
+        if (sinceImpact >= 0 && sinceImpact < 170) {
+          tomatoShake = Math.max(tomatoShake, 5 * (1 - sinceImpact / 170));
+        }
+      }
+    }
+    const strength = reducedMotion ? 0
+      : Math.max(Math.max(0, (shakeUntil - time) / 250) * shakeStrength, tomatoShake);
+    const seed = number(level, 1) * 37;
+    ctx.save();
+    ctx.clearRect(0, 0, W, H);
+    if (strength) ctx.translate(Math.sin(time * .093) * strength, Math.cos(time * .127) * strength * .65);
+    const photo = loadedPhoto(meta.mode === 'campaign' ? photoForLevel(theme, level) : null);
+    const photoOpacity = photo ? reducedMotion ? 1 : clamp((time - photo.readyAt) / 250, 0, 1) : 0;
+    if (photoOpacity < 1) {
+      if (theme === 'city') drawCity(ctx, tick, groundY, seed);
+      else if (theme === 'ocean') drawOcean(ctx, tick, groundY, seed);
+      else if (theme === 'land') drawLand(ctx, tick, groundY, seed);
+      else drawForest(ctx, tick, groundY, seed);
+    }
+    if (photo) drawPhotoBackdrop(ctx, photo.image, theme, groundY, photoOpacity);
+    drawGround(ctx, theme, groundY, tick, seed, Boolean(photo) && theme === 'land');
+    drawPlatforms(ctx, arena.platforms, theme);
+    drawHazards(ctx, arena.hazards, theme, tick);
+
+    const fighters = Array.isArray(state.fighters) ? state.fighters : [
+      { x: 295, y: groundY, vx: 0, facing: 1, hp: 100, grounded: true },
+      { x: 675, y: groundY, vx: 0, facing: -1, hp: 100, grounded: true },
+    ];
+    const visibleIds = new Set(fighters.map((fighter) => String(fighter?.id)));
+    // The next campaign wave can replace a KO'd enemy immediately. Its brief
+    // visual echo holds the head in place until the tomato lands and fades.
+    for (const knockout of knockouts.values()) {
+      if (visibleIds.has(knockout.target)) continue;
+      ctx.save();
+      ctx.globalAlpha *= .88 * clamp((TOMATO_LIFE_MS - (time - knockout.born)) / 360, 0, 1);
+      drawFighter(ctx, knockout.fighter, knockout.index, groundY, tick, knockout.reducedMotion, knockout, time);
+      ctx.restore();
+    }
+    fighters.forEach((fighter, index) => {
+      const current = fighter || {};
+      const knockout = number(current.hp, 100) <= 0 ? knockouts.get(String(current.id)) : null;
+      drawFighter(ctx, knockout?.fighter ?? current, index, groundY, tick,
+        knockout?.reducedMotion ?? reducedMotion, knockout, time);
+    });
+    for (const knockout of knockouts.values()) drawTomatoBurst(ctx, knockout, time, knockout.reducedMotion);
+    drawEffects(time);
+    drawAtmosphere(ctx, theme, tick, level);
+    ctx.restore();
+    lastFighters = new Map(fighters.map((fighter, index) => fighter?.id == null ? null
+      : [String(fighter.id), { fighter: { ...fighter }, index }]).filter(Boolean));
+  }
+
+  return { render, effect };
+}
