@@ -168,10 +168,14 @@ button:focus-visible, input:focus-visible, .map-stage:focus-visible {
 .checkpoint-status { display: flex; align-items: center; gap: 10px; color: #c8d4ca; font-size: 11px; font-weight: 700; font-variant-numeric: tabular-nums; white-space: nowrap; }
 .checkpoint-diamond { width: 8px; height: 8px; transform: rotate(45deg); background: var(--signal); }
 .tail-separator { width: 1px; height: 15px; margin: 0 3px; background: #647975; }
+.special-status { padding: 6px 9px; border: 1px solid #5a817e; color: #b9e6df; background: rgba(48,91,88,.26); font-size: 10px; font-weight: 800; letter-spacing: .02em; white-space: nowrap; font-variant-numeric: tabular-nums; }
+.special-status.is-ready { border-color: #bdebd8; color: #effff4; background: rgba(48,143,132,.36); box-shadow: 0 0 15px rgba(139,233,223,.2); }
 .keyboard-guide { display: flex; gap: clamp(7px,1.3vw,18px); color: #adbfb7; font-size: 10px; white-space: nowrap; }
 .keyboard-guide > span { display: inline-flex; align-items: center; gap: 3px; }
 kbd { display: inline-block; min-width: 20px; padding: 3px 5px; border: 1px solid #5b7270; border-bottom-width: 2px; color: #eef0e3; font: 700 9px/1 "Bahnschrift", "Arial Narrow", sans-serif; text-align: center; }
 .touch-controls { display: none; }
+.touch-actions .touch-key--special { min-width: 68px; border-color: #a7e9d4; color: #102a2b; background: linear-gradient(135deg,#efffe9,#80d8d0); box-shadow: 0 0 16px rgba(135,226,211,.24); }
+.touch-actions .touch-key--special:disabled { opacity: .48; filter: saturate(.35); box-shadow: none; }
 
 .route-panel { overflow: hidden; min-width: 0; color: var(--paper-ink); background: var(--paper); box-shadow: 0 14px 35px rgba(0,0,0,.16); }
 .panel-header { display: flex; flex-direction: column; justify-content: center; min-height: 97px; padding: 20px 23px 16px; border-bottom: 1px solid #b9bdb0; }

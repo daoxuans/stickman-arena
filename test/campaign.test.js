@@ -25,12 +25,38 @@ function knockOutWave(session) {
   return session.step();
 }
 
-test('all 56 stages have four ordered themes, unique scenes, valid waves and four bosses', () => {
+function knockOutWithHero(session, count) {
+  const hero = session.combat.fighters.find((fighter) => fighter.id === 'hero');
+  const enemies = session.combat.fighters.filter((fighter) => fighter.team === 1 && fighter.hp > 0);
+  assert.ok(enemies.length >= count);
+  enemies.forEach((enemy, index) => {
+    enemy.x = index < count ? hero.x + 37 + index * 12 : 860;
+    enemy.y = hero.y;
+    enemy.hp = index < count ? 1 : enemy.hp;
+    enemy.vx = 0;
+    enemy.vy = 0;
+    enemy.stun = 100;
+    enemy.invulnerable = 0;
+    enemy.grounded = true;
+  });
+  hero.attackStage = 1;
+  hero.attackTick = 4; // The next fixed tick is the first real hit frame.
+  hero.hitIds = [];
+  hero.facing = 1;
+  hero.stun = 0;
+  return session.step();
+}
+
+function finishHitstop(session) {
+  while (session.combat.hitstop > 0) session.step();
+}
+
+test('all 56 stages have four ordered themes, unique scenes, valid waves and nine bosses', () => {
   assert.equal(MAX_LEVEL, 56);
   assert.equal(LEVELS.length, MAX_LEVEL);
   assert.deepEqual([...new Set(LEVELS.map((level) => level.name))].length, 56);
   assert.deepEqual(Object.keys(THEMES), ['forest', 'city', 'ocean', 'land']);
-  assert.deepEqual(LEVELS.filter((level) => level.isBoss).map((level) => level.number), [14, 28, 42, 56]);
+  assert.deepEqual(LEVELS.filter((level) => level.isBoss).map((level) => level.number), [10, 14, 20, 28, 30, 40, 42, 50, 56]);
 
   for (const [index, level] of LEVELS.entries()) {
     assert.equal(level.number, index + 1);
@@ -60,11 +86,13 @@ test('a small regular-enemy lift reaches all 56 stages without changing waves or
   const oldDamage = { grunt: 0.73, rusher: 0.66, guard: 0.8, brute: 1.04 };
   const waveCounts = [1, 2, 1, 2, 2, 2, 2, 2, 2, 3, 2, 2, 3, 2];
   const enemyCounts = [1, 2, 2, 3, 3, 3, 4, 4, 4, 5, 4, 5, 5, 2];
+  const addedBosses = new Set([10, 20, 30, 40, 50]);
 
   for (const level of LEVELS) {
     const chapterIndex = level.chapter - 1;
-    assert.equal(level.waves.length, waveCounts[level.stage - 1]);
-    assert.equal(level.enemyCount, enemyCounts[level.stage - 1]);
+    const extraBoss = addedBosses.has(level.number) ? 1 : 0;
+    assert.equal(level.waves.length, waveCounts[level.stage - 1] + extraBoss);
+    assert.equal(level.enemyCount, enemyCounts[level.stage - 1] + extraBoss);
     assert.equal(level.isCheckpoint, [1, 5, 9, 13].includes(level.stage));
     let strongerEnemies = 0;
 
@@ -164,6 +192,80 @@ test('waves advance one by one, then clear unlocks exactly the next room', () =>
   assert.equal(new CampaignSession({ storage: store }).start().level.number, 3);
 });
 
+test('light-wave charges are available only in rooms with more than three enemies and require two player KOs', () => {
+  const shortRoom = new CampaignSession({ storage: seedProgress(6, 5) });
+  assert.equal(shortRoom.start().specialEligible, false);
+  const shortResult = knockOutWithHero(shortRoom, 2);
+  assert.equal(shortResult.specialKills, 0);
+  assert.equal(shortResult.specialCharges, 0);
+  finishHitstop(shortRoom);
+  assert.equal(shortRoom.step({ special: true }).events.some((event) => event.type === 'special-wave'), false);
+
+  const longRoom = new CampaignSession({ storage: seedProgress(7, 5) });
+  assert.equal(longRoom.start().specialEligible, true);
+  const first = knockOutWithHero(longRoom, 1);
+  assert.equal(first.specialKills, 1);
+  assert.equal(first.specialCharges, 0);
+  finishHitstop(longRoom);
+  const second = knockOutWithHero(longRoom, 1);
+  assert.equal(second.specialKills, 2);
+  assert.equal(second.specialCharges, 1);
+  assert.ok(second.events.some((event) => event.type === 'special-ready'));
+  finishHitstop(longRoom);
+  const activeEnemies = longRoom.combat.fighters.filter((fighter) => fighter.team === 1 && fighter.hp > 0);
+  assert.equal(activeEnemies.length, 2);
+  const before = activeEnemies.map((enemy) => enemy.hp);
+  const wave = longRoom.step({ special: true });
+  assert.equal(wave.specialCharges, 0);
+  assert.deepEqual(activeEnemies.map((enemy) => enemy.hp), before.map((hp) => Math.ceil(hp / 2)));
+  assert.equal(wave.events.filter((event) => event.type === 'hit' && event.special).length, 2);
+});
+
+test('the campaign-only light wave accumulates charges, halves the current wave and protects the hero', () => {
+  const session = new CampaignSession({ storage: seedProgress(12, 9) });
+  session.start();
+  let result = knockOutWithHero(session, 2);
+  assert.equal(result.waveNumber, 2);
+  assert.equal(result.specialCharges, 1);
+  finishHitstop(session);
+  result = knockOutWithHero(session, 2);
+  assert.equal(result.specialKills, 4);
+  assert.equal(result.specialCharges, 2);
+  assert.equal(result.phase, 'playing');
+
+  // A short press arriving during hitstop is not consumed on a frozen tick.
+  assert.equal(session.step({ special: true }).specialCharges, 2);
+  while (session.combat.hitstop > 0) assert.equal(session.step({ special: true }).specialCharges, 2);
+  const enemy = session.combat.fighters.find((fighter) => fighter.team === 1 && fighter.hp > 0);
+  const hero = session.combat.fighters.find((fighter) => fighter.id === 'hero');
+  const originalHp = enemy.hp;
+  result = session.step({ special: true });
+  assert.equal(result.specialCharges, 1);
+  assert.equal(enemy.hp, Math.ceil(originalHp / 2));
+  assert.ok(hero.invulnerable >= 35 && hero.specialWaveTicks > 0);
+  assert.ok(result.events.some((event) => event.type === 'special-wave' && event.source === hero.id));
+  assert.ok(result.events.some((event) => event.type === 'hit' && event.target === enemy.id && event.special));
+
+  const hpAfterWave = hero.hp;
+  session.combat.arena.hazards.push({ x: hero.x - 10, y: hero.y - 14, w: 20, h: 14, damage: 50 });
+  result = session.step({ special: true });
+  assert.equal(result.specialCharges, 1, 'holding the button cannot spend a second charge');
+  assert.equal(hero.hp, hpAfterWave, 'the invulnerable wave blocks terrain damage');
+  session.combat.arena.hazards.pop();
+  session.step({ special: false });
+  result = session.step({ special: true });
+  assert.equal(result.specialCharges, 0);
+  assert.equal(enemy.hp, Math.ceil(Math.ceil(originalHp / 2) / 2));
+
+  hero.hp = 0;
+  assert.equal(session.step().phase, 'failed');
+  const retry = session.retry();
+  assert.equal(retry.level.number, 9);
+  assert.equal(retry.specialEligible, true);
+  assert.equal(retry.specialKills, 0);
+  assert.equal(retry.specialCharges, 0);
+});
+
 test('the final boss ends the campaign and persists completion', () => {
   const store = seedProgress(56, 55, Array.from({ length: 55 }, (_, i) => i + 1));
   const session = new CampaignSession({ storage: store });
@@ -179,7 +281,7 @@ test('the final boss ends the campaign and persists completion', () => {
   assert.equal(session.next().phase, 'completed');
 });
 
-test('four bosses use reduced stats and only boss-wave entry restores 30 HP', () => {
+test('four chapter bosses retain reduced stats and boss-wave entry restores 30 HP', () => {
   const expected = [
     [14, 171, 0.95, 132],
     [28, 190, 1.02, 146],

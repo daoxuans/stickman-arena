@@ -2,6 +2,7 @@ import { aiInput, createCombatState, createFighter, stepCombat } from '../shared
 import { MAX_LEVEL, checkpointFor, getLevel, isCheckpoint } from '../shared/levels.js';
 
 export const STORAGE_KEY = 'stickman-arena.campaign.v1';
+const SPECIAL_INVULNERABLE_TICKS = 36;
 
 const memoryValues = new Map();
 const memoryStorage = {
@@ -46,6 +47,7 @@ function copyArena(level) {
     theme: level.theme, groundY: level.groundY,
     platforms: level.platforms.map((platform) => ({ ...platform })),
     hazards: level.hazards.map((hazard) => ({ ...hazard })),
+    fallingHazard: level.arena.fallingHazard ? { ...level.arena.fallingHazard } : null,
   };
 }
 
@@ -60,6 +62,10 @@ export class CampaignSession {
     this.levelNumber = null;
     this.waveIndex = 0;
     this.failedLevel = null;
+    this.specialEligible = false;
+    this.specialKills = 0;
+    this.specialCharges = 0;
+    this.specialHeld = false;
     this.#load();
   }
 
@@ -101,6 +107,10 @@ export class CampaignSession {
     this.levelNumber = level.number;
     this.waveIndex = 0;
     this.failedLevel = null;
+    this.specialEligible = level.enemyCount > 3;
+    this.specialKills = 0;
+    this.specialCharges = 0;
+    this.specialHeld = false;
     this.phase = 'playing';
     const player = createFighter({
       id: 'hero', name: '火柴斗士', x: 170, y: level.groundY, team: 0, kind: 'hero', maxHp: 100,
@@ -140,15 +150,87 @@ export class CampaignSession {
     });
   }
 
-  /** Advance one fixed 1/60-second tick. Inputs are {left,right,attack,jump,dodge}. */
+  #castSpecial(player) {
+    const targets = this.combat.fighters.filter((fighter) => fighter.team !== player.team && fighter.hp > 0);
+    if (!targets.length) return null;
+    this.specialCharges--;
+    player.stun = 0;
+    player.attackStage = 0;
+    player.attackTick = 0;
+    player.kickType = null;
+    player.kickTick = 0;
+    player.attackBuffered = false;
+    player.comboWindow = 0;
+    player.dodgeTicks = 0;
+    player.invulnerable = Math.max(player.invulnerable, SPECIAL_INVULNERABLE_TICKS + 1);
+    player.specialWaveTicks = SPECIAL_INVULNERABLE_TICKS;
+
+    const hits = targets.map((target) => {
+      const before = target.hp;
+      target.hp = Math.ceil(before / 2);
+      target.stun = Math.max(target.stun, 16);
+      target.invulnerable = Math.max(target.invulnerable, 12);
+      target.hurtFlash = 11;
+      target.attackStage = 0;
+      target.attackTick = 0;
+      target.kickType = null;
+      target.kickTick = 0;
+      target.attackBuffered = false;
+      target.comboWindow = 0;
+      const direction = Math.sign(target.x - player.x) || player.facing;
+      target.vx = direction * 6 / target.mass;
+      target.vy = Math.min(target.vy, -3);
+      target.grounded = false;
+      return { target: target.id, x: target.x, y: target.y - target.height * .57, damage: before - target.hp };
+    });
+    return { x: player.x, y: player.y - player.height * .52, hits };
+  }
+
+  /** Advance one fixed 1/60-second tick. The light wave is campaign-only. */
   step(input = {}) {
     if (this.phase !== 'playing') return this.snapshot();
     const player = this.combat.fighters.find((fighter) => fighter.team === 0);
-    const inputsById = { [player.id]: input };
+    // Hitstop does not sample actions. The browser retains short taps until
+    // the next live tick, so a held button must not spend charges while frozen.
+    const samplingInput = this.combat.hitstop === 0;
+    const specialDown = input.special === true;
+    const special = samplingInput && specialDown && !this.specialHeld
+      && this.specialEligible && this.specialCharges > 0 && player.hp > 0
+      ? this.#castSpecial(player) : null;
+    if (samplingInput) this.specialHeld = specialDown;
+    const inputsById = { [player.id]: special
+      ? { ...input, attack: false, kick: false, dodge: false } : input };
     for (const enemy of this.combat.fighters) {
       if (enemy.team === 1 && enemy.hp > 0) inputsById[enemy.id] = aiInput(enemy, player, this.combat);
     }
     stepCombat(this.combat, inputsById);
+    if (samplingInput && player.specialWaveTicks > 0) player.specialWaveTicks--;
+    if (special) {
+      this.combat.events.push({
+        id: `${this.combat.tick}:special-wave`, type: 'special-wave',
+        x: special.x, y: special.y, source: player.id, radius: 960,
+      });
+      for (const hit of special.hits) {
+        this.combat.events.push({
+          id: `${this.combat.tick}:special-hit:${hit.target}`, type: 'hit',
+          ...hit, source: player.id, heavy: true, special: true,
+        });
+      }
+    }
+    if (this.specialEligible && player.hp > 0) {
+      for (const outcome of this.combat.events) {
+        if (outcome.type !== 'ko' || outcome.source !== player.id
+          || !this.combat.fighters.some((fighter) => fighter.id === outcome.target && fighter.team === 1)) continue;
+        this.specialKills++;
+        if (this.specialKills % 2 === 0) {
+          this.specialCharges++;
+          this.combat.events.push({
+            id: `${this.combat.tick}:special-ready:${this.specialKills}`,
+            type: 'special-ready', charges: this.specialCharges,
+          });
+        }
+      }
+    }
 
     // Failure takes precedence even if the last blow knocked both sides out.
     if (player.hp <= 0) {
@@ -212,6 +294,9 @@ export class CampaignSession {
       waveNumber: this.waveIndex + 1,
       waveCount: level.waves.length,
       failedLevel: this.failedLevel,
+      specialEligible: this.specialEligible,
+      specialKills: this.specialKills,
+      specialCharges: this.specialCharges,
       progress: { ...this.progress, cleared: [...this.progress.cleared] },
     };
   }

@@ -12,6 +12,7 @@ const IDS = [
   'match-clock', 'session-status', 'checkpoint-label', 'progress-label',
   'room-code', 'room-input', 'create-room', 'join-room', 'copy-room',
   'room-message', 'leave-room', 'rematch', 'sound-toggle', 'toast',
+  'special-status', 'special-key-guide', 'special-button',
 ];
 const ui = Object.fromEntries(IDS.map((id) => [id, document.getElementById(id)]));
 for (const id of IDS) {
@@ -34,11 +35,11 @@ let overlaySecondaryAction = null;
 const keyboard = new Set();
 const pointerButtons = new Map();
 const campaignPresses = new Set();
-const campaignActions = new Set(['jump', 'attack', 'kick', 'dodge']);
+const campaignActions = new Set(['jump', 'attack', 'kick', 'dodge', 'special']);
 const keyBindings = new Map([
   ['KeyA', 'left'], ['ArrowLeft', 'left'],
   ['KeyD', 'right'], ['ArrowRight', 'right'],
-  ['KeyJ', 'attack'], ['KeyK', 'kick'], ['Space', 'jump'],
+  ['KeyJ', 'attack'], ['KeyK', 'kick'], ['KeyL', 'special'], ['Space', 'jump'],
   ['ShiftLeft', 'dodge'], ['ShiftRight', 'dodge'],
 ]);
 
@@ -113,9 +114,16 @@ class SoundEffects {
     if (!this.enabled) return;
     switch (effect.type) {
       case 'hit':
+        if (effect.special) break; // The light wave already has its own impact sound.
         this.tone(effect.heavy ? 115 : 160, effect.heavy ? 42 : 65, effect.heavy ? 0.19 : 0.12, effect.heavy ? 0.18 : 0.12, 'sawtooth');
         this.noise(effect.heavy ? 0.13 : 0.075, 0.09);
         break;
+      case 'special-wave':
+        this.tone(170, 720, 0.35, 0.11, 'sawtooth');
+        this.tone(420, 135, 0.42, 0.07, 'triangle');
+        this.noise(0.18, 0.055, 2300);
+        break;
+      case 'special-ready': this.tone(520, 880, 0.17, 0.045); break;
       case 'ko': {
         // KO arrives when the fighter falls. The tomato lands on the head ~180 ms later.
         this.tone(125, 75, 0.11, 0.025, 'sine');
@@ -134,6 +142,11 @@ class SoundEffects {
       case 'jump-kick':
         this.tone(320, 125, 0.16, 0.045, 'sawtooth');
         this.noise(0.075, 0.03);
+        break;
+      case 'fall-impact':
+        this.tone(effect.kind === 'hail' ? 650 : 260, effect.kind === 'hail' ? 185 : 82,
+          0.085, 0.025, effect.kind === 'hail' ? 'triangle' : 'sine');
+        this.noise(0.045, 0.018, effect.kind === 'hail' ? 3400 : 1300);
         break;
       case 'land': this.tone(110, 60, 0.08, 0.04); break;
       case 'dodge': this.noise(0.11, 0.04); break;
@@ -202,6 +215,7 @@ function currentInput() {
     left: held.has('left'), right: held.has('right'),
     attack: held.has('attack'), kick: held.has('kick'),
     jump: held.has('jump'), dodge: held.has('dodge'),
+    special: held.has('special'),
   };
 }
 
@@ -225,7 +239,9 @@ function sendInput(force = false) {
   const now = performance.now();
   if (!force && now - duel.lastInputAt < 48) return;
   duel.lastInputAt = now;
-  duel.socket.send(JSON.stringify({ type: 'input', seq: duel.inputSeq++, input: currentInput() }));
+  const input = currentInput();
+  delete input.special; // A campaign-only power is never part of the PvP protocol.
+  duel.socket.send(JSON.stringify({ type: 'input', seq: duel.inputSeq++, input }));
 }
 
 document.addEventListener('keydown', (event) => {
@@ -308,7 +324,8 @@ function drawMap() {
 }
 
 function updateCampaignHud() {
-  const { level, combat, progress, waveNumber, waveCount } = campaignView;
+  const { level, combat, progress, waveNumber, waveCount,
+    specialEligible, specialCharges, specialKills } = campaignView;
   const hero = combat?.fighters.find((fighter) => fighter.team === 0);
   const opponents = combat?.fighters.filter((fighter) => fighter.team === 1 && fighter.hp > 0) ?? [];
   const opponent = opponents[0];
@@ -324,6 +341,20 @@ function updateCampaignHud() {
   ui['session-status'].textContent = '单人闯关 · 本机存档';
   ui['checkpoint-label'].textContent = `存档点：第 ${String(progress.checkpointLevel).padStart(2, '0')} 关`;
   ui['progress-label'].textContent = `当前进度 ${String(progress.currentLevel).padStart(2, '0')} / ${MAX_LEVEL} · 失败 ${progress.deaths} 次`;
+  ui['special-status'].hidden = !specialEligible;
+  ui['special-key-guide'].hidden = !specialEligible;
+  ui['special-button'].hidden = !specialEligible;
+  if (specialEligible) {
+    const needed = 2 - (specialKills % 2);
+    const specialText = specialCharges > 0
+      ? `光波 ×${specialCharges} · 按 L 发动`
+      : `光波充能 · 再击倒 ${needed} 人`;
+    if (ui['special-status'].textContent !== specialText) ui['special-status'].textContent = specialText;
+    ui['special-status'].classList.toggle('is-ready', specialCharges > 0);
+    ui['special-button'].textContent = specialCharges > 0 ? `光波 ×${specialCharges}` : '光波';
+    ui['special-button'].disabled = specialCharges === 0 || campaignView.phase !== 'playing';
+    ui['special-button'].setAttribute('aria-label', `无敌光波，剩余 ${specialCharges} 次`);
+  }
 }
 
 function campaignOverlay() {
@@ -357,7 +388,7 @@ function campaignOverlay() {
   } else if (phase === 'completed') {
     showOverlay({
       title: '56 关全部突破',
-      body: '森林、城市、海洋与陆地的四位首领均已击败。你的通关记录保存在这台浏览器。',
+      body: '森林、城市、海洋与陆地的九场首领战均已突破。你的通关记录保存在这台浏览器。',
       primary: '开启新的征程',
       onPrimary: () => {
         if (!window.confirm('重新开始将清除当前的 56 关通关进度，确定继续吗？')) return;
@@ -371,7 +402,7 @@ function campaignOverlay() {
   } else {
     showOverlay({
       title: level.number === 1 && progress.cleared.length === 0 ? '准备开战' : '继续征程',
-      body: `第 ${level.number} / ${MAX_LEVEL} 关 · ${level.themeName}「${level.name}」。A/D 移动，J 攻击，空格跳跃，Shift 闪避。`,
+      body: `第 ${level.number} / ${MAX_LEVEL} 关 · ${level.themeName}「${level.name}」。A/D 移动，J 攻击，空格跳跃，Shift 闪避。${campaignView.specialEligible ? '每击倒两名敌人可按 L 释放一次无敌光波。' : ''}`,
       primary: '开始挑战',
       onPrimary: () => { resumeCampaign(); hideOverlay(); },
     });
@@ -390,6 +421,10 @@ function consumeEvents(events) {
   for (const effect of events ?? []) {
     renderer.effect(effect);
     sound.play(effect);
+    if (mode === 'campaign' && effect.type === 'special-ready') {
+      notify(`光波已充能 ${effect.charges} 次，按 L 或点击光波发动`);
+      updateCampaignHud();
+    }
   }
 }
 
@@ -412,6 +447,10 @@ function updateDuelHud() {
   ui['session-status'].textContent = duel.code ? `联机房间 · ${duel.code}` : '联机大厅';
   ui['checkpoint-label'].textContent = '服务器判定命中与胜负';
   ui['progress-label'].textContent = duel.phase === 'playing' ? '99 秒决胜 · 平局可重赛' : '双方到齐后自动开赛';
+  ui['special-status'].hidden = true;
+  ui['special-key-guide'].hidden = true;
+  ui['special-button'].hidden = true;
+  ui['special-button'].disabled = true;
   ui['room-code'].textContent = duel.code ?? '—— —— ——';
   ui['copy-room'].disabled = !duel.code;
   ui['leave-room'].hidden = !duel.code;

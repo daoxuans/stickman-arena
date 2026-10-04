@@ -63,8 +63,8 @@ test('browser controller boots, switches modes, starts a fight and renders a fra
   const ids = [...page.matchAll(/id="([^"]+)"/g)].map((match) => match[1]);
   const elements = new Map(ids.map((id) => [id, new FakeNode(id)]));
   elements.get('duel-theme').value = 'city';
-  const buttons = ['left', 'right', 'attack', 'kick', 'jump', 'dodge'].map((key) => {
-    const node = new FakeNode();
+  const buttons = ['left', 'right', 'attack', 'kick', 'jump', 'dodge', 'special'].map((key) => {
+    const node = key === 'special' ? elements.get('special-button') : new FakeNode();
     node.dataset.key = key;
     return node;
   });
@@ -160,6 +160,7 @@ test('browser controller boots, switches modes, starts a fight and renders a fra
     assert.equal(elements.get('screen-overlay').hidden, false);
     assert.equal(elements.get('duel-panel').hidden, true);
     assert.equal(elements.get('stage-title').textContent, '林缘试招');
+    assert.equal(elements.get('special-button').hidden, true, 'the first room cannot use the wave');
 
     elements.get('duel-button').fire('click');
     assert.equal(elements.get('campaign-panel').hidden, true);
@@ -197,12 +198,12 @@ test('browser controller boots, switches modes, starts a fight and renders a fra
     assert.equal(advanceFrame()[0].jump, false);
     assert.equal(campaignInputs.at(-1).kick, false);
 
-    for (const [code, action] of [['Space', 'jump'], ['KeyJ', 'attack'], ['KeyK', 'kick'], ['ShiftLeft', 'dodge']]) {
+    for (const [code, action] of [['Space', 'jump'], ['KeyJ', 'attack'], ['KeyK', 'kick'], ['KeyL', 'special'], ['ShiftLeft', 'dodge']]) {
       tapKey(code);
       assert.equal(advanceFrame()[0][action], true, `short ${action} keyboard tap should survive until the next tick`);
       assert.equal(advanceFrame()[0][action], false, `${action} must not automatically repeat`);
     }
-    for (const [index, action] of ['jump', 'attack', 'kick', 'dodge'].entries()) {
+    for (const [index, action] of ['jump', 'attack', 'kick', 'dodge', 'special'].entries()) {
       const button = buttons.find((entry) => entry.dataset.key === action);
       button.fire('pointerdown', { pointerId: 20 + index });
       button.fire('pointerup', { pointerId: 20 + index });
@@ -242,6 +243,10 @@ test('browser controller boots, switches modes, starts a fight and renders a fra
     assert.equal(campaignInputs.at(-1).jump, false, 'a key pressed while paused must not fire on resume');
     document.fire('keyup', { code: 'Space' });
 
+    tapKey('KeyL');
+    window.fire('blur');
+    assert.equal(advanceFrame()[0].special, false, 'blur drops a queued light wave');
+
     document.fire('keydown', { code: 'ShiftLeft', repeat: false });
     latestCampaignView.combat.fighters.find((fighter) => fighter.id === 'hero').hp = 0;
     advanceFrame();
@@ -280,6 +285,12 @@ test('browser controller boots, switches modes, starts a fight and renders a fra
     socket.fire('message', { data: JSON.stringify({ type: 'created', code: '123456', role: 'p1', theme: 'city' }) });
     socket.fire('message', { data: JSON.stringify({ type: 'start', code: '123456', role: 'p1', theme: 'city' }) });
     assert.equal(socket.sent.at(-1).input.kick, false);
+    assert.equal('special' in socket.sent.at(-1).input, false);
+
+    document.fire('keydown', { code: 'KeyL', repeat: false });
+    assert.equal('special' in socket.sent.at(-1).input, false, 'light wave is never sent to the duel server');
+    document.fire('keyup', { code: 'KeyL' });
+    assert.equal(elements.get('special-button').hidden, true, 'duels do not show the special button');
 
     document.fire('keydown', { code: 'KeyK', repeat: false });
     assert.equal(socket.sent.at(-1).input.kick, true);

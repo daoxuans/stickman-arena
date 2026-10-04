@@ -1,5 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { attackOf } from '../shared/combat.js';
 import { createRenderer } from '../public/render.js';
 
 const ATTACK_WINDOWS = [
@@ -32,6 +33,9 @@ function recordingCanvas() {
     beginPath() { path = []; },
     moveTo(x, y) { path.push([x, y]); },
     lineTo(x, y) { path.push([x, y]); },
+    bezierCurveTo(cx1, cy1, cx2, cy2, x, y) {
+      path.push({ kind: 'bezier', cx1, cy1, cx2, cy2, x, y });
+    },
     arc(x, y, radius) { path.push({ kind: 'arc', x, y, radius }); },
     ellipse(x, y, rx, ry) { path.push({ kind: 'ellipse', x, y, rx, ry }); },
     fill() {
@@ -96,50 +100,163 @@ function kicker(type, kickTick, facing = 1, kind = 'hero') {
     y: type === 'air' ? 350 : 430, grounded: type !== 'air' };
 }
 
-test('regular and boss arrows appear only during each real damage window', () => {
+test('regular and boss punch wind appears only during each real damage window', () => {
   for (const { kind, stage, from, to } of ATTACK_WINDOWS) {
     const frames = [
       [from - 1, false], [from, true],
       [Math.floor((from + to) / 2), true], [to, true], [to + 1, false],
     ];
     for (const [attackTick, visible] of frames) {
-      const { fills } = renderFighters([fighter(kind, stage, attackTick)]);
-      const cores = fills.filter(({ color }) => color === '#fff9e3');
-      assert.equal(cores.length, Number(visible), `${kind} combo ${stage}, tick ${attackTick}`);
+      const { fills, strokes } = renderFighters([fighter(kind, stage, attackTick)]);
+      const core = kind === 'boss' ? '#ffeddb' : '#fff8e8';
+      const gusts = strokes.filter(({ color, points }) => color === core
+        && points.some((point) => point.kind === 'bezier'));
+      assert.equal(gusts.length, Number(visible), `${kind} combo ${stage}, tick ${attackTick}`);
+      assert.equal(fills.filter(({ color }) => color === core).length, 0,
+        'punches use open wind strokes, never the old filled arrow');
       if (kind === 'boss') {
         const warning = stage === 3 ? '#f59b77' : '#ffd09a';
         assert.equal(fills.some(({ color }) => color === warning), attackTick < from,
-          `boss warning and arrow must not overlap at stage ${stage}, tick ${attackTick}`);
+          `boss warning and punch wind must not overlap at stage ${stage}, tick ${attackTick}`);
       }
     }
   }
 });
 
-test('hero and opponent arrows face the fighter direction even on a whiff', () => {
+test('hero and opponent fist wakes mirror the fighter direction even on a whiff', () => {
   for (const facing of [-1, 1]) {
     for (const index of [0, 1]) {
       const combatant = fighter(index ? 'grunt' : 'hero', 2, 8, facing);
       const fighters = index ? [fighter('hero', 0, 0), combatant] : [combatant];
-      const { fills } = renderFighters(fighters);
-      const core = index ? '#fff0e7' : '#fff9e3';
-      const arrows = fills.filter(({ color }) => color === core);
-      assert.equal(arrows.length, 1, `fighter ${index}, facing ${facing}`);
-      assert.equal(arrows[0].scaleX, facing, `arrow should mirror with fighter ${index}`);
-      assert.ok(arrows[0].points[3][0] > arrows[0].points[0][0], 'local arrowhead points forward');
+      const { strokes } = renderFighters(fighters);
+      const core = index ? '#fff0e7' : '#fff8e8';
+      const wind = strokes.filter(({ color, points }) => color === core
+        && points.some((point) => point.kind === 'bezier'));
+      assert.equal(wind.length, 1, `fighter ${index}, facing ${facing}`);
+      assert.equal(wind[0].scaleX, facing, `the fist wake mirrors fighter ${index}`);
+      assert.ok(wind[0].points[1].x > wind[0].points[0][0],
+        'a curved gust moves forward from the fist, without an arrowhead');
     }
   }
 });
 
-test('reduced motion keeps the arrow core but removes its decorative trails', () => {
+test('reduced motion keeps the punch wind but removes its decorative trails', () => {
   const combatant = fighter('hero', 3, 10);
   const normal = renderFighters([combatant]);
   const reduced = renderFighters([combatant], { reducedMotion: true });
-  const trails = ({ color, width }) => (color === '#f5b66d' && width === 1.8)
-    || (color === '#fff9e3' && (width === 1.4 || width === 1.7));
-  assert.equal(normal.fills.filter(({ color }) => color === '#fff9e3').length, 1);
-  assert.equal(reduced.fills.filter(({ color }) => color === '#fff9e3').length, 1);
-  assert.equal(normal.strokes.filter(trails).length, 4);
+  const coreWind = ({ color, points }) => color === '#fff8e8'
+    && points.some((point) => point.kind === 'bezier');
+  const trails = ({ color, width }) => color === '#f5b66d' && width === 1.6;
+  assert.equal(normal.strokes.filter(coreWind).length, 1);
+  assert.equal(reduced.strokes.filter(coreWind).length, 1);
+  assert.equal(normal.strokes.filter(trails).length, 3);
   assert.equal(reduced.strokes.filter(trails).length, 0);
+});
+
+test('the boss keeps a slim stick-figure body but stands visibly taller and wider', () => {
+  const hero = { ...fighter('hero', 0, 0), id: 'hero', x: 260, height: 88 };
+  const boss = { ...fighter('boss', 0, 0, -1), id: 'boss', x: 650, height: 136 };
+  const { fills, strokes } = renderFighters([hero, boss]);
+  const heroHead = fills.find(({ color, points }) => color === '#173b3b'
+    && points.some((point) => point.kind === 'arc' && point.radius === 22));
+  const bossHead = fills.find(({ color, points }) => color === '#482d34'
+    && points.some((point) => point.kind === 'arc' && point.radius === 22));
+  const bossCollar = strokes.find(({ color, width }) => color === '#ef8c72' && width === 1.6);
+  assert.equal(heroHead?.scaleX, 1);
+  assert.equal(bossHead?.scaleX, -1.28);
+  assert.ok(bossCollar, 'an angular shoulder accent separates bosses from ordinary enemies');
+  assert.ok(Math.abs(bossHead.scaleX) > Math.abs(heroHead.scaleX),
+    'the same oversized head is scaled up on the boss');
+});
+
+test('the enlarged boss fist wake stays near its authoritative melee reach', () => {
+  for (const [stage, activeTick] of [[1, 14], [2, 15], [3, 17]]) {
+    const { strokes } = renderFighters([fighter('boss', stage, activeTick)]);
+    const wake = strokes.find(({ color, points }) => color === '#ffeddb'
+      && points.some((point) => point.kind === 'bezier'));
+    const reach = attackOf({ kind: 'boss', attackStage: stage }).reach;
+    assert.ok(wake);
+    assert.ok(wake.points[1].x * Math.abs(wake.scaleX) <= reach + 20,
+      `boss combo ${stage} must not suggest a long-range projectile`);
+  }
+});
+
+test('the special wave expands from the player once and keeps a readable invulnerable aura', () => {
+  const { renderer, strokes } = recordingRenderer();
+  renderFrame(renderer, [], 39);
+  strokes.length = 0;
+  const wave = { id: '40:special-wave', type: 'special-wave', x: 310, y: 350, radius: 960 };
+  renderer.effect(wave);
+  renderFrame(renderer, [{ ...fighter('hero', 0, 0), specialWaveTicks: 25 }], 40);
+  assert.equal(strokes.filter(({ color }) => color === '#dffff8').length, 1);
+  assert.equal(strokes.filter(({ color }) => color === '#72e4df').length, 1);
+  assert.ok(strokes.some(({ color }) => color === '#ddfff3'),
+    'the hero is visibly shielded for the whole special window');
+  strokes.length = 0;
+  renderer.effect({ ...wave });
+  renderFrame(renderer, [], 41);
+  assert.equal(strokes.filter(({ color }) => color === '#dffff8').length, 1,
+    'replayed snapshots cannot stack the same full-screen wave');
+
+  const reduced = recordingRenderer(true);
+  renderFrame(reduced.renderer, [], 39);
+  reduced.renderer.effect({ ...wave, id: '40:low-motion-wave' });
+  renderFrame(reduced.renderer, [], 40);
+  assert.equal(reduced.strokes.filter(({ color }) => color === '#dffff8').length, 1,
+    'reduced motion retains the cast confirmation with a static flash');
+});
+
+test('falling-object warning and object are legible only in campaign scenes', () => {
+  const recording = recordingRenderer();
+  const { renderer, strokes, fills } = recording;
+  const arena = { theme: 'ocean', groundY: 430, platforms: [], hazards: [] };
+  const fallingObject = { kind: 'hail', phase: 'warning', x: 380, y: -20,
+    impactY: 325, radius: 8, ticksUntilImpact: 45, warningTicks: 40, index: 0 };
+  renderer.render({ tick: 130, arena, fighters: [], fallingObject },
+    { mode: 'campaign', theme: 'ocean', level: 30 });
+  assert.ok(strokes.some(({ color }) => color === '#d4fff4'),
+    'the target zone warns before a small object descends');
+
+  strokes.length = 0;
+  fills.length = 0;
+  renderer.render({ tick: 172, arena, fighters: [],
+    fallingObject: { ...fallingObject, phase: 'falling', y: 190, ticksUntilImpact: 12 } },
+  { mode: 'campaign', theme: 'ocean', level: 30 });
+  assert.ok(fills.some(({ color }) => color === '#679eaa'), 'a hailstone is actually visible');
+  assert.ok(strokes.some(({ color }) => color === '#d6f5f4'), 'its short trail conveys falling motion');
+
+  strokes.length = 0;
+  fills.length = 0;
+  renderer.render({ tick: 173, arena, fighters: [], fallingObject },
+    { mode: 'duel', theme: 'ocean' });
+  assert.ok(!strokes.some(({ color }) => color === '#d4fff4'));
+  assert.ok(!fills.some(({ color }) => color === '#679eaa'));
+
+  const reduced = recordingRenderer(true);
+  reduced.renderer.render({ tick: 172, arena, fighters: [],
+    fallingObject: { ...fallingObject, phase: 'falling', y: 190 } },
+  { mode: 'campaign', theme: 'ocean', level: 30 });
+  assert.ok(reduced.fills.some(({ color }) => color === '#679eaa'));
+  assert.ok(!reduced.strokes.some(({ color }) => color === '#d6f5f4'),
+    'reduced motion keeps the object and warning, without a falling streak');
+});
+
+test('falling impacts burst once even if an authoritative event is replayed', () => {
+  const { renderer, strokes, fills } = recordingRenderer();
+  renderFrame(renderer, [], 39);
+  const impact = { id: '40:fall-impact', type: 'fall-impact', x: 400, y: 325,
+    kind: 'hail', radius: 8, index: 0 };
+  renderer.effect(impact);
+  strokes.length = 0;
+  fills.length = 0;
+  renderFrame(renderer, [], 40);
+  assert.equal(strokes.filter(({ color }) => color === '#f8e7c7').length, 1);
+  assert.ok(fills.some(({ color }) => color === '#cbd7ca'), 'the impact scatters a few small shards');
+  renderer.effect({ ...impact });
+  strokes.length = 0;
+  renderFrame(renderer, [], 41);
+  assert.equal(strokes.filter(({ color }) => color === '#f8e7c7').length, 1,
+    'the same falling object cannot burst twice when snapshots repeat');
 });
 
 test('ground and air kick energy tracks only the authoritative active frames, even on a whiff', () => {

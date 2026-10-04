@@ -10,11 +10,16 @@ const THEMES = ['forest', 'city', 'ocean', 'land'];
 const ASSET_ROOT = new URL('../public/assets/backgrounds/', import.meta.url);
 const EXPECTED_SIZE = [1600, 900];
 const PHOTO_LEVELS = [
-  [1, 7, 11, 13], [15, 18, 22, 24],
+  [1, 4, 7, 11, 13], [15, 18, 22, 24, 27],
   [29, 33, 39, 42], [44, 46, 49, 56],
 ];
-const PHOTO_FILES = THEMES.flatMap((theme) => ['', '-2', '-3', '-4']
-  .map((suffix) => `${theme}${suffix}.webp`));
+const PHOTO_NAMES = [
+  ['forest-intro.webp', 'forest.webp', 'forest-2.webp', 'forest-3.webp', 'forest-4.webp'],
+  ['city.webp', 'city-2.webp', 'city-3.webp', 'city-4.webp', 'city-5.webp'],
+  ['ocean.webp', 'ocean-2.webp', 'ocean-3.webp', 'ocean-4.webp'],
+  ['land.webp', 'land-2.webp', 'land-3.webp', 'land-4.webp'],
+];
+const PHOTO_FILES = PHOTO_NAMES.flat();
 
 function webpChunks(buffer) {
   assert.ok(buffer.length >= 30, 'WebP must include a RIFF container and image data');
@@ -63,7 +68,7 @@ function selectedStages(theme, chapter) {
     .filter((level) => photoForLevel(theme, level));
 }
 
-test('only the sixteen bounded, metadata-free 1600×900 WebP backgrounds are public', () => {
+test('only the eighteen bounded, metadata-free 1600×900 WebP backgrounds are public', () => {
   const filenames = readdirSync(ASSET_ROOT).sort();
   assert.deepEqual(filenames, [...PHOTO_FILES].sort());
   for (const filename of filenames) {
@@ -90,6 +95,8 @@ test('HTTP serves every processed background but never exposes private originals
   for (const privatePath of [
     '/pic/source-contact.webp',
     `/pic/${encodeURIComponent('微信图片_20261004174950_13_2.jpg')}`,
+    `/pic/${encodeURIComponent('微信图片_20261004174959_18_2.jpg')}`,
+    `/pic/${encodeURIComponent('微信图片_20261004174956_16_2.jpg')}`,
     '/pic/Forest_path_at_sunset_(Unsplash).jpg',
     '/assets/backgrounds/source-contact.webp',
   ]) {
@@ -97,22 +104,21 @@ test('HTTP serves every processed background but never exposes private originals
   }
 });
 
-test('sixteen photo stages each use a distinct chapter photo; choices survive reload and retries', async () => {
+test('eighteen photo stages preserve the existing photos plus the first-stage and city additions', async () => {
   const allSelected = [];
   const secondLoad = await import(`../public/render.js?backgrounds-stability=${Date.now()}`);
 
   for (let chapter = 0; chapter < THEMES.length; chapter += 1) {
     const theme = THEMES[chapter];
     const stages = selectedStages(theme, chapter);
-    assert.deepEqual(stages, PHOTO_LEVELS[chapter], `${theme} must retain its original four photo stages`);
+    assert.deepEqual(stages, PHOTO_LEVELS[chapter], `${theme} must keep its assigned photo stages`);
     allSelected.push(...stages);
     const selectedPaths = stages.map((level) => photoForLevel(theme, level));
-    assert.equal(new Set(selectedPaths).size, 4, `${theme} must use each background once`);
+    assert.equal(new Set(selectedPaths).size, stages.length, `${theme} must use each background once`);
 
     for (let level = chapter * 14 + 1; level <= (chapter + 1) * 14; level += 1) {
       const photoIndex = stages.indexOf(level);
-      const suffix = photoIndex > 0 ? `-${photoIndex + 1}` : '';
-      const expected = photoIndex >= 0 ? `./assets/backgrounds/${theme}${suffix}.webp` : null;
+      const expected = photoIndex >= 0 ? `./assets/backgrounds/${PHOTO_NAMES[chapter][photoIndex]}` : null;
       assert.equal(photoForLevel(theme, level), expected, `${theme} stage ${level}`);
       assert.equal(secondLoad.photoForLevel(theme, level), expected, 'choice must survive a fresh module load');
       for (const other of THEMES.filter((name) => name !== theme)) {
@@ -121,6 +127,7 @@ test('sixteen photo stages each use a distinct chapter photo; choices survive re
     }
   }
 
+  assert.equal(allSelected.length, 18);
   for (let i = 1; i < allSelected.length; i += 1) {
     assert.ok(allSelected[i] - allSelected[i - 1] > 1, `photo stages ${allSelected[i - 1]} and ${allSelected[i]} are adjacent`);
   }
@@ -132,27 +139,50 @@ test('sixteen photo stages each use a distinct chapter photo; choices survive re
   }
 });
 
-test('checkpoint failure, retry, and reload keep the same photo assignment', () => {
+function savedAt(currentLevel, checkpointLevel = currentLevel) {
   let saved = JSON.stringify({
-    currentLevel: 33, checkpointLevel: 33, deaths: 0, completed: false, cleared: [],
+    currentLevel, checkpointLevel, deaths: 0, completed: false, cleared: [],
   });
-  const storage = {
+  return {
     getItem(key) { return key === STORAGE_KEY ? saved : null; },
     setItem(key, value) { if (key === STORAGE_KEY) saved = value; },
   };
+}
+
+test('first-stage, city and ocean checkpoint photos survive failure, retry and reload', () => {
+  for (const [level, filename] of [
+    [1, 'forest-intro.webp'], [27, 'city-5.webp'], [33, 'ocean-2.webp'],
+  ]) {
+    const storage = savedAt(level);
+    const session = new CampaignSession({ storage });
+    const first = session.start();
+    const chosen = photoForLevel(first.level.theme, first.level.number);
+    assert.equal(chosen, `./assets/backgrounds/${filename}`);
+
+    session.combat.fighters[0].hp = 0;
+    assert.equal(session.step().phase, 'failed');
+    const retry = session.retry();
+    assert.equal(retry.level.number, level);
+    assert.equal(photoForLevel(retry.level.theme, retry.level.number), chosen);
+
+    const restored = new CampaignSession({ storage }).start();
+    assert.equal(photoForLevel(restored.level.theme, restored.level.number), chosen);
+  }
+});
+
+test('level four uses the old forest photo; failing there returns to the first-stage photo', () => {
+  const storage = savedAt(4, 1);
   const session = new CampaignSession({ storage });
   const first = session.start();
-  const chosen = photoForLevel(first.level.theme, first.level.number);
-  assert.equal(chosen, './assets/backgrounds/ocean-2.webp');
+  assert.equal(photoForLevel(first.level.theme, first.level.number), './assets/backgrounds/forest.webp');
+  const refreshed = new CampaignSession({ storage }).start();
+  assert.equal(photoForLevel(refreshed.level.theme, refreshed.level.number), './assets/backgrounds/forest.webp');
 
   session.combat.fighters[0].hp = 0;
   assert.equal(session.step().phase, 'failed');
   const retry = session.retry();
-  assert.equal(retry.level.number, 33);
-  assert.equal(photoForLevel(retry.level.theme, retry.level.number), chosen);
-
-  const restored = new CampaignSession({ storage }).start();
-  assert.equal(photoForLevel(restored.level.theme, restored.level.number), chosen);
+  assert.equal(retry.level.number, 1);
+  assert.equal(photoForLevel(retry.level.theme, retry.level.number), './assets/backgrounds/forest-intro.webp');
 });
 
 function fakeCanvas(calls) {

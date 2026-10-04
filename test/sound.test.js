@@ -74,6 +74,24 @@ test('muting or starting a new round prevents a queued tomato sound', () => {
   assert.equal(played.length, 2, 'a cancelled KO never plays after a round change');
 });
 
+test('falling-object warnings stay quiet, while impacts make restrained material cues', () => {
+  const SoundEffects = soundClass({});
+  const sound = new SoundEffects();
+  const played = [];
+  sound.tone = (...args) => played.push(['tone', ...args]);
+  sound.noise = (...args) => played.push(['noise', ...args]);
+
+  sound.play({ type: 'fall-warning', kind: 'hail' });
+  assert.equal(played.length, 0);
+  sound.play({ type: 'fall-impact', kind: 'hail' });
+  assert.deepEqual(played.map(([name]) => name), ['tone', 'noise']);
+  assert.equal(played[0][1], 650);
+  assert.ok(played[0][4] <= 0.03 && played[1][2] <= 0.02);
+  played.length = 0;
+  sound.play({ type: 'fall-impact', kind: 'pebble' });
+  assert.ok(played[0][1] < 650, 'a pebble should sound lower than hail');
+});
+
 test('tomato noise passes through a low-pass filter before reaching the output', () => {
   const links = [];
   const filters = [];

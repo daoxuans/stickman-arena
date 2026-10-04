@@ -13,6 +13,7 @@ const JUMP_SPEED = -11.7;
 const DODGE_SPEED = 10.5;
 const DODGE_TICKS = 11;
 const DODGE_COOLDOWN = 54;
+const FALL_TICKS = 30;
 
 const ARCHETYPES = {
   hero: { hp: 100, speed: 4.45, mass: 1, damage: 1, height: 88 },
@@ -22,7 +23,7 @@ const ARCHETYPES = {
   guard: { hp: 58, speed: 2.7, mass: 1.25, damage: 0.88, height: 88 },
   brute: { hp: 76, speed: 2.4, mass: 1.55, damage: 1.08, height: 96 },
   heavy: { hp: 76, speed: 2.4, mass: 1.55, damage: 1.08, height: 96 },
-  boss: { hp: 152, speed: 3.15, mass: 1.65, damage: 1.16, height: 105 },
+  boss: { hp: 152, speed: 3.15, mass: 1.65, damage: 1.16, height: 136 },
 };
 
 const ATTACKS = [
@@ -38,6 +39,7 @@ const BOSS_ATTACKS = ATTACKS.map((strike) => strike && {
   duration: strike.duration + 8,
   activeFrom: strike.activeFrom + 8,
   activeTo: strike.activeTo + 8,
+  reach: Math.round(strike.reach * 1.25),
 });
 const KICKS = Object.freeze({
   ground: Object.freeze({ duration: 20, activeFrom: 6, activeTo: 11, damage: 11, reach: 78, knockback: 6.8, stun: 19, freeze: 5 }),
@@ -75,7 +77,7 @@ export function createFighter({
   return {
     id: String(id), name: name ?? (kind === 'hero' ? '火柴斗士' : '挑战者'),
     team, kind, x, y, vx: 0, vy: 0, facing: team === 0 ? 1 : -1,
-    width: kind === 'boss' ? 35 : 29, height: stats.height,
+    width: kind === 'boss' ? 44 : 29, height: stats.height,
     hp: health, maxHp: health, speed: stats.speed, mass: stats.mass,
     damageScale: stats.damage * damageScale,
     grounded: true, coyote: 6, jumpBuffer: 0,
@@ -96,11 +98,16 @@ export function createCombatState({ mode = 'campaign', arena = {}, fighters = []
       groundY: arena.groundY ?? 438,
       platforms: arena.platforms ?? [],
       hazards: arena.hazards ?? [],
+      fallingHazard: mode === 'campaign' && arena.fallingHazard
+        ? { ...arena.fallingHazard } : null,
     },
     fighters,
     events: [],
     tick: 0,
     hitstop: 0,
+    fallingClock: 0,
+    fallingIndex: 0,
+    fallingObject: null,
     status: 'playing',
     timerTicks: Math.max(0, Math.floor(durationTicks)),
     winner: null,
@@ -267,6 +274,85 @@ function resolveHazards(state, fighter) {
     }
     break;
   }
+}
+
+function fallingVictim(state, object, previousY, nextY) {
+  return state.fighters.filter((fighter) => fighter.hp > 0
+    && Math.abs(fighter.x - object.x) <= fighter.width * 0.43 + object.radius
+    && previousY - object.radius <= fighter.y
+    && nextY + object.radius >= fighter.y - fighter.height)
+    .sort((a, b) => (a.y - a.height) - (b.y - b.height)
+      || (a.id < b.id ? -1 : a.id > b.id ? 1 : 0))[0] ?? null;
+}
+
+/** One seeded object at a time; the clock advances only on simulated, non-hitstop frames. */
+function advanceFallingHazard(state) {
+  const config = state.mode === 'campaign' ? state.arena.fallingHazard : null;
+  if (!config) return;
+  state.fallingClock++;
+  const object = state.fallingObject;
+  if (object?.phase === 'warning') {
+    object.warningRemaining--;
+    object.ticksUntilImpact--;
+    if (object.warningRemaining === 0) object.phase = 'falling';
+    return;
+  }
+  if (object?.phase === 'falling') {
+    const previousY = object.y;
+    object.fallTick++;
+    const progress = clamp(object.fallTick / FALL_TICKS, 0, 1);
+    const nextY = -object.radius + (object.impactY + object.radius) * progress * progress;
+    object.y = nextY;
+    object.ticksUntilImpact = FALL_TICKS - object.fallTick;
+    const victim = fallingVictim(state, object, previousY, nextY);
+    if (victim || nextY >= object.impactY) {
+      const impactY = victim
+        ? clamp(victim.y - victim.height - object.radius, previousY, nextY) : object.impactY;
+      const damageFraction = Number.isFinite(config.damageFraction)
+        ? clamp(config.damageFraction, 0, 1) : 0.1;
+      const damage = victim ? Math.max(1, Math.round(victim.maxHp * damageFraction)) : 0;
+      const damaged = victim && applyDamage(state, victim, {
+        amount: damage, direction: victim.x < object.x ? -1 : 1,
+        knockback: 3.4, stun: 9, source: `hazard:${object.kind}`,
+      });
+      if (victim && !damaged) {
+        event(state, 'evade', { x: victim.x, y: victim.y - victim.height / 2, target: victim.id });
+      }
+      event(state, 'fall-impact', {
+        kind: object.kind, x: object.x, y: impactY, radius: object.radius,
+        index: object.index, target: victim?.id ?? null, damage: damaged ? damage : 0,
+      });
+      state.fallingObject = null;
+    }
+    return;
+  }
+
+  const firstTick = Number.isFinite(config.firstTick) ? Math.max(1, Math.floor(config.firstTick)) : 120;
+  const period = Number.isFinite(config.period) ? Math.max(1, Math.floor(config.period)) : 240;
+  if (state.fallingClock < firstTick + state.fallingIndex * period) return;
+  const index = state.fallingIndex++;
+  const candidates = state.fighters.filter((fighter) => fighter.hp > 0)
+    .sort((a, b) => a.team - b.team || (a.id < b.id ? -1 : a.id > b.id ? 1 : 0));
+  if (candidates.length === 0) return;
+  const seed = Number.isFinite(config.seed) ? Math.floor(config.seed) : 0;
+  const target = candidates[((seed + index) % candidates.length + candidates.length) % candidates.length];
+  const scatter = [-8, 0, 8, -4, 4][((seed * 17 + index * 7) % 5 + 5) % 5];
+  const x = clamp(target.x + scatter, 20, WORLD_WIDTH - 20);
+  let impactY = state.arena.groundY;
+  for (const platform of state.arena.platforms) {
+    if (x >= platform.x && x <= platform.x + platform.w) impactY = Math.min(impactY, platform.y);
+  }
+  const warningTicks = Number.isFinite(config.warningTicks)
+    ? Math.max(1, Math.floor(config.warningTicks)) : 40;
+  const radius = Number.isFinite(config.radius) ? clamp(config.radius, 2, 20) : 8;
+  state.fallingObject = {
+    kind: config.type ?? 'hail', x, y: -radius, impactY, radius, index,
+    phase: 'warning', warningTicks, warningRemaining: warningTicks,
+    fallTick: 0, ticksUntilImpact: warningTicks + FALL_TICKS,
+  };
+  event(state, 'fall-warning', {
+    kind: state.fallingObject.kind, x, y: impactY, radius, index, warningTicks,
+  });
 }
 
 function moveFighter(state, fighter, input) {
@@ -445,6 +531,7 @@ export function stepCombat(state, inputsById = {}) {
   for (const fighter of state.fighters) moveFighter(state, fighter, inputOf(inputsById[fighter.id]));
   resolveAttacks(state);
   for (const fighter of state.fighters) resolveHazards(state, fighter);
+  advanceFallingHazard(state);
   if (state.mode === 'duel') resolveDuel(state);
   return state;
 }
@@ -463,16 +550,21 @@ export function aiInput(fighter, target, state) {
   const kickOffset = [...fighter.id].reduce((sum, char) => sum + char.charCodeAt(0), 0) % kickCadence;
   const phase = (state.tick + offset) % cadence;
   const wantedGap = isBoss ? 59 : isRusher ? 48 : 57;
-  const walking = gap > wantedGap ? Math.sign(distance) : 0;
+  const targetDirection = Math.sign(distance);
+  // Overlapping hitboxes have no useful left/right side; avoid rapid flips as they cross.
+  const needsTurn = gap > (target.width ?? 29) * 0.35 && targetDirection !== fighter.facing;
+  const canTurn = fighter.stun === 0 && fighter.dodgeTicks === 0
+    && fighter.attackStage === 0 && fighter.kickType === null;
+  const walking = gap > wantedGap || (needsTurn && canTurn) ? targetDirection : 0;
   return {
     left: walking < 0,
     right: walking > 0,
     jump: (target.y < fighter.y - 36 && gap < 190 && phase === 13)
       || (isRusher && gap > 120 && gap < 225 && phase === 3),
-    attack: gap < (isBoss ? 100 : 83) && phase < (isBoss ? 5 : 3),
-    kick: !isBoss && fighter.grounded && fighter.attackStage === 0 && fighter.kickType === null
+    attack: !needsTurn && gap < (isBoss ? 100 : 83) && phase < (isBoss ? 5 : 3),
+    kick: !needsTurn && !isBoss && fighter.grounded && fighter.attackStage === 0 && fighter.kickType === null
       && gap < 80 && (state.tick + kickOffset) % kickCadence === 0,
-    dodge: (isBoss || isGuard || isRusher) && gap < 104
+    dodge: !needsTurn && (isBoss || isGuard || isRusher) && gap < 104
       && target.attackStage > 0 && phase === 19,
   };
 }

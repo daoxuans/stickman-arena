@@ -53,6 +53,14 @@ const PHOTO_THEMES = ['forest', 'city', 'ocean', 'land'];
 const PHOTO_BACKGROUNDS = Object.fromEntries(PHOTO_THEMES.map((theme) => [theme,
   ['', '-2', '-3', '-4'].map((suffix) => `./assets/backgrounds/${theme}${suffix}.webp`),
 ]));
+// Keep the existing sixteen assignments, except for the requested first-stage
+// photo. The former first-stage forest photo moves to stage 4, and stage 27
+// adds a separate city photo without replacing any existing background.
+const PHOTO_OVERRIDES = new Map([
+  [1, './assets/backgrounds/forest-intro.webp'],
+  [4, './assets/backgrounds/forest.webp'],
+  [27, './assets/backgrounds/city-5.webp'],
+]);
 
 const number = (value, fallback = 0) => Number.isFinite(Number(value)) ? Number(value) : fallback;
 const clamp = (value, low, high) => Math.max(low, Math.min(high, value));
@@ -85,7 +93,7 @@ export function photoForLevel(theme, level) {
   const chapter = Math.floor((level - 1) / 14);
   if (PHOTO_THEMES[chapter] !== theme) return null;
   const stage = (level - 1) % 14 + 1;
-  return PHOTO_STAGES[chapter].get(stage) ?? null;
+  return PHOTO_OVERRIDES.get(level) ?? PHOTO_STAGES[chapter].get(stage) ?? null;
 }
 
 function normalizedTheme(value) {
@@ -533,6 +541,74 @@ function drawHazards(ctx, hazards, theme, tick) {
   }
 }
 
+function fallingColors(kind) {
+  switch (kind) {
+    case 'pinecone': return { outer: '#5e493c', face: '#b58861', warning: '#ffe0a1', trail: '#dcc7a4' };
+    case 'debris': return { outer: '#46575b', face: '#aabbb5', warning: '#ffd5a1', trail: '#c8dfda' };
+    case 'hail': return { outer: '#679eaa', face: '#effffa', warning: '#d4fff4', trail: '#d6f5f4' };
+    default: return { outer: '#755949', face: '#e1b78a', warning: '#ffe1b2', trail: '#e5caa5' };
+  }
+}
+
+function drawFallingWarning(ctx, falling, tick, reducedMotion) {
+  if (!falling || (falling.phase !== 'warning' && falling.phase !== 'falling')) return;
+  const x = clamp(number(falling.x), 12, W - 12);
+  const y = clamp(number(falling.impactY), 18, H - 12);
+  const colors = fallingColors(falling.kind);
+  const warningTicks = Math.max(1, number(falling.warningTicks, 40));
+  const urgency = falling.phase === 'falling' ? 1
+    : clamp(1 - number(falling.ticksUntilImpact, warningTicks) / (warningTicks + 30), 0, 1);
+  const pulse = reducedMotion ? 0 : Math.sin(tick * .25) * 2;
+  const radius = 19 + urgency * 7 + pulse;
+  ctx.save();
+  ctx.globalAlpha = .58 + urgency * .34;
+  ctx.beginPath();
+  ctx.arc(x, y, radius, 0, TAU);
+  ctx.strokeStyle = colors.warning;
+  ctx.lineWidth = 2.6;
+  ctx.stroke();
+  for (const side of [-1, 1]) {
+    line(ctx, [[x + side * (radius + 5), y - 6], [x + side * (radius + 5), y + 6]], colors.warning, 2.1);
+  }
+  line(ctx, [[x - 6, y], [x + 6, y]], colors.warning, 2.1);
+  ctx.restore();
+}
+
+function drawFallingObject(ctx, falling, tick, reducedMotion) {
+  if (!falling || falling.phase !== 'falling') return;
+  const x = number(falling.x);
+  const y = number(falling.y);
+  const radius = clamp(number(falling.radius, 8), 5, 14);
+  if (y < -radius * 2 || y > H + radius * 2) return;
+  const colors = fallingColors(falling.kind);
+  if (!reducedMotion) {
+    ctx.save();
+    ctx.globalAlpha = .52;
+    line(ctx, [[x, y - radius], [x - 2, y - radius - 24]], colors.trail, 3.3);
+    ctx.restore();
+  }
+  ctx.save();
+  ctx.translate(x, y);
+  ctx.rotate(reducedMotion ? 0 : tick * .12 + number(falling.index) * .7);
+  if (falling.kind === 'hail') {
+    ellipse(ctx, 0, 0, radius, radius * 1.12, colors.outer);
+    ellipse(ctx, -1, -2, radius * .75, radius * .8, colors.face);
+    line(ctx, [[-radius * .55, -radius * .35], [0, -radius * .7]], '#ffffff', 1.7);
+  } else if (falling.kind === 'pinecone') {
+    ellipse(ctx, 0, 0, radius * .82, radius * 1.2, colors.outer);
+    for (let row = -1; row <= 1; row++) {
+      polygon(ctx, [[-radius * .5, row * radius * .55], [0, (row + .55) * radius * .55],
+        [radius * .5, row * radius * .55], [0, (row - .45) * radius * .55]], colors.face);
+    }
+  } else {
+    polygon(ctx, [[-radius, -radius * .6], [-radius * .2, -radius], [radius * .8, -radius * .56],
+      [radius, radius * .32], [radius * .1, radius], [-radius * .86, radius * .45]], colors.outer);
+    polygon(ctx, [[-radius * .5, -radius * .52], [radius * .2, -radius * .7],
+      [radius * .68, 0], [-radius * .1, radius * .48]], colors.face);
+  }
+  ctx.restore();
+}
+
 function bone(ctx, joints, outline, core, width = 8) {
   line(ctx, joints, outline, width + 3);
   line(ctx, joints, core, width);
@@ -630,58 +706,77 @@ function drawBossWindup(ctx, { hand, head, tick, attackTick, activeFrom, stage, 
   ctx.stroke();
   ellipse(ctx, hand[0], hand[1], 7 + charge * 4, 7 + charge * 4, stage === 3 ? 'rgba(242,112,83,.42)' : 'rgba(255,198,132,.36)');
 
-  // A restrained reach cue points toward the threatened side without
-  // pretending to be a pixel-perfect collision-box preview.
+  // The winding air trail warns of reach without reading as a projectile.
   ctx.globalAlpha = .15 + charge * .38;
   ctx.setLineDash([6, 5]);
   line(ctx, [[29, -55 - bob], [58 + stage * 5, -55 - bob]], signal, 2);
   ctx.setLineDash([]);
-  polygon(ctx, [[66 + stage * 5, -55 - bob], [61 + stage * 5, -60 - bob], [61 + stage * 5, -50 - bob]], signal);
+  ctx.beginPath();
+  ctx.arc(60 + stage * 5, -55 - bob, 7, -.9, .9);
+  ctx.strokeStyle = signal;
+  ctx.lineWidth = 2;
+  ctx.stroke();
   ctx.restore();
 }
 
-function drawLightArrow(ctx, hand, strike, stage, attackTick, index, reducedMotion, boss) {
-  const tailX = hand[0] + 2;
-  const tipX = strike.reach + 12;
-  const centerY = hand[1];
-  const wing = (4 + stage * 2) * (boss ? 1.12 : 1);
-  const accent = index ? '#ec7d6a' : '#f5b66d';
-  const core = index ? '#fff0e7' : '#fff9e3';
-  const glow = ctx.createLinearGradient(tailX - 11, centerY, tipX, centerY);
-  glow.addColorStop(0, 'rgba(245,182,109,0)');
-  glow.addColorStop(.55, index ? 'rgba(236,125,106,.3)' : 'rgba(245,182,109,.3)');
-  glow.addColorStop(1, index ? 'rgba(255,226,204,.72)' : 'rgba(255,246,203,.72)');
-
+function drawPunchWind(ctx, hand, strike, stage, attackTick, index, reducedMotion, boss) {
+  const [x, y] = hand;
+  // Boss art is enlarged from the feet; convert its physical reach back into
+  // local pose space so the gust never promises a hit far beyond the hitbox.
+  const end = strike.reach / (boss ? 1.28 : 1) + 9 + stage * 2;
+  const span = Math.max(24, end - x);
+  const spread = (12 + stage * 2) * (boss ? 1.12 : 1);
+  const accent = boss ? '#ef8c72' : index ? '#ec7d6a' : '#f5b66d';
+  const core = boss ? '#ffeddb' : index ? '#fff0e7' : '#fff8e8';
   const inTick = attackTick - strike.activeFrom + 1;
   const outTick = strike.activeTo - attackTick + 1;
   const crest = Math.min(1, inTick / 2, outTick / 2);
+  const gust = ctx.createLinearGradient(x - 15, y, end, y);
+  gust.addColorStop(0, boss || index ? 'rgba(236,125,106,0)' : 'rgba(245,182,109,0)');
+  gust.addColorStop(.55, boss || index ? 'rgba(236,125,106,.34)' : 'rgba(245,182,109,.34)');
+  gust.addColorStop(1, boss || index ? 'rgba(255,227,206,.09)' : 'rgba(255,248,219,.09)');
   ctx.save();
-  ctx.globalAlpha = reducedMotion ? .86 : .7 + crest * .3;
-  // The arrow remains attached to the fist and ends near the melee reach.
-  // The stage changes its silhouette, not the authoritative hit area.
-  polygon(ctx, [
-    [tailX - 11, centerY - wing * .55], [tipX - 14, centerY - wing * 1.35],
-    [tipX + 4, centerY], [tipX - 14, centerY + wing * 1.35],
-    [tailX - 11, centerY + wing * .55],
-  ], glow);
-  polygon(ctx, [
-    [tailX, centerY - 2.8], [tipX - 13, centerY - 2.8],
-    [tipX - 13, centerY - wing], [tipX, centerY],
-    [tipX - 13, centerY + wing], [tipX - 13, centerY + 2.8],
-    [tailX, centerY + 2.8],
-  ], accent);
-  polygon(ctx, [
-    [tailX + 2, centerY - 1.25], [tipX - 10, centerY - 1.25],
-    [tipX - 10, centerY - wing * .48], [tipX - 2, centerY],
-    [tipX - 10, centerY + wing * .48], [tipX - 10, centerY + 1.25],
-    [tailX + 2, centerY + 1.25],
-  ], core);
+  ctx.globalAlpha = reducedMotion ? .86 : .62 + crest * .34;
+  ctx.lineCap = 'round';
+  // Open, curved wake lines turn around the fist; no filled wedge or point
+  // can be confused with the former flying arrow.
+  ctx.beginPath();
+  ctx.moveTo(x - 13, y - spread * .65);
+  ctx.bezierCurveTo(x + span * .14, y - spread * 1.8,
+    x + span * .73, y - spread * 1.35, end, y - 3);
+  ctx.strokeStyle = gust;
+  ctx.lineWidth = 9 + stage * 1.5;
+  ctx.stroke();
+  ctx.beginPath();
+  ctx.moveTo(x - 10, y - spread * .72);
+  ctx.bezierCurveTo(x + span * .2, y - spread * 1.45,
+    x + span * .7, y - spread * 1.2, end - 3, y - 5);
+  ctx.strokeStyle = core;
+  ctx.lineWidth = 2.7 + stage * .4;
+  ctx.stroke();
+  ctx.beginPath();
+  ctx.moveTo(x - 8, y + spread * .45);
+  ctx.bezierCurveTo(x + span * .23, y + spread * 1.4,
+    x + span * .75, y + spread * 1.13, end - 5, y + 4);
+  ctx.strokeStyle = accent;
+  ctx.lineWidth = 2.4 + stage * .25;
+  ctx.stroke();
+  ctx.beginPath();
+  ctx.ellipse(end - 9, y, 5 + stage, spread * .78, 0, -.91, .91);
+  ctx.strokeStyle = core;
+  ctx.lineWidth = 2;
+  ctx.stroke();
   if (!reducedMotion) {
-    line(ctx, [[tailX + 7, centerY], [tailX - 5, centerY - 7]], accent, 1.8);
-    line(ctx, [[tailX + 7, centerY], [tailX - 5, centerY + 7]], accent, 1.8);
-    if (stage >= 2) {
-      line(ctx, [[tailX - 12, centerY - wing - 2], [tipX - 24, centerY - wing - 2]], core, 1.4);
-      if (stage === 3) line(ctx, [[tailX - 18, centerY + wing + 3], [tipX - 22, centerY + wing + 3]], core, 1.7);
+    ctx.globalAlpha *= .72;
+    for (let i = 0; i < Math.min(stage + 1, 3); i++) {
+      const offset = 6 + i * 8;
+      ctx.beginPath();
+      ctx.moveTo(x - 26 - i * 5, y - spread - offset);
+      ctx.bezierCurveTo(x + span * .1, y - spread - offset * 1.5,
+        x + span * .55, y - spread - offset * .9, end - 16 - i * 5, y - spread * .53);
+      ctx.strokeStyle = accent;
+      ctx.lineWidth = 1.6;
+      ctx.stroke();
     }
   }
   ctx.restore();
@@ -759,20 +854,23 @@ function drawFighter(ctx, fighter, index, groundY, tick, reducedMotion = false, 
   const airKick = fighter.kickType === 'air' && kicking;
   const kickActive = Boolean(kick && kickTick >= kick.activeFrom && kickTick <= kick.activeTo);
   const hit = number(fighter.hurtFlash) > 0;
+  const boss = fighter.kind === 'boss';
+  const figureScale = boss ? 1.28 : 1;
   const invulnerable = Boolean(fighter.invulnerable) || dodge;
   const defeated = number(fighter.hp, 100) <= 0;
-  const bossWindup = fighter.kind === 'boss' && attacking
+  const bossWindup = boss && attacking
     && attackTick < strike.activeFrom && !defeated;
-  const core = hit ? '#fff9e8' : index ? '#f5ddcf' : '#f5ecd7';
-  const outline = index ? '#663f41' : '#173b3b';
-  const accent = index ? '#ec7d6a' : '#f5b66d';
+  const core = hit ? '#fff9e8' : boss ? '#e6c9b9' : index ? '#f5ddcf' : '#f5ecd7';
+  const outline = boss ? '#482d34' : index ? '#663f41' : '#173b3b';
+  const accent = boss ? '#ef8c72' : index ? '#ec7d6a' : '#f5b66d';
 
   const altitude = clamp(groundY - y, 0, 180);
-  ellipse(ctx, x, groundY + 6, Math.max(15, 25 - altitude * .05), 5, `rgba(10,28,28,${Math.max(.09,.3 - altitude * .001)})`);
+  ellipse(ctx, x, groundY + 6, Math.max(15, (boss ? 34 : 25) - altitude * .05),
+    boss ? 6 : 5, `rgba(10,28,28,${Math.max(.09,.3 - altitude * .001)})`);
 
   ctx.save();
   ctx.translate(x, y);
-  ctx.scale(facing, 1);
+  ctx.scale(facing * figureScale, figureScale);
   if (defeated) {
     const elapsed = knockout ? time - knockout.born : Infinity;
     const progress = knockout
@@ -823,13 +921,22 @@ function drawFighter(ctx, fighter, index, groundY, tick, reducedMotion = false, 
     kneeBack = [-25, -18]; footBack = [-42, -3];
     kneeFront = [24, -22]; footFront = [40, -3];
   } else {
-    kneeBack = [-12 - stride * 11, -18]; footBack = [-21 - stride * 18, -1 + Math.max(0, stride) * 5];
-    kneeFront = [12 + stride * 11, -18]; footFront = [22 + stride * 18, -1 + Math.max(0, -stride) * 5];
+    kneeBack = [-12 - stride * 11, -18]; footBack = [-(boss ? 27 : 21) - stride * 18, -1 + Math.max(0, stride) * 5];
+    kneeFront = [12 + stride * 11, -18]; footFront = [(boss ? 28 : 22) + stride * 18, -1 + Math.max(0, -stride) * 5];
   }
   bone(ctx, [hip, kneeBack, footBack], outline, core, 4.8);
   bone(ctx, [hip, kneeFront, footFront], outline, core, 4.8);
   if (kicking && !defeated) drawKickEnergy(ctx, footFront, kick, kickTick, kickActive, airKick, index, reducedMotion);
   bone(ctx, [hip, shoulder], outline, core, 4.8);
+  if (boss && !defeated) {
+    // Broader shoulders and a split collar give the boss a powerful silhouette
+    // while the torso and limbs remain unmistakably thin stick-figure strokes.
+    line(ctx, [[shoulder[0] - 19, -69 - bob], [shoulder[0] - 2, -75 - bob],
+      [shoulder[0] + 20, -69 - bob]], outline, 4.6);
+    line(ctx, [[shoulder[0] - 15, -71 - bob], [shoulder[0] - 2, -75 - bob],
+      [shoulder[0] + 16, -71 - bob]], accent, 1.6);
+    line(ctx, [[hip[0] - 6, -52 - bob], [hip[0] + 6, -47 - bob]], accent, 1.8);
+  }
 
   ctx.beginPath();
   ctx.arc(head[0], head[1], HEAD_RADIUS, 0, TAU);
@@ -871,7 +978,19 @@ function drawFighter(ctx, fighter, index, groundY, tick, reducedMotion = false, 
       activeFrom: strike.activeFrom, stage: attackStage, bob, reducedMotion,
     });
   }
-  if (strikeActive && !defeated) drawLightArrow(ctx, frontHand, strike, attackStage, attackTick, index, reducedMotion, fighter.kind === 'boss');
+  if (strikeActive && !defeated) drawPunchWind(ctx, frontHand, strike, attackStage, attackTick, index, reducedMotion, boss);
+  if (number(fighter.specialWaveTicks) > 0 && !defeated) {
+    const pulse = reducedMotion ? 0 : Math.sin(tick * .4) * 2;
+    ctx.save();
+    ctx.globalAlpha = .18;
+    ellipse(ctx, lean * .5, -48, 32 + pulse, 60 + pulse, '#8de9df');
+    ctx.beginPath();
+    ctx.ellipse(lean * .5, -48, 30 + pulse, 58 + pulse, 0, 0, TAU);
+    ctx.strokeStyle = '#ddfff3';
+    ctx.lineWidth = 3.1;
+    ctx.stroke();
+    ctx.restore();
+  }
   if (invulnerable && !defeated) {
     ctx.save();
     ctx.setLineDash([5, 8]);
@@ -966,7 +1085,7 @@ export function createRenderer(canvas) {
     if (!event || typeof event !== 'object') return;
     reducedMotion = Boolean(motionMedia?.matches);
     const type = String(event.type || '').toLowerCase();
-    if (!['hit', 'dodge', 'land', 'ko', 'kick', 'jump-kick'].includes(type)) return;
+    if (!['hit', 'dodge', 'land', 'ko', 'kick', 'jump-kick', 'special-wave', 'fall-impact'].includes(type)) return;
 
     const stamp = now();
     const stableId = event.id ?? event.eventId ?? event.uid;
@@ -1009,19 +1128,36 @@ export function createRenderer(canvas) {
       knockouts.set(target, {
         target, born: stamp, fighter: pose, index: previous?.index ?? (pose.team === 1 ? 1 : 0),
         reducedMotion,
-        impactX: pose.x + facing, impactY: pose.y - 83 - HEAD_RADIUS,
+        impactX: pose.x + facing,
+        impactY: pose.y - (83 + HEAD_RADIUS) * (pose.kind === 'boss' ? 1.28 : 1),
       });
       if (knockouts.size > 24) knockouts.delete(knockouts.keys().next().value);
       return;
     }
+    if (type === 'special-wave') {
+      rings.push({ x, y, born: stamp, life: reducedMotion ? 290 : 560,
+        radius: clamp(number(event.radius, 960), 160, 1100),
+        color: '#dffff8', type });
+      if (!reducedMotion) {
+        shakeStrength = 3.5;
+        shakeUntil = stamp + 120;
+      }
+      if (rings.length > 45) rings.splice(0, rings.length - 45);
+      return;
+    }
     const ultimate = type === 'jump-kick';
     const heavy = type === 'hit' && Boolean(event.heavy);
+    const specialHit = type === 'hit' && event.special === true;
+    const fallingImpact = type === 'fall-impact';
     const facing = number(event.facing, 1) < 0 ? -1 : 1;
     const count = reducedMotion ? 5 : ultimate ? 28
-      : heavy ? 23 : type === 'hit' ? 17 : type === 'land' ? 10 : type === 'kick' ? 7 : 9;
-    const speed = ultimate ? 205 : type === 'hit' ? 180
+      : specialHit ? 13 : fallingImpact ? 8 : heavy ? 23
+        : type === 'hit' ? 17 : type === 'land' ? 10 : type === 'kick' ? 7 : 9;
+    const speed = ultimate ? 205 : fallingImpact ? 75 : type === 'hit' ? 180
       : type === 'dodge' ? 80 : 60;
     const palette = ultimate ? ['#eaffec', '#8de9df', '#f5d995']
+      : specialHit ? ['#eafff4', '#80e4df', '#d9f8ed']
+        : fallingImpact ? ['#f8e7c7', '#cbd7ca', '#a6bdba']
       : type === 'dodge' ? ['#e9f9df', '#8bbec0', '#c1e6d6']
       : type === 'land' ? ['#e9d1a5', '#b4a580', '#f6e9c8']
       : ['#fff4ca', '#f5a96c', '#e97157'];
@@ -1030,10 +1166,16 @@ export function createRenderer(canvas) {
         ? (facing < 0 ? Math.PI : 0) + (i / Math.max(1, count - 1) - .5) * 1.65
         : (i / count) * TAU + hash(i * 11 + x + y) * .3;
       const force = speed * (.35 + hash(i * 7 + x) * .8);
-      particles.push({ x, y, vx: Math.cos(angle) * force, vy: Math.sin(angle) * force - (type === 'land' ? 45 : 0), size: 1.5 + hash(i * 13 + y) * (ultimate ? 4 : 3), color: palette[i % palette.length], born: stamp, life: ultimate ? 390 : type === 'kick' ? 210 : type === 'land' ? 340 : type === 'dodge' ? 330 : 480, dust: type === 'land' || type === 'dodge' });
+      particles.push({ x, y, vx: Math.cos(angle) * force,
+        vy: Math.sin(angle) * force - (type === 'land' || fallingImpact ? 45 : 0),
+        size: 1.5 + hash(i * 13 + y) * (ultimate ? 4 : 3),
+        color: palette[i % palette.length], born: stamp,
+        life: ultimate ? 390 : fallingImpact ? 250 : type === 'kick' ? 210
+          : type === 'land' ? 340 : type === 'dodge' ? 330 : 480,
+        dust: type === 'land' || type === 'dodge' || fallingImpact });
     }
-    rings.push({ x, y, born: stamp, life: ultimate ? 410 : type === 'kick' ? 190 : 300,
-      radius: ultimate ? 105 : heavy ? 70 : type === 'hit' ? 53 : type === 'kick' ? 25 : 34,
+    rings.push({ x, y, born: stamp, life: ultimate ? 410 : fallingImpact ? 220 : type === 'kick' ? 190 : 300,
+      radius: ultimate ? 105 : fallingImpact ? 28 : heavy ? 70 : type === 'hit' ? 53 : type === 'kick' ? 25 : 34,
       color: palette[0], type, facing });
     if (!reducedMotion && (type === 'hit' || ultimate)) {
       shakeStrength = ultimate ? 4 : clamp(3 + number(event.damage) * .13, 3, heavy ? 8 : 7);
@@ -1049,6 +1191,35 @@ export function createRenderer(canvas) {
       const item = rings[i];
       const progress = (time - item.born) / item.life;
       if (progress >= 1) { rings.splice(i, 1); continue; }
+      if (item.type === 'special-wave') {
+        const radius = reducedMotion ? 130 : 12 + item.radius * (1 - (1 - progress) ** 2.6);
+        ctx.save();
+        ctx.globalCompositeOperation = 'screen';
+        ctx.globalAlpha = (1 - progress) * (reducedMotion ? .55 : .8);
+        // Damage resolves on the cast tick. A brief whole-arena flash makes
+        // that immediate effect legible before the expanding crest arrives.
+        ctx.fillStyle = `rgba(148,255,239,${.16 * (1 - clamp(progress / .22, 0, 1))})`;
+        ctx.fillRect(0, 0, W, H);
+        const bloom = ctx.createRadialGradient(item.x, item.y, Math.max(0, radius - 35),
+          item.x, item.y, radius + 42);
+        bloom.addColorStop(0, 'rgba(116,238,227,0)');
+        bloom.addColorStop(.55, 'rgba(140,255,241,.44)');
+        bloom.addColorStop(1, 'rgba(140,255,241,0)');
+        ctx.fillStyle = bloom;
+        ctx.fillRect(0, 0, W, H);
+        ctx.beginPath();
+        ctx.arc(item.x, item.y, radius, 0, TAU);
+        ctx.strokeStyle = '#72e4df';
+        ctx.lineWidth = reducedMotion ? 6 : 20 * (1 - progress) + 3;
+        ctx.stroke();
+        ctx.beginPath();
+        ctx.arc(item.x, item.y, radius, 0, TAU);
+        ctx.strokeStyle = item.color;
+        ctx.lineWidth = reducedMotion ? 2.5 : 5 - 2 * progress;
+        ctx.stroke();
+        ctx.restore();
+        continue;
+      }
       ctx.save();
       ctx.globalAlpha = (1 - progress) * (item.type === 'hit' || item.type === 'jump-kick' ? .74 : .45);
       ctx.beginPath();
@@ -1135,6 +1306,7 @@ export function createRenderer(canvas) {
     drawGround(ctx, theme, groundY, tick, seed, Boolean(photo) && theme === 'land');
     drawPlatforms(ctx, arena.platforms, theme);
     drawHazards(ctx, arena.hazards, theme, tick);
+    if (meta.mode === 'campaign') drawFallingWarning(ctx, state.fallingObject, tick, reducedMotion);
 
     const fighters = Array.isArray(state.fighters) ? state.fighters : [
       { x: 295, y: groundY, vx: 0, facing: 1, hp: 100, grounded: true },
@@ -1156,6 +1328,7 @@ export function createRenderer(canvas) {
       drawFighter(ctx, knockout?.fighter ?? current, index, groundY, tick,
         knockout?.reducedMotion ?? reducedMotion, knockout, time);
     });
+    if (meta.mode === 'campaign') drawFallingObject(ctx, state.fallingObject, tick, reducedMotion);
     for (const knockout of knockouts.values()) drawTomatoBurst(ctx, knockout, time, knockout.reducedMotion);
     drawEffects(time);
     drawAtmosphere(ctx, theme, tick, level);

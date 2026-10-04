@@ -17,6 +17,13 @@ function sparring(x = 350) {
   return createCombatState({ fighters, arena: arena() });
 }
 
+function fallingHazard(overrides = {}) {
+  return {
+    type: 'hail', period: 240, firstTick: 120, warningTicks: 40,
+    radius: 8, damageFraction: 0.1, seed: 0, ...overrides,
+  };
+}
+
 test('duel uses a symmetric arena and a 99-second fixed-step clock', () => {
   const state = createDuelState('ocean');
   assert.equal(TICK_RATE, 60);
@@ -76,6 +83,25 @@ test('boss attacks telegraph for twelve full ticks before their active frame', (
   }
   stepCombat(state);
   assert.ok(state.fighters[0].hp < 100);
+});
+
+test('boss size and punch reach match the enlarged silhouette without faster startup', () => {
+  const boss = createFighter({ id: 'boss', x: 350, y: 438, team: 1, kind: 'boss' });
+  assert.deepEqual({ width: boss.width, height: boss.height }, { width: 44, height: 136 });
+  assert.deepEqual([1, 2, 3].map((stage) => {
+    boss.attackStage = stage;
+    return attackOf(boss).reach;
+  }), [83, 89, 101]);
+  boss.attackStage = 0;
+
+  const hero = createFighter({ id: 'hero', x: 265, y: 438, team: 0 });
+  const state = createCombatState({ arena: arena(), fighters: [hero, boss] });
+  for (let tick = 0; tick < 12; tick++) {
+    stepCombat(state, { boss: { attack: tick === 0 } });
+    assert.equal(hero.hp, 100);
+  }
+  stepCombat(state);
+  assert.ok(hero.hp < 100, 'enlarged boss connects beyond a regular punch reach');
 });
 
 test('ground kick has its own shared window, hits once, and holding the key never repeats it', () => {
@@ -350,6 +376,136 @@ test('an active hazard damages once and respects a damage cooldown', () => {
   assert.equal(state.fighters[0].hp, 93);
 });
 
+test('one seeded falling object warns every 240 effective frames and replays identically', () => {
+  const build = () => createCombatState({
+    arena: arena({ fallingHazard: fallingHazard({ seed: 2 }) }),
+    fighters: [
+      createFighter({ id: 'hero', x: 200, y: 438, team: 0 }),
+      createFighter({ id: 'enemy', x: 720, y: 438, team: 1, kind: 'grunt' }),
+    ],
+  });
+  const first = build();
+  const replay = build();
+  const warnings = [];
+  const impacts = [];
+  for (let frame = 1; frame <= 600; frame++) {
+    stepCombat(first);
+    stepCombat(replay);
+    assert.deepEqual(first.events, replay.events);
+    assert.deepEqual(first.fallingObject, replay.fallingObject);
+    for (const entry of first.events) {
+      if (entry.type === 'fall-warning') warnings.push({ frame, ...entry });
+      if (entry.type === 'fall-impact') impacts.push({ frame, ...entry });
+    }
+    if (frame === 159) assert.equal(first.fallingObject?.phase, 'warning');
+    if (frame === 160) {
+      assert.equal(first.fallingObject?.phase, 'falling');
+      assert.equal(first.fallingObject?.y, -8);
+    }
+  }
+  assert.deepEqual(warnings.map(({ frame, index }) => [frame, index]), [[120, 0], [360, 1], [600, 2]]);
+  assert.deepEqual(warnings.map(({ kind }) => kind), ['hail', 'hail', 'hail']);
+  assert.equal(impacts.length, 2);
+  assert.ok(impacts[0].frame > 160 && impacts[0].frame < 190);
+  assert.ok(impacts[1].frame > 400 && impacts[1].frame < 430);
+});
+
+test('hitstop freezes both the falling-hazard clock and its visible warning', () => {
+  const state = createCombatState({
+    arena: arena({ fallingHazard: fallingHazard({ firstTick: 1, warningTicks: 4 }) }),
+    fighters: [createFighter({ id: 'hero', x: 200, y: 438 })],
+  });
+  stepCombat(state);
+  assert.equal(state.fallingObject.phase, 'warning');
+  state.hitstop = 6;
+  for (let frame = 0; frame < 6; frame++) stepCombat(state);
+  assert.equal(state.tick, 7);
+  assert.equal(state.fallingClock, 1);
+  assert.equal(state.fallingObject.warningRemaining, 4);
+  for (let frame = 0; frame < 4; frame++) stepCombat(state);
+  assert.equal(state.fallingObject.phase, 'falling');
+  stepCombat(state);
+  const fallingY = state.fallingObject.y;
+  state.hitstop = 3;
+  for (let frame = 0; frame < 3; frame++) stepCombat(state);
+  assert.equal(state.fallingClock, 6);
+  assert.equal(state.fallingObject.y, fallingY);
+});
+
+test('falling objects can hit either team for ten percent of maximum HP', () => {
+  const hero = createFighter({ id: 'hero', x: 200, y: 438, team: 0 });
+  const enemy = createFighter({ id: 'enemy', x: 720, y: 438, team: 1, kind: 'grunt' });
+  const state = createCombatState({
+    arena: arena({ fallingHazard: fallingHazard({ firstTick: 1, period: 90, warningTicks: 4 }) }),
+    fighters: [hero, enemy],
+  });
+  const hits = [];
+  for (let frame = 0; frame < 150; frame++) {
+    stepCombat(state);
+    hits.push(...state.events.filter((entry) => entry.type === 'hit'));
+  }
+  assert.equal(hero.hp, 90);
+  assert.equal(enemy.hp, 38);
+  assert.deepEqual(hits.map(({ target, damage, source }) => ({ target, damage, source })), [
+    { target: 'hero', damage: 10, source: 'hazard:hail' },
+    { target: 'enemy', damage: 4, source: 'hazard:hail' },
+  ]);
+});
+
+test('a warned fall can be sidestepped or absorbed by invulnerability', () => {
+  const build = () => createCombatState({
+    arena: arena({ fallingHazard: fallingHazard({ firstTick: 1, period: 240 }) }),
+    fighters: [createFighter({ id: 'hero', x: 200, y: 438 })],
+  });
+  const evaded = build();
+  stepCombat(evaded);
+  const markedX = evaded.fallingObject.x;
+  let missed = null;
+  for (let frame = 0; frame < 90; frame++) {
+    stepCombat(evaded, { hero: { right: true } });
+    missed ??= evaded.events.find((entry) => entry.type === 'fall-impact');
+  }
+  assert.ok(Math.abs(evaded.fighters[0].x - markedX) > 100);
+  assert.deepEqual({ target: missed?.target, damage: missed?.damage }, { target: null, damage: 0 });
+  assert.equal(evaded.fighters[0].hp, 100);
+
+  const protectedState = build();
+  stepCombat(protectedState);
+  protectedState.fighters[0].invulnerable = 100;
+  let blocked = null;
+  for (let frame = 0; frame < 90; frame++) {
+    stepCombat(protectedState);
+    blocked ??= protectedState.events.find((entry) => entry.type === 'fall-impact');
+  }
+  assert.deepEqual({ target: blocked?.target, damage: blocked?.damage }, { target: 'hero', damage: 0 });
+  assert.equal(protectedState.fighters[0].hp, 100);
+});
+
+test('falling objects use the boss maximum HP and cannot enter a PvP duel', () => {
+  const boss = createFighter({ id: 'boss', x: 350, y: 438, team: 1, kind: 'boss' });
+  boss.hp = 50;
+  const config = fallingHazard({ type: 'pebble', firstTick: 1, warningTicks: 2 });
+  const state = createCombatState({ arena: arena({ fallingHazard: config }), fighters: [boss] });
+  let hit = null;
+  for (let frame = 0; frame < 60; frame++) {
+    stepCombat(state);
+    hit ??= state.events.find((entry) => entry.type === 'hit');
+  }
+  assert.equal(boss.hp, 35);
+  assert.deepEqual({ damage: hit?.damage, source: hit?.source },
+    { damage: 15, source: 'hazard:pebble' });
+
+  const duel = createCombatState({
+    mode: 'duel', durationTicks: 300, arena: arena({ fallingHazard: config }),
+    fighters: [createFighter({ id: 'p1', x: 200 }), createFighter({ id: 'p2', x: 720, team: 1 })],
+  });
+  for (let frame = 0; frame < 120; frame++) stepCombat(duel);
+  assert.equal(duel.arena.fallingHazard, null);
+  assert.equal(duel.fallingClock, 0);
+  assert.equal(duel.fallingObject, null);
+  assert.ok(!duel.events.some((entry) => entry.type.startsWith('fall-')));
+});
+
 test('the authoritative duel resolves KO and timeouts', () => {
   const knockout = createDuelState();
   knockout.fighters[0].x = 300;
@@ -375,6 +531,82 @@ test('enemy AI produces safe, deterministic controls', () => {
   const first = aiInput(state.fighters[1], state.fighters[0], state);
   assert.deepEqual(first, aiInput(state.fighters[1], state.fighters[0], state));
   for (const value of Object.values(first)) assert.equal(typeof value, 'boolean');
+});
+
+test('each enemy type notices a close target behind and turns before swinging', () => {
+  for (const kind of ['grunt', 'rusher', 'guard', 'boss']) {
+    const state = sparring(250);
+    const [hero] = state.fighters;
+    const enemy = createFighter({ id: `enemy-${kind}`, x: 250, y: 438, team: 1, kind });
+    state.fighters[1] = enemy;
+    // Choose an actual attack opportunity, so merely skipping an idle frame cannot pass.
+    enemy.facing = 1;
+    const attackTick = Array.from({ length: 63 }, (_, tick) => tick).find((tick) => {
+      state.tick = tick;
+      return aiInput(enemy, hero, state).attack;
+    });
+    assert.notEqual(attackTick, undefined);
+    state.tick = attackTick;
+    enemy.facing = -1;
+    const turn = aiInput(enemy, hero, state);
+    assert.equal(turn.right, true, `${kind} tracks the target behind`);
+    assert.equal(turn.attack, false, `${kind} does not swing while facing away`);
+    assert.equal(turn.kick, false);
+    stepCombat(state, { [enemy.id]: turn });
+    assert.equal(enemy.facing, 1);
+    assert.equal(enemy.attackStage, 0);
+    assert.equal(hero.hp, 100);
+
+    let swung = false;
+    for (let tick = 0; tick < 180; tick++) {
+      stepCombat(state, { [enemy.id]: aiInput(enemy, hero, state) });
+      if (enemy.attackStage > 0) swung = true;
+      if (hero.hp < 100) break;
+    }
+    assert.equal(swung, true, `${kind} eventually attacks after turning`);
+    assert.ok(hero.hp < 100, `${kind} can hit the target after turning`);
+  }
+});
+
+test('enemy AI tracks a target crossing behind only after a committed punch recovers', () => {
+  const state = sparring(350);
+  const [hero, enemy] = state.fighters;
+  stepCombat(state, { enemy: { attack: true } });
+  assert.equal(enemy.attackStage, 1);
+  hero.x = enemy.x + 50;
+
+  for (let tick = 0; enemy.attackStage > 0 && tick < 40; tick++) {
+    const input = aiInput(enemy, hero, state);
+    assert.equal(input.attack, false);
+    stepCombat(state, { enemy: input });
+    assert.equal(enemy.facing, -1, 'an active punch keeps its original direction');
+  }
+  assert.equal(enemy.attackStage, 0);
+  const turn = aiInput(enemy, hero, state);
+  assert.equal(turn.right, true);
+  stepCombat(state, { enemy: turn });
+  assert.equal(enemy.facing, 1);
+});
+
+test('enemy AI does not flicker its direction when fighter hitboxes overlap', () => {
+  const state = sparring(300);
+  const [hero, enemy] = state.fighters;
+  for (const offset of [0, 3, -3, 9, -9, 0]) {
+    hero.x = enemy.x + offset;
+    const input = aiInput(enemy, hero, state);
+    assert.equal(input.left, false);
+    assert.equal(input.right, false);
+  }
+  assert.equal(enemy.facing, -1, 'AI input remains pure');
+});
+
+test('the close-behind AI rule does not auto-turn fighters in a PvP duel', () => {
+  const duel = createDuelState();
+  duel.fighters[0].x = 300;
+  duel.fighters[1].x = 250;
+  duel.fighters[1].facing = -1;
+  stepCombat(duel);
+  assert.equal(duel.fighters[1].facing, -1);
 });
 
 test('ordinary enemy AI kicks occasionally while the balanced boss AI does not', () => {

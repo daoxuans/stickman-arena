@@ -70,6 +70,16 @@ const WAVE_BLUEPRINTS = [
 const ENEMY_HP = { grunt: 64, rusher: 52, guard: 80, brute: 104, boss: 140 };
 const ENEMY_DAMAGE = { grunt: 0.73, rusher: 0.66, guard: 0.8, brute: 1.04, boss: 0.82 };
 const ENEMY_NAMES = { grunt: '斗士', rusher: '疾行者', guard: '盾卫', brute: '重拳手' };
+const MILESTONE_BOSSES = Object.freeze({
+  10: '雾林巨拳',
+  20: '地下铁卫',
+  30: '风暴巨兵',
+  40: '深海狂拳',
+  50: '荒原巨灵',
+});
+const FALLING_TYPES = Object.freeze({
+  forest: 'pinecone', city: 'debris', ocean: 'hail', land: 'pebble',
+});
 // A small campaign-wide lift; the already-balanced boss stats stay untouched.
 const REGULAR_HP_BOOST = 1.04;
 const REGULAR_DAMAGE_BOOST = 1.025;
@@ -84,7 +94,7 @@ const PLATFORM_LAYOUTS = [
   [[297, 94, 121], [620, 75, 145]],
 ];
 
-function makeArena(theme, stage, chapterIndex) {
+function makeArena(theme, stage, chapterIndex, number) {
   const groundY = [444, 452, 448, 454][chapterIndex] - ((stage + chapterIndex) % 3) * 3;
   const layout = PLATFORM_LAYOUTS[(stage + chapterIndex - 1) % PLATFORM_LAYOUTS.length];
   const platforms = layout.map(([x, height, w]) => ({
@@ -109,21 +119,35 @@ function makeArena(theme, stage, chapterIndex) {
     });
   }
 
-  return { theme: theme.id, groundY, platforms, hazards };
+  return {
+    theme: theme.id, groundY, platforms, hazards,
+    // A single, telegraphed falling object per four seconds on even-numbered
+    // campaign stages. Its seed is the global level number, so retrying a
+    // checkpoint reconstructs the same predictable sequence.
+    ...(number % 2 === 0 ? { fallingHazard: {
+      type: FALLING_TYPES[theme.id], period: 240, firstTick: 120,
+      warningTicks: 40, radius: 8, damageFraction: 0.1, seed: number,
+    } } : {}),
+  };
 }
 
-function makeWaves(stage, chapterIndex, theme) {
-  return WAVE_BLUEPRINTS[stage - 1].map((blueprint, waveIndex) => ({
+function makeWaves(stage, chapterIndex, theme, number) {
+  const makeGroup = (kind, count, name = kind === 'boss' ? theme.bossName : ENEMY_NAMES[kind]) => ({
+    kind, count, name,
+    maxHp: Math.round(ENEMY_HP[kind] * (1 + chapterIndex * 0.13 + stage * 0.016)
+      * (kind === 'boss' ? 1 : REGULAR_HP_BOOST)),
+    damageScale: Number((ENEMY_DAMAGE[kind] * (1 + chapterIndex * 0.085 + stage * 0.011)
+      * (kind === 'boss' ? 1 : REGULAR_DAMAGE_BOOST)).toFixed(2)),
+  });
+  const waves = WAVE_BLUEPRINTS[stage - 1].map((blueprint, waveIndex) => ({
     index: waveIndex + 1,
-    groups: blueprint.map(([kind, count]) => ({
-      kind, count,
-      name: kind === 'boss' ? theme.bossName : ENEMY_NAMES[kind],
-      maxHp: Math.round(ENEMY_HP[kind] * (1 + chapterIndex * 0.13 + stage * 0.016)
-        * (kind === 'boss' ? 1 : REGULAR_HP_BOOST)),
-      damageScale: Number((ENEMY_DAMAGE[kind] * (1 + chapterIndex * 0.085 + stage * 0.011)
-        * (kind === 'boss' ? 1 : REGULAR_DAMAGE_BOOST)).toFixed(2)),
-    })),
+    groups: blueprint.map(([kind, count]) => makeGroup(kind, count)),
   }));
+  if (MILESTONE_BOSSES[number]) {
+    waves.push({ index: waves.length + 1,
+      groups: [makeGroup('boss', 1, MILESTONE_BOSSES[number])] });
+  }
+  return waves;
 }
 
 export const LEVELS = Object.freeze(CHAPTERS.flatMap((chapter, chapterIndex) => {
@@ -131,12 +155,13 @@ export const LEVELS = Object.freeze(CHAPTERS.flatMap((chapter, chapterIndex) => 
   return chapter.names.map((name, index) => {
     const stage = index + 1;
     const number = chapterIndex * 14 + stage;
-    const arena = makeArena(theme, stage, chapterIndex);
-    const waves = makeWaves(stage, chapterIndex, theme);
+    const arena = makeArena(theme, stage, chapterIndex, number);
+    const waves = makeWaves(stage, chapterIndex, theme, number);
     return {
       number, stage, chapter: chapterIndex + 1, name,
       theme: theme.id, themeName: theme.name,
-      isBoss: stage === 14, isCheckpoint: [1, 5, 9, 13].includes(stage),
+      isBoss: waves.some((wave) => wave.groups.some((group) => group.kind === 'boss')),
+      isCheckpoint: [1, 5, 9, 13].includes(stage),
       groundY: arena.groundY, platforms: arena.platforms, hazards: arena.hazards,
       arena, waves,
       enemyCount: waves.reduce((total, wave) => total + wave.groups.reduce((count, group) => count + group.count, 0), 0),
