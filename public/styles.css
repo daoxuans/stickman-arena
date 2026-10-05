@@ -145,6 +145,13 @@ button:focus-visible, input:focus-visible, .map-stage:focus-visible {
 .health-track { overflow: hidden; height: 6px; background: rgba(244,239,222,.17); }
 .health-fill { height: 100%; width: 100%; background: linear-gradient(90deg,#de8d58,var(--signal)); }
 .fighter-status--opponent .health-fill { margin-left: auto; background: linear-gradient(90deg,var(--signal-hot),#f3aa80); }
+/* Duel uniforms: P1 is warm red and P2 cool cyan; campaign enemies keep coral. */
+.fight-hud.is-duel .fighter-status--player { border-color: #dc765c; }
+.fight-hud.is-duel .fighter-status--player .fighter-status__tag { color: #ffc1a4; }
+.fight-hud.is-duel .fighter-status--player .health-fill { background: linear-gradient(90deg,#a84246,#ec8c68); }
+.fight-hud.is-duel .fighter-status--opponent { border-color: #76cfe3; }
+.fight-hud.is-duel .fighter-status--opponent .fighter-status__tag { color: #98e8ed; }
+.fight-hud.is-duel .fighter-status--opponent .health-fill { background: linear-gradient(90deg,#66c6d9,#2782a6); }
 .match-timer { display: flex; flex-direction: column; align-items: center; min-width: 64px; padding: 4px 0; color: #fcf1df; text-shadow: 0 2px 8px #172c2b; }
 .match-timer span { color: #e1e9dd; font: 800 9px/1 "Bahnschrift", "Arial Narrow", sans-serif; letter-spacing: .22em; }
 .match-timer strong { margin-top: 3px; font: 900 30px/1 "Bahnschrift SemiCondensed", "Arial Narrow", sans-serif; font-variant-numeric: tabular-nums; }
@@ -243,7 +250,10 @@ kbd { display: inline-block; min-width: 20px; padding: 3px 5px; border: 1px soli
 .panel-bottom__line { height: 1px; flex: 1; background: #a5afa5; }
 
 .duel-panel h3 { max-width: 11ch; margin: 1px 0 8px; font-size: 26px; font-weight: 900; line-height: 1.25; letter-spacing: -.025em; }
-.duel-lead { margin: 0 0 20px; color: var(--paper-muted); font-size: 12px; line-height: 1.65; }
+.duel-lead { margin: 0 0 12px; color: var(--paper-muted); font-size: 12px; line-height: 1.65; }
+.duel-rules { display: grid; gap: 8px; margin-bottom: 18px; padding: 12px 13px; border-left: 3px solid #3f806f; color: #31514a; background: #d8e4d4; }
+.duel-rules p { margin: 0; font-size: 11px; line-height: 1.55; }
+.duel-rules strong { display: block; margin-bottom: 2px; color: #193a37; font-size: 11px; }
 .room-ticket { margin-bottom: 12px; padding: 13px 15px 14px; border: 1px solid #aab8a9; background: #f4efdf; }
 .room-ticket > span { color: #66776d; font-size: 10px; font-weight: 800; letter-spacing: .07em; }
 .room-ticket__value { display: flex; align-items: end; justify-content: space-between; gap: 8px; margin-top: 7px; }

@@ -1,6 +1,6 @@
 /**
  * Deterministic, fixed-step combat shared by the campaign and the room server.
- * Coordinates are logical world pixels (campaign 1920 x 540, duel 960 x 540);
+ * Coordinates are logical world pixels (campaign 1920 x 540, duel 2880 x 540);
  * a fighter's y is at its feet. The canvas viewport remains 960 x 540.
  * Every call to stepCombat advances exactly one 1/60-second simulation tick.
  */
@@ -10,6 +10,7 @@ import { getEquipment } from './equipment.js';
 export const TICK_RATE = 60;
 export const WORLD_WIDTH = 960;
 export const WORLD_HEIGHT = 540;
+export const DUEL_WORLD_WIDTH = WORLD_WIDTH * 3;
 export const CORPSE_SETTLE_TICKS = 27;
 export const CORPSE_HOLD_TICKS = 180;
 
@@ -22,12 +23,18 @@ const DODGE_COOLDOWN = 54;
 const FALL_TICKS = 30;
 export const SPEAR_WINDUP_TICKS = 20;
 export const SPEARS_PER_LEVEL = 5;
+export const SPEARS_PER_DUEL = SPEARS_PER_LEVEL;
+export const DUEL_WAVE_HITS_REQUIRED = 3;
+export const DUEL_WAVE_DAMAGE = 20;
+export const DUEL_WAVE_REACH = 800;
+export const DUEL_WAVE_HALF_HEIGHT = 42;
+export const DUEL_WAVE_GUARD_TICKS = 18;
 const SPEAR_SPEED = 18;
 export const SPEAR_GRAVITY = 0.9;
 export const SPEAR_MIN_ANGLE = 8;
 export const SPEAR_MAX_ANGLE = 72;
 const SPEAR_AIMED_SPEED = 26;
-const SPEAR_AIM_STEP = 1.25;
+export const SPEAR_AIM_STEP = 1.25;
 const SPEAR_DEFAULT_ANGLE = 42;
 const SPEAR_LIFETIME = 94;
 export const ROCK_GRAVITY = SPEAR_GRAVITY;
@@ -72,7 +79,7 @@ const KICKS = Object.freeze({
 });
 
 const BUTTONS = ['left', 'right', 'jump', 'attack', 'kick', 'dodge', 'spear',
-  'aimUp', 'aimDown', 'aimCancel', 'equipment'];
+  'aimUp', 'aimDown', 'aimCancel', 'special', 'equipment'];
 
 function inputOf(value) {
   const input = {};
@@ -136,11 +143,19 @@ export function createFighter({
     attackBuffered: false, hitIds: [],
     prevInput: { left: false, right: false, jump: false, attack: false, kick: false,
       dodge: false, spear: false, aimUp: false, aimDown: false, aimCancel: false,
-      equipment: false, aimAngle: null },
+      special: false, equipment: false, aimAngle: null },
   };
 }
 
 export function createCombatState({ mode = 'campaign', arena = {}, fighters = [], durationTicks = 0 } = {}) {
+  if (mode === 'duel') {
+    for (const fighter of fighters) {
+      fighter.spearRemaining = SPEARS_PER_DUEL;
+      fighter.duelWaveCharge = 0;
+      fighter.duelWaveHits = 0;
+      fighter.duelWaveRecovery = 0;
+    }
+  }
   return {
     mode,
     arena: {
@@ -178,18 +193,53 @@ export function createCombatState({ mode = 'campaign', arena = {}, fighters = []
 
 export function createDuelState(theme = 'city') {
   const selected = ['forest', 'city', 'ocean', 'land'].includes(theme) ? theme : 'city';
+  const hazardType = {
+    forest: 'thorns', city: 'traffic', ocean: 'tide', land: 'fissure',
+  }[selected];
+  const platformType = {
+    forest: 'log', city: 'roof', ocean: 'pier', land: 'rock',
+  }[selected];
+  const mirrorPlatform = (platform) => ({
+    ...platform,
+    x: DUEL_WORLD_WIDTH - platform.x - platform.w,
+    ...(platform.baseX === undefined ? {} : {
+      baseX: DUEL_WORLD_WIDTH - platform.baseX
+        - (platform.motion === 'float' ? platform.w : 0),
+    }),
+    // The plank tilts the opposite way at each tick; horizontal drift does
+    // likewise. This is a geometric mirror, not just an initial-position copy.
+    ...(platform.motion === 'rotate' || platform.axis === 'x'
+      ? { amplitude: -platform.amplitude } : {}),
+  });
+  const leftPlatforms = [
+    { x: 445, y: 375, w: 175, h: 12, type: platformType },
+    { x: 840, y: 334, w: 180, h: 12, type: 'log', motion: 'rotate',
+      baseX: 930, baseY: 334, baseAngle: 0, amplitude: 0.23, period: 210, phase: 0 },
+    { x: 1070, y: 344, w: 142, h: 12, type: 'log', motion: 'float', axis: 'x',
+      baseX: 1070, baseY: 344, amplitude: 34, period: 190, phase: 0 },
+  ];
+  const leftHazard = { x: 690, y: 424, w: 76, h: 14,
+    type: hazardType, damage: 10, period: 180, activeTicks: 108, phase: 0 };
   const arena = {
     theme: selected,
+    width: DUEL_WORLD_WIDTH,
     groundY: 438,
-    // Symmetrical, hazard-free terrain keeps PvP outcomes about player inputs.
-    platforms: [{ x: 410, y: 338, w: 140, h: 14 }],
-    hazards: [],
+    platforms: [
+      ...leftPlatforms, { x: 1320, y: 300, w: 240, h: 12, type: 'log' },
+      ...leftPlatforms.map(mirrorPlatform),
+    ].sort((a, b) => a.x - b.x),
+    hazards: [
+      leftHazard,
+      { x: 1395, y: 424, w: 90, h: 14, type: hazardType, damage: 10,
+        period: 180, activeTicks: 108, phase: 90 },
+      { ...leftHazard, x: DUEL_WORLD_WIDTH - leftHazard.x - leftHazard.w },
+    ],
   };
   return createCombatState({
     mode: 'duel', arena, durationTicks: 99 * TICK_RATE,
     fighters: [
-      createFighter({ id: 'p1', name: '青色斗士', x: 270, y: arena.groundY, team: 0 }),
-      createFighter({ id: 'p2', name: '赤色斗士', x: 690, y: arena.groundY, team: 1 }),
+      createFighter({ id: 'p1', name: '赤色斗士', x: 1220, y: arena.groundY, team: 0 }),
+      createFighter({ id: 'p2', name: '青色斗士', x: 1660, y: arena.groundY, team: 1 }),
     ],
   });
 }
@@ -512,7 +562,8 @@ function launchSpear(state, fighter) {
   const origin = spearOrigin(fighter, facing);
   // The warning locks its landing point at startup. Movement during windup
   // must not silently retarget the throw after the player has read its arc.
-  const flight = fighter.team === 0 && fighter.spearLaunchFacing !== null
+  const flight = (state.mode === 'duel' || fighter.team === 0)
+    && fighter.spearLaunchFacing !== null
     ? spearAimedFlight(facing, fighter.spearAimAngle)
     : spearFlight(origin.x, origin.y, fighter.spearAimX, fighter.spearAimY);
   const projectile = {
@@ -521,14 +572,17 @@ function launchSpear(state, fighter) {
     x: origin.x, y: origin.y,
     vx: flight.vx,
     vy: flight.vy,
-    radius: 7, damage: (fighter.team === 0 ? 22 : 14 * fighter.damageScale),
+    radius: 7, damage: (state.mode === 'duel' || fighter.team === 0
+      ? 22 : 14 * fighter.damageScale),
     ttl: SPEAR_LIFETIME,
   };
   state.projectiles.push(projectile);
-  // Aiming and windup are free; only a real player launch spends this room's
-  // shared allowance. Enemy telegraphed throws and duels have no such resource.
+  // Aiming and windup are free. A real launch alone spends the campaign's
+  // shared level allowance or this particular duelist's round allowance.
   if (state.mode === 'campaign' && fighter.team === 0) {
     state.spearRemaining = Math.max(0, state.spearRemaining - 1);
+  } else if (state.mode === 'duel') {
+    fighter.spearRemaining = Math.max(0, fighter.spearRemaining - 1);
   }
   event(state, 'spear-throw', {
     x: projectile.x, y: projectile.y, source: fighter.id,
@@ -785,6 +839,21 @@ function applyDamage(state, target, { amount, direction, knockback, stun, invuln
     ...(delivery ? { delivery } : {}),
     ...(delivery === 'equipment' && equipmentId ? { equipmentId } : {}),
   });
+  if (state.mode === 'duel' && delivery !== 'duel-wave') {
+    const attacker = state.fighters.find((fighter) => fighter.id === source
+      && fighter.kind === 'hero' && fighter.team !== target.team);
+    if (attacker && attacker.duelWaveCharge === 0) {
+      attacker.duelWaveHits++;
+      if (attacker.duelWaveHits >= DUEL_WAVE_HITS_REQUIRED) {
+        attacker.duelWaveHits = 0;
+        attacker.duelWaveCharge = 1;
+        event(state, 'duel-wave-ready', {
+          x: attacker.x, y: attacker.y - attacker.height * 0.55,
+          source: attacker.id, charge: 1,
+        });
+      }
+    }
+  }
   if (warded) event(state, 'boss-ward-hit', {
     x: target.x, y: target.y - target.height * 0.57,
     target: target.id, source, absorbed: rawDamage - damage,
@@ -878,6 +947,49 @@ function resolveAttacks(state) {
   }
 }
 
+function startDuelWave(state, fighter) {
+  // This instant forward blast is deliberately distinct from the campaign's
+  // full-wave percentage skill. It may interrupt an unthrown spear for free.
+  cancelSpear(state, fighter);
+  fighter.duelWaveCharge = 0;
+  fighter.duelWaveHits = 0;
+  fighter.duelWaveRecovery = DUEL_WAVE_GUARD_TICKS;
+  fighter.invulnerable = Math.max(fighter.invulnerable, DUEL_WAVE_GUARD_TICKS);
+  event(state, 'duel-wave', {
+    x: fighter.x, y: fighter.y - fighter.height * 0.55,
+    source: fighter.id, facing: fighter.facing,
+    reach: DUEL_WAVE_REACH, halfHeight: DUEL_WAVE_HALF_HEIGHT,
+    damage: DUEL_WAVE_DAMAGE, durationTicks: 14,
+  });
+}
+
+function resolveDuelWaves(state) {
+  if (state.mode !== 'duel') return;
+  // Collect every launch before any wave deals damage. Simultaneous casts
+  // gain their guard first, regardless of fighter array/presentation order.
+  for (const wave of state.events.filter((entry) => entry.type === 'duel-wave')) {
+    const source = state.fighters.find((fighter) => fighter.id === wave.source);
+    if (!source) continue;
+    for (const target of state.fighters) {
+      if (target.hp <= 0 || target.team === source.team) continue;
+      const forward = (target.x - wave.x) * wave.facing;
+      if (forward < -target.width * 0.35
+          || forward > wave.reach + target.width * 0.45
+          || target.y - 8 < wave.y - wave.halfHeight
+          || target.y - target.height > wave.y + wave.halfHeight) continue;
+      if (!applyDamage(state, target, {
+        amount: DUEL_WAVE_DAMAGE, direction: wave.facing,
+        knockback: 7, stun: 20, invulnerable: 11,
+        source: source.id, heavy: true, delivery: 'duel-wave',
+      })) {
+        event(state, 'evade', {
+          x: target.x, y: target.y - target.height / 2, target: target.id,
+        });
+      } else state.hitstop = Math.max(state.hitstop, 5);
+    }
+  }
+}
+
 function sweptBoxHit(startX, startY, nextX, nextY, left, right, top, bottom) {
   const bounds = [
     [startX, nextX - startX, left, right],
@@ -924,13 +1036,16 @@ function sweptPlatformHit(projectile, platform, nextX, nextY, motionTick) {
 
 /** A swept path prevents fast spears and rocks from tunnelling through a thin fighter. */
 function resolveProjectiles(state) {
-  if (state.mode !== 'campaign') {
+  if (state.mode !== 'campaign' && state.mode !== 'duel') {
     state.projectiles = [];
     return;
   }
   const active = [];
   const impacts = [];
   for (const projectile of state.projectiles) {
+    // PvP has only each player's scarce manual spear; campaign-only rocks and
+    // boss casts never enter its combat resolution even in a forged state.
+    if (state.mode === 'duel' && projectile.kind !== 'spear') continue;
     const nextVy = projectile.vy + (projectile.kind === 'rock' ? ROCK_GRAVITY : SPEAR_GRAVITY);
     const nextX = projectile.x + projectile.vx;
     const nextY = projectile.y + nextVy;
@@ -1021,7 +1136,9 @@ function resolveHazards(state, fighter) {
     if (right <= hazard.x || left >= hazard.x + hazard.w || fighter.y <= hazard.y || top >= hazard.y + hazard.h) continue;
     const direction = fighter.x < hazard.x + hazard.w / 2 ? -1 : 1;
     if (applyDamage(state, fighter, {
-      amount: hazard.damage ?? 7, direction, knockback: 4.2, stun: 12,
+      amount: state.mode === 'duel' ? Math.max(1, Math.round(fighter.maxHp * 0.1))
+        : hazard.damage ?? 7,
+      direction, knockback: 4.2, stun: 12,
       invulnerable: 18, source: `hazard:${hazard.type ?? 'terrain'}`,
     })) {
       fighter.hazardCooldown = 42;
@@ -1118,12 +1235,14 @@ function advanceFallingHazard(state) {
 function moveFighter(state, fighter, input) {
   const was = fighter.prevInput;
   const actionBusyAtTickStart = fighter.attackStage > 0 || fighter.kickType !== null
-    || fighter.dodgeTicks > 0 || fighter.spearWindup > 0 || fighter.equipmentAttackId !== null;
+    || fighter.dodgeTicks > 0 || fighter.spearWindup > 0
+    || fighter.equipmentAttackId !== null || fighter.duelWaveRecovery > 0;
   const jumpPressed = input.jump && !was.jump;
   const attackPressed = input.attack && !was.attack;
   const kickPressed = input.kick && !was.kick;
   const dodgePressed = input.dodge && !was.dodge;
   const spearPressed = input.spear && !was.spear;
+  const specialPressed = input.special && !was.special;
   const equipped = state.mode === 'campaign' && fighter.team === 0 && fighter.kind === 'hero'
     ? getEquipment(state.equippedEquipmentId) : null;
   const equipmentPressed = Boolean(equipped && input.equipment && !was.equipment);
@@ -1155,6 +1274,7 @@ function moveFighter(state, fighter, input) {
     if (fighter.comboWindow === 0 && fighter.attackStage === 0) fighter.comboStage = 0;
   }
   if (fighter.stun > 0) fighter.stun--;
+  if (fighter.duelWaveRecovery > 0) fighter.duelWaveRecovery--;
   if (input.bossSkill) {
     const target = state.fighters.find((other) => other.team !== fighter.team && other.hp > 0);
     if (target) beginBossCast(state, fighter, target, input.bossSkill);
@@ -1171,11 +1291,12 @@ function moveFighter(state, fighter, input) {
     fighter.spearAimAngle = clamp(nextAngle, SPEAR_MIN_ANGLE, SPEAR_MAX_ANGLE);
   }
   if (jumpPressed && fighter.kickType === null && !fighter.bossCast
+      && !fighter.duelWaveRecovery
       && fighter.equipmentAttackId === null) fighter.jumpBuffer = 8;
 
   if (dodgePressed && !fighter.bossCast && fighter.stun === 0 && fighter.attackStage === 0
       && fighter.kickType === null && fighter.equipmentAttackId === null
-      && fighter.spearWindup === 0
+      && fighter.spearWindup === 0 && !fighter.duelWaveRecovery
       && fighter.dodgeCooldown === 0 && fighter.dodgeTicks === 0) {
     const direction = Number(input.right) - Number(input.left);
     if (direction !== 0) fighter.facing = direction;
@@ -1196,7 +1317,8 @@ function moveFighter(state, fighter, input) {
       if (fighter.attackStage === 0 && fighter.kickType === null
           && fighter.equipmentAttackId === null) fighter.facing = direction;
       const moveScale = fighter.kickType ? 0.38
-        : fighter.attackStage || fighter.equipmentAttackId ? 0.42 : 1;
+        : fighter.attackStage || fighter.equipmentAttackId ? 0.42
+          : fighter.duelWaveRecovery ? 0.55 : 1;
       fighter.vx = approach(fighter.vx, direction * fighter.speed * moveScale, fighter.grounded ? 0.9 : 0.52);
     } else {
       fighter.vx *= fighter.grounded ? 0.72 : 0.88;
@@ -1206,10 +1328,21 @@ function moveFighter(state, fighter, input) {
     fighter.vx *= 0.94;
   }
 
+  const waveLaunched = state.mode === 'duel' && specialPressed
+    && fighter.kind === 'hero' && fighter.duelWaveCharge > 0
+    && fighter.stun === 0 && fighter.attackStage === 0 && fighter.kickType === null
+    && fighter.dodgeTicks === 0 && !fighter.duelWaveRecovery
+    && fighter.equipmentAttackId === null && !fighter.bossCast
+    && !jumpPressed && !attackPressed && !kickPressed && !dodgePressed;
+  if (waveLaunched) {
+    startDuelWave(state, fighter);
+    fighter.jumpBuffer = 0;
+  }
+
   if (fighter.jumpBuffer > 0 && fighter.coyote > 0 && fighter.stun === 0
       && !fighter.bossCast && fighter.dodgeTicks === 0
       && fighter.kickType === null && fighter.equipmentAttackId === null
-      && fighter.spearWindup === 0) {
+      && fighter.spearWindup === 0 && !fighter.duelWaveRecovery) {
     fighter.vy = JUMP_SPEED;
     fighter.grounded = false;
     fighter.coyote = 0;
@@ -1221,13 +1354,14 @@ function moveFighter(state, fighter, input) {
   if (kickPressed && !fighter.bossCast && fighter.stun === 0 && fighter.dodgeTicks === 0
       && fighter.attackStage === 0 && fighter.kickType === null
       && fighter.equipmentAttackId === null && fighter.spearWindup === 0
+      && !fighter.duelWaveRecovery
       && (fighter.grounded || !fighter.airKickUsed)) {
     startKick(state, fighter, fighter.grounded ? 'ground' : 'air');
   }
 
   if (attackPressed && !fighter.bossCast && fighter.stun === 0 && fighter.dodgeTicks === 0
       && fighter.kickType === null && fighter.equipmentAttackId === null
-      && fighter.spearWindup === 0) {
+      && fighter.spearWindup === 0 && !fighter.duelWaveRecovery) {
     if (fighter.attackStage > 0) fighter.attackBuffered = fighter.attackStage < 3;
     else startAttack(state, fighter, fighter.comboWindow > 0 ? Math.min(3, fighter.comboStage + 1) : 1);
   }
@@ -1277,15 +1411,19 @@ function moveFighter(state, fighter, input) {
     }
   }
 
-  if (state.mode === 'campaign' && !fighter.bossCast && spearPressed
-      && (fighter.team !== 0 || (!input.aimCancel && !otherActionPressed))
+  const manualSpear = (state.mode === 'campaign' && fighter.team === 0)
+    || (state.mode === 'duel' && fighter.kind === 'hero');
+  const aiSpear = state.mode === 'campaign' && fighter.team !== 0 && fighter.spearEnabled;
+  if ((manualSpear || aiSpear) && !fighter.bossCast && spearPressed
+      && (!manualSpear || (!input.aimCancel && !otherActionPressed))
       && fighter.stun === 0
       && fighter.dodgeTicks === 0 && fighter.attackStage === 0
       && fighter.kickType === null && fighter.equipmentAttackId === null
-      && !equipmentBusyThisTick && fighter.spearWindup === 0 && fighter.spearCooldown === 0
-      && (fighter.team !== 0 || state.spearRemaining > 0)
-      && (fighter.team === 0 || fighter.spearEnabled)) {
-    if (fighter.team === 0) {
+      && !equipmentBusyThisTick && !fighter.duelWaveRecovery
+      && fighter.spearWindup === 0 && fighter.spearCooldown === 0
+      && (aiSpear || (state.mode === 'duel'
+        ? fighter.spearRemaining > 0 : state.spearRemaining > 0))) {
+    if (manualSpear) {
       if (fighter.spearAiming) confirmPlayerSpear(state, fighter);
       else beginPlayerAim(state, fighter);
     } else beginSpear(state, fighter);
@@ -1448,6 +1586,7 @@ export function stepCombat(state, inputsById = {}) {
   // tick instead of acting before the player sees their entry cue.
   for (const fighter of [...state.fighters]) moveFighter(state, fighter, inputOf(inputsById[fighter.id]));
   resolveAttacks(state);
+  resolveDuelWaves(state);
   resolveProjectiles(state);
   for (const fighter of state.fighters) resolveHazards(state, fighter);
   advanceFallingHazard(state);

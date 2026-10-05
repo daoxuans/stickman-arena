@@ -2310,3 +2310,241 @@ test('copied equipment drops, poses and pickup events never enter a PvP scene', 
   assert.equal(recording.strokes.filter(({ color }) => color === equipment.color).length, 0,
     'PvP retains its existing plain hero even if a copied state/event has campaign-only fields');
 });
+
+function wideDuelState(p1X = 260, p2X = 2580, extras = {}) {
+  return { tick: 40, motionTick: 40, status: 'playing',
+    arena: { theme: 'city', width: 2880, groundY: 430, platforms: [], hazards: [] },
+    fighters: [
+      { ...fighter('hero', 0, 0, 1), id: 'p1', team: 0, x: p1X,
+        width: 29, height: 88 },
+      { ...fighter('hero', 0, 0, -1), id: 'p2', team: 1, x: p2X,
+        width: 29, height: 88 },
+    ], ...extras };
+}
+
+test('each wide-duel client follows its own fighter and shows an offscreen opponent without sharing photos', () => {
+  const portrait = { complete: true, naturalWidth: 256, naturalHeight: 256 };
+  const state = wideDuelState();
+  const headXs = (recording) => recording.fills.filter(({ color, points }) =>
+    color === SHADOW_WANDERER.head && points.some((point) => point.kind === 'arc'
+      && point.radius === 22)).map(({ originX }) => originX);
+  const p1View = recordingRenderer(true);
+  p1View.renderer.setAvatar(portrait);
+  p1View.renderer.render(state, { mode: 'duel', localFighterId: 'p1' });
+  assert.deepEqual(headXs(p1View), [260, 2580]);
+  assert.equal(p1View.images.length, 1);
+  assert.equal(p1View.images[0].image, portrait);
+  assert.ok(p1View.labels.some(({ value, originX }) => value === '对手 距离 2320'
+    && originX === 0), 'P1 is told the opponent is to the right on the fixed screen layer');
+  assert.ok(p1View.fills.some(({ color, originX }) => color === '#7be8f1' && originX === 0),
+    'the right-edge direction arrow uses P2 colour');
+
+  const p2View = recordingRenderer(true);
+  p2View.renderer.setAvatar(portrait);
+  p2View.renderer.render(state, { mode: 'duel', localFighterId: 'p2' });
+  assert.deepEqual(headXs(p2View), [-1660, 660], 'P2 sees its own camera clamped to the far arena edge');
+  assert.equal(p2View.images.length, 1);
+  assert.equal(p2View.images[0].image, portrait);
+  assert.ok(p2View.images[0].originX > 0 && p2View.images[0].originX < 960,
+    'the only painted photo belongs to P2, not the distant P1');
+  assert.ok(p2View.labels.some(({ value, originX }) => value === '对手 距离 2320'
+    && originX === 0), 'P2 independently sees a leftward distance cue');
+  assert.ok(p2View.fills.some(({ color, originX }) => color === '#ff555a' && originX === 0));
+
+  const anonymous = recordingRenderer(true);
+  anonymous.renderer.setAvatar(portrait);
+  anonymous.renderer.render(state, { mode: 'duel' });
+  assert.equal(anonymous.images.length, 0, 'without an explicit local identity no remote fighter inherits the photo');
+  assert.ok(!anonymous.labels.some(({ value }) => String(value).startsWith('对手 距离')));
+  p2View.labels.length = 0;
+  p2View.renderer.render(wideDuelState(2110, 2580, { tick: 41 }),
+    { mode: 'duel', localFighterId: 'p2' });
+  assert.ok(!p2View.labels.some(({ value }) => String(value).startsWith('对手 距离')),
+    'the cue disappears once the opponent is actually inside this viewport');
+});
+
+test('the third 960px illustrated panel stays continuous in all four duel themes and never requests photos', () => {
+  for (const theme of ['forest', 'city', 'ocean', 'land']) {
+    const recording = recordingRenderer(true);
+    const state = wideDuelState(2400, 2580);
+    recording.renderer.render({ ...state, arena: { ...state.arena, theme } },
+      { mode: 'duel', theme, level: 1, localFighterId: 'p1' });
+    const ground = recording.rects.filter(({ y, w, h }) => y === 430 && w === 960 && h === 110);
+    assert.deepEqual(ground.map(({ originX, scaleX }) => [originX, scaleX]),
+      [[-1920, 1], [0, -1], [0, 1]], `${theme} has a continuous, mirrored middle seam and a third ground panel`);
+    assert.ok(recording.rects.some(({ y, w, h, originX, scaleX }) =>
+      y === 0 && w === 960 && h === 540 && originX === 0 && scaleX === 1),
+    `${theme} sky fills the visible third segment`);
+    assert.equal(recording.images.length, 0, 'PvP does not load a campaign photo even with a level hint');
+  }
+});
+
+test('the far-side rotating plank, moving tread and timed damaging trap use authoritative world poses', () => {
+  const rotating = { x: 2090, y: 310, w: 168, h: 12, type: 'log', motion: 'rotate',
+    baseX: 2174, baseY: 310, baseAngle: 0, amplitude: .19, period: 96 };
+  const moving = { x: 2310, y: 337, w: 120, h: 12, motion: 'float', axis: 'x',
+    baseX: 2310, baseY: 337, amplitude: 22, period: 120 };
+  const trap = { x: 2060, y: 410, w: 90, h: 20, type: 'electric',
+    period: 120, activeTicks: 60, phase: 0, damage: 9 };
+  const state = wideDuelState(260, 2400, { tick: 106, motionTick: 24 });
+  state.arena.platforms = [rotating, moving];
+  state.arena.hazards = [trap];
+  const recording = recordingRenderer(true);
+  const meta = { mode: 'duel', localFighterId: 'p2' };
+  recording.renderer.render(state, meta);
+  const pose = platformPose(rotating, 24);
+  assert.ok(recording.rotations.some(({ angle, originX, originY }) =>
+    Math.abs(angle - pose.angle) < 1e-9 && originX === pose.centerX - 1920
+      && originY === pose.centerY), 'the visible wooden rotation equals the shared collision pose');
+  assert.ok(recording.rects.some(({ color, w, x }) =>
+    color === '#c99866' && w === pose.width && x === -pose.width / 2),
+  'the wooden walkable edge remains the platform top');
+  assert.ok(recording.rects.some(({ color, originX, w }) =>
+    color === '#b5b8ad' && originX === platformPose(moving, 24).centerX - 1920
+      && w === moving.w), 'the floating tread occupies its simulated far-panel location');
+  assert.ok(recording.labels.some(({ value, originX }) => value === '机关即将启动'
+    && originX === -1920), 'a periodic PvP trap warns while still inactive');
+  recording.labels.length = 0;
+  recording.strokes.length = 0;
+  recording.renderer.render({ ...state, tick: 120 }, meta);
+  assert.ok(!recording.labels.some(({ value }) => value === '机关即将启动'),
+    'the inactive countdown cannot obscure the now-active trap');
+  assert.ok(recording.strokes.some(({ color }) => color === '#e9db86'),
+    'the live electric hitbox has its existing visibly active markings');
+  recording.renderer.effect({ id: 'duel-trap-hit', type: 'hit', source: 'hazard:electric',
+    target: 'p2', x: 2400, y: 350, damage: 9 });
+  recording.labels.length = 0;
+  recording.strokes.length = 0;
+  recording.renderer.render({ ...state, tick: 121 }, meta);
+  assert.ok(recording.labels.some(({ value, originX }) => value === '机关 -9'
+    && originX === -1920), 'only confirmed trap damage receives a short numeric hit cue');
+  assert.ok(!recording.strokes.some(({ color }) => color === '#fff9e9'),
+    'trap damage cannot masquerade as a close-range fist hit');
+});
+
+test('both duelists render their own manual spear arc, committed direction and projectile across the third panel', () => {
+  const recording = recordingRenderer(true);
+  const state = wideDuelState(170, 2420);
+  state.fighters[1] = { ...state.fighters[1], spearAiming: true, spearAimAngle: 8 };
+  state.projectiles = [{ id: 'p2-spear', kind: 'spear', team: 1,
+    x: 2400, y: 330, vx: -25, vy: -5 }];
+  const meta = { mode: 'duel', localFighterId: 'p2' };
+  recording.renderer.render(state, meta);
+  const origin = spearOrigin(state.fighters[1]);
+  const arc = recording.strokes.find(({ color, points }) => color === '#a8eaf8'
+    && points.length > 10 && points[0]?.[0] === origin.x);
+  assert.ok(arc, 'P2 can aim a real player-selected arc rather than an AI locked target');
+  assert.equal(arc.originX, -1920);
+  assert.deepEqual(arc.points[1], Object.values(spearTrajectoryPoint(origin.x, origin.y,
+    spearAimedFlight(-1, 8), 1)));
+  assert.ok(recording.labels.some(({ value }) => value === '仰角 8°'));
+  assert.ok(recording.strokes.some(({ color, originX }) => color === '#7bd6ed'
+    && originX === 480), 'P2 cool-coloured spear shaft follows the same third-panel camera');
+
+  recording.strokes.length = 0;
+  recording.labels.length = 0;
+  const committed = { ...state.fighters[1], facing: -1, spearAiming: false,
+    spearWindup: 10, spearLaunchFacing: 1, spearAimAngle: 42 };
+  recording.renderer.render({ ...state, tick: 41, fighters: [state.fighters[0], committed] }, meta);
+  const lockedOrigin = spearOrigin(committed, 1);
+  const lockedArc = recording.strokes.find(({ color, points }) => color === '#a8eaf8'
+    && points.length > 10 && points[0]?.[0] === lockedOrigin.x);
+  assert.ok(lockedArc);
+  assert.ok(lockedArc.points[1][0] > lockedOrigin.x,
+    'the already committed P2 throw uses its launch-facing instead of later body facing');
+  assert.ok(recording.labels.some(({ value }) => value === '锁定 42°'));
+});
+
+test('duel light wave stops at its real forward reach and confirms only actual hits, including low motion', () => {
+  for (const reducedMotion of [false, true]) withClock((advance) => {
+    const recording = recordingRenderer(reducedMotion);
+    const state = wideDuelState(2600, 2200);
+    const meta = { mode: 'duel', localFighterId: 'p2' };
+    recording.renderer.effect({ id: `wave-${reducedMotion}`, type: 'duel-wave',
+      source: 'p2', x: 2200, y: 350, facing: 1, reach: 800,
+      halfHeight: 42, durationTicks: 14 });
+    recording.renderer.effect({ id: `wave-hit-${reducedMotion}`, type: 'hit',
+      delivery: 'duel-wave', source: 'p2', target: 'p1', x: 2600, y: 350,
+      damage: 20, heavy: true });
+    recording.renderer.render(state, meta);
+    const core = recording.strokes.find(({ color, width, points }) => color === '#f6ffff'
+      && width === (reducedMotion ? 6 : 10) && points.length === 2);
+    assert.ok(core, 'the authoritative cast has a white-core forward ray on both motion settings');
+    assert.ok(Math.abs(core.originX - (2200 + 39 - 1720)) < 8,
+      'a pre-frame event retains its world-space origin, allowing only the confirmed-hit camera shake');
+    assert.equal(core.points[1][0], 2880 - 2200 - 39,
+      'the beam is clipped at the arena wall, not stretched to a campaign-wide echo');
+    assert.ok(recording.strokes.some(({ color, originX }) => color === '#e4fff3'
+      && Math.abs(originX - (2600 - 1720)) < 8),
+    'a server-confirmed target gets one local impact cue');
+    assert.ok(!recording.strokes.some(({ color }) => color === '#dffff8'),
+      'a duel ray never claims the campaign wave hits opponents behind its arc');
+    recording.strokes.length = 0;
+    recording.renderer.effect({ id: `wave-${reducedMotion}`, type: 'duel-wave',
+      source: 'p2', x: 2200, y: 350, facing: 1, reach: 800,
+      halfHeight: 42, durationTicks: 14 });
+    recording.renderer.render({ ...state, tick: 41 }, meta);
+    assert.equal(recording.strokes.filter(({ color, width }) => color === '#f6ffff'
+      && width === (reducedMotion ? 6 : 10)).length, 1,
+    'replayed room events cannot pile up the same cast');
+    advance(260);
+    recording.strokes.length = 0;
+    recording.renderer.render({ ...state, tick: 56 }, meta);
+    assert.ok(!recording.strokes.some(({ color }) => color === '#f6ffff'),
+      'the PvP beam does not linger beyond the actual short hit window');
+  });
+});
+
+test('P1 left-facing ray mirrors from its own palm, and a ready cue does not imply a hit', () => {
+  const recording = recordingRenderer(true);
+  const state = wideDuelState(1400, 2500);
+  const meta = { mode: 'duel', localFighterId: 'p1', sceneToken: 'room-1' };
+  recording.renderer.effect({ id: 'ready-p1', type: 'duel-wave-ready',
+    source: 'p1', x: 1400, y: 350, charge: 1 });
+  recording.renderer.effect({ id: 'left-wave', type: 'duel-wave', source: 'p1',
+    x: 1400, y: 350, facing: -1, reach: 800, halfHeight: 42, durationTicks: 14 });
+  recording.renderer.render(state, meta);
+  const beam = recording.strokes.find(({ color, width, scaleX }) =>
+    color === '#fffaf0' && width === 6 && scaleX === -1);
+  assert.ok(beam, 'P1 casts the same bounded beam to the left');
+  assert.equal(beam.originX, 1400 - 39 - 920);
+  assert.equal(beam.points[1][0], 800 - 39);
+  assert.ok(recording.strokes.some(({ color, originX, points }) => color === '#b8f7dd'
+    && originX === -920 && points.some((point) => point.kind === 'arc'
+      && point.x === 1400)), 'earning a charge has a short local ring');
+  assert.ok(!recording.strokes.some(({ color }) => color === '#e4fff3'),
+    'without an authoritative hit event the distant opponent gets no false hit marker');
+  recording.strokes.length = 0;
+  recording.renderer.render({ ...state, tick: 0 }, { ...meta, sceneToken: 'room-2' });
+  assert.ok(!recording.strokes.some(({ color }) => color === '#fffaf0' || color === '#b8f7dd'),
+    'a new round clears both the cast and the old readiness cue');
+});
+
+test('early spear-impact and KO events beyond x=1920 remain attached to the duel world after the first frame', () => {
+  withClock(() => {
+    const recording = recordingRenderer(true);
+    recording.renderer.effect({ id: 'far-impact', type: 'spear-impact',
+      x: 2530, y: 340, source: 'p2', target: 'p1', damage: 22 });
+    recording.renderer.effect({ id: 'far-ko', type: 'ko', target: 'p1',
+      kind: 'hero', x: 2530, y: 390, source: 'p2' });
+    const state = wideDuelState(2530, 2310);
+    state.fighters[0].hp = 0;
+    recording.renderer.render(state, { mode: 'duel', localFighterId: 'p2' });
+    assert.ok(recording.strokes.some(({ color, originX, points }) => color === '#fff4ce'
+      && originX === -1830 && points.some((point) => point.kind === 'arc'
+        && point.x === 2530)), 'the spear impact is not clamped to the old 960px map');
+    assert.ok(recording.fills.some(({ color, originX }) => color === '#702d2a'
+      && originX > 680 && originX < 760),
+    'the fallen opponent and its tomato remain near the real far-side world x');
+
+    const p2Ko = recordingRenderer(true);
+    p2Ko.renderer.effect({ id: 'far-p2-ko', type: 'ko', target: 'p2',
+      kind: 'hero', x: 2530, y: 390, source: 'p1' });
+    const p2State = wideDuelState(2310, 2530);
+    p2State.fighters[1].hp = 0;
+    p2Ko.renderer.render(p2State, { mode: 'duel', localFighterId: 'p1' });
+    assert.ok(p2Ko.fills.some(({ color, originX }) => color === '#287f98'
+      && originX > 680 && originX < 760),
+    'a first-frame P2 KO retains its own cool scarf rather than borrowing P1 red');
+  });
+});

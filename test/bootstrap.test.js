@@ -96,6 +96,24 @@ test('portrait setup exposes explicit local-only upload and camera fallback cont
   }
   assert.match(page, /<dialog id="backpack-dialog"[^>]*aria-labelledby="backpack-title"/);
   assert.match(page, /data-key="equipment"/);
+  assert.match(page, /联机技能说明/);
+  assert.match(page, /横向三倍战场有旋转木条/);
+  assert.match(page, /投矛 · 每人每局 5 发/);
+  assert.match(page, /光波 · 3 次命中充能/);
+});
+
+test('PvP HUD colors identify red P1 and cyan P2 without recoloring campaign foes', () => {
+  const page = readFileSync(new URL('../public/index.html', import.meta.url), 'utf8');
+  const style = readFileSync(new URL('../public/styles.css', import.meta.url), 'utf8');
+  assert.match(page, /id="fight-hud" class="fight-hud"/);
+  assert.match(style, /\.fighter-status--opponent \.health-fill \{[^}]*var\(--signal-hot\)/,
+    'campaign enemies retain the existing coral health bar');
+  assert.match(style, /\.fight-hud\.is-duel \.fighter-status--player \.health-fill \{[^}]*#a84246/,
+    'only the duel P1 health bar uses a warm red gradient');
+  assert.match(style, /\.fight-hud\.is-duel \.fighter-status--opponent \{ border-color: #76cfe3; \}/,
+    'only the duel P2 HUD frame switches to cyan');
+  assert.match(style, /\.fight-hud\.is-duel \.fighter-status--opponent \.health-fill \{[^}]*#66c6d9/,
+    'duel P2 health uses the matching cool cyan gradient');
 });
 
 test('browser controller boots, switches modes, starts a fight and renders a frame', async () => {
@@ -270,7 +288,7 @@ test('browser controller boots, switches modes, starts a fight and renders a fra
     clearTimeout(id) { timers.delete(id); },
     confirm: () => true,
   };
-  globalThis.location = { protocol: 'http:', host: '127.0.0.1:3000' };
+  globalThis.location = { protocol: 'http:', host: '127.0.0.1:3001' };
   globalThis.requestAnimationFrame = (callback) => { frames.push(callback); };
   globalThis.WebSocket = FakeWebSocket;
   try {
@@ -362,10 +380,14 @@ test('browser controller boots, switches modes, starts a fight and renders a fra
     elements.get('duel-button').fire('click');
     assert.equal(elements.get('campaign-panel').hidden, true);
     assert.equal(elements.get('duel-panel').hidden, false);
+    assert.equal(elements.get('fight-hud').classList.contains('is-duel'), true,
+      'the P1/P2 HUD gets duel-only colors');
     assert.equal(elements.get('stage-label').textContent, '实时联机 1V1');
     assert.equal(elements.get('avatar-open').disabled, false, 'the idle duel lobby can set a local portrait');
 
     elements.get('campaign-button').fire('click');
+    assert.equal(elements.get('fight-hud').classList.contains('is-duel'), false,
+      'campaign enemies return to their original warm-colored HUD');
     elements.get('overlay-primary').fire('click');
     assert.equal(elements.get('screen-overlay').hidden, true);
     assert.ok(musicStarts() > 0, 'starting the campaign begins its quiet theme after the gesture');
@@ -722,11 +744,14 @@ test('browser controller boots, switches modes, starts a fight and renders a fra
     elements.get('create-room').fire('click');
     await new Promise((resolve) => setImmediate(resolve));
     const socket = sockets.at(-1);
-    assert.equal(socket.url, 'ws://127.0.0.1:3000/ws');
+    assert.equal(socket.url, 'ws://127.0.0.1:3001/ws');
     const musicBeforeRoom = musicStarts();
     socket.fire('message', { data: JSON.stringify({ type: 'created', code: '123456', role: 'p1', theme: 'city' }) });
     assert.equal(musicStarts(), musicBeforeRoom, 'waiting for an opponent has no battle score');
+    elements.get('room-input').focus();
     socket.fire('message', { data: JSON.stringify({ type: 'start', code: '123456', role: 'p1', theme: 'city' }) });
+    assert.equal(globalThis.document.activeElement, elements.get('game-canvas'),
+      'joining via Enter moves keyboard focus out of the room-code field before combat');
     assert.ok(musicStarts() > musicBeforeRoom, 'server start begins the duel arrangement');
     assert.equal(elements.get('avatar-open').disabled, true,
       'portrait setup cannot interrupt a live server-authoritative duel');
@@ -743,25 +768,31 @@ test('browser controller boots, switches modes, starts a fight and renders a fra
     assert.equal(socket.sent.at(-1).input.kick, false);
     assert.equal(socket.sent.at(-1).input.attack, false,
       'a duel-lobby key released during portrait setup cannot become a ghost attack');
-    assert.equal('special' in socket.sent.at(-1).input, false);
-    assert.equal('spear' in socket.sent.at(-1).input, false);
+    assert.equal(socket.sent.at(-1).input.special, false);
+    assert.equal(socket.sent.at(-1).input.spear, false);
     assert.equal('equipment' in socket.sent.at(-1).input, false);
     assert.deepEqual(Object.keys(socket.sent.at(-1).input).sort(),
-      ['attack', 'dodge', 'jump', 'kick', 'left', 'right']);
+      ['aimCancel', 'aimDown', 'aimUp', 'attack', 'dodge', 'jump', 'kick',
+        'left', 'right', 'spear', 'special']);
     assert.doesNotMatch(JSON.stringify(socket.sent), /data:image|avatar|portrait/i,
       'portrait pixels and metadata never travel with room or combat messages');
 
     document.fire('keydown', { code: 'KeyL', repeat: false });
-    assert.equal('special' in socket.sent.at(-1).input, false, 'light wave is never sent to the duel server');
+    assert.equal(socket.sent.at(-1).input.special, true, 'L sends an authorized PvP wave input');
     document.fire('keyup', { code: 'KeyL' });
-    assert.equal(elements.get('special-button').hidden, true, 'duels do not show the special button');
+    assert.equal(socket.sent.at(-1).input.special, false);
+    assert.equal(elements.get('special-button').hidden, false, 'both duelists see the wave button');
+    assert.equal(elements.get('special-button').disabled, true, 'uncharged wave is unavailable');
     document.fire('keydown', { code: 'KeyI', repeat: false });
-    assert.equal('spear' in socket.sent.at(-1).input, false, 'campaign spears never enter PvP protocol');
+    assert.equal(socket.sent.at(-1).input.spear, true, 'I sends an authorized PvP spear edge');
     document.fire('keyup', { code: 'KeyI' });
+    assert.equal(socket.sent.at(-1).input.spear, false, 'release separates two I presses');
     document.fire('keydown', { code: 'ArrowUp', repeat: false });
-    assert.equal('aimUp' in socket.sent.at(-1).input, false, 'campaign aiming never enters PvP');
+    assert.equal(socket.sent.at(-1).input.aimUp, true, 'an aim key is authorized in PvP');
     document.fire('keyup', { code: 'ArrowUp' });
-    assert.equal(elements.get('spear-button').hidden, true, 'duels do not show the spear button');
+    assert.equal(socket.sent.at(-1).input.aimUp, false);
+    assert.equal(elements.get('spear-button').hidden, false, 'both duelists see the spear button');
+    assert.equal(elements.get('spear-guide-remaining').textContent, '5/5');
     assert.equal(elements.get('spear-aim-controls').hidden, true);
     assert.equal(elements.get('equipment-status').hidden, true, 'the backpack is campaign-only');
     assert.equal(elements.get('equipment-button').hidden, true);
@@ -771,6 +802,159 @@ test('browser controller boots, switches modes, starts a fight and renders a fra
     document.fire('keyup', { code: 'KeyE' });
     tapKey('KeyB');
     assert.equal(elements.get('backpack-dialog').open, false, 'B cannot open a campaign bag in PvP');
+
+    // Resource/readout truth comes from the local role in the authoritative
+    // state. A network-delayed aim may be nudged by a very brief touch or key
+    // tap, while double I presses and hitstop remain separate network edges.
+    const duelSkills = createDuelState('city');
+    duelSkills.fighters[0].spearRemaining = 3;
+    duelSkills.fighters[0].spearAiming = true;
+    duelSkills.fighters[0].spearAimAngle = 34;
+    duelSkills.fighters[0].facing = -1;
+    duelSkills.fighters[0].duelWaveCharge = 1;
+    duelSkills.fighters[0].duelWaveHits = 2;
+    socket.fire('message', { data: JSON.stringify({
+      type: 'state', code: '123456', phase: 'playing', state: duelSkills,
+    }) });
+    assert.equal(elements.get('spear-guide-remaining').textContent, '3/5');
+    assert.match(elements.get('spear-status').textContent, /朝左瞄准/);
+    assert.equal(elements.get('spear-button').textContent, '发射 ×3');
+    assert.equal(elements.get('spear-aim-controls').hidden, false);
+    assert.equal(elements.get('special-button').disabled, false);
+    assert.match(elements.get('special-status').textContent, /朝左前方 800/);
+    assert.equal(elements.get('game-canvas').classList.contains('is-aiming'), true);
+    assert.match(elements.get('touch-tip').textContent, /弧线仅预测落点/);
+    document.fire('keydown', { code: 'KeyI', repeat: false });
+    const lastSpearSeq = socket.sent.at(-1).seq;
+    window.fire('blur');
+    const [blurCancel, blurRelease] = socket.sent.slice(-2);
+    assert.equal(blurCancel.seq, lastSpearSeq + 1);
+    assert.equal(blurRelease.seq, blurCancel.seq + 1);
+    assert.deepEqual([blurCancel.input.aimCancel, blurRelease.input.aimCancel], [true, false],
+      'PvP blur sends a cancellable server edge and releases it for later Esc presses');
+    assert.equal(blurCancel.input.spear, false,
+      'blur discards a held or queued I rather than confirming the aimed spear');
+    assert.equal(blurRelease.input.spear, false);
+    window.fire('focus');
+    globalThis.document.hidden = true;
+    globalThis.document.fire('visibilitychange');
+    assert.deepEqual(socket.sent.slice(-2).map(({ input }) => input.aimCancel), [true, false],
+      'hiding the duel tab also cancels server-owned aim without a stuck Esc');
+    globalThis.document.hidden = false;
+    globalThis.document.fire('visibilitychange');
+    duelSkills.fighters[0].spearAiming = false;
+    duelSkills.fighters[0].stun = 4;
+    socket.fire('message', { data: JSON.stringify({
+      type: 'state', code: '123456', phase: 'playing', state: duelSkills,
+    }) });
+    assert.equal(elements.get('special-button').disabled, true,
+      'a charged PvP wave cannot be requested while its fighter is stunned');
+    assert.match(elements.get('special-status').textContent, /当前动作结束后/);
+    duelSkills.fighters[0].stun = 0;
+    duelSkills.fighters[0].spearWindup = 8;
+    socket.fire('message', { data: JSON.stringify({
+      type: 'state', code: '123456', phase: 'playing', state: duelSkills,
+    }) });
+    assert.equal(elements.get('special-button').disabled, false,
+      'an already-charged wave may interrupt an unthrown PvP spear');
+    assert.equal(elements.get('spear-button').disabled, true, 'a committed spear cannot be re-aimed');
+    duelSkills.fighters[0].spearWindup = 0;
+    duelSkills.fighters[0].spearAiming = true;
+    socket.fire('message', { data: JSON.stringify({
+      type: 'state', code: '123456', phase: 'playing', state: duelSkills,
+    }) });
+    assert.equal(elements.get('special-button').disabled, false,
+      'the charged wave may also cancel the unconfirmed aim');
+
+    document.fire('keydown', { code: 'ArrowUp', repeat: false });
+    document.fire('keyup', { code: 'ArrowUp' });
+    assert.ok(socket.sent.at(-1).input.aimAngle > 34,
+      'a quick up tap sends an absolute angle even if released before a server tick');
+    const upButton = elements.get('aim-up-button');
+    upButton.fire('pointerdown', { pointerId: 70 });
+    upButton.fire('pointerup', { pointerId: 70 });
+    assert.ok(socket.sent.at(-1).input.aimAngle > 35,
+      'a quick touch tap also survives until the server samples its target angle');
+    const duelCanvas = elements.get('game-canvas');
+    duelCanvas.fire('pointerdown', { pointerId: 71, clientY: 200 });
+    duelCanvas.fire('pointermove', { pointerId: 71, clientY: 150 });
+    duelCanvas.fire('pointerup', { pointerId: 71, clientY: 150 });
+    const draggedAngle = socket.sent.at(-1).input.aimAngle;
+    assert.ok(draggedAngle > 40, 'dragging up requests a higher throw angle');
+    assert.equal(duelCanvas.classList.contains('is-aim-dragging'), false);
+    assert.match(elements.get('spear-angle').textContent, /仰角 [4-9][0-9]°/);
+    duelSkills.fighters[0].spearAimAngle = draggedAngle;
+    socket.fire('message', { data: JSON.stringify({
+      type: 'state', code: '123456', phase: 'playing', state: duelSkills,
+    }) });
+    document.fire('keydown', { code: 'KeyD', repeat: false });
+    assert.equal('aimAngle' in socket.sent.at(-1).input, false,
+      'a server-acknowledged drag stops overriding subsequent keyboard adjustments');
+    document.fire('keyup', { code: 'KeyD' });
+
+    duelSkills.hitstop = 3;
+    socket.fire('message', { data: JSON.stringify({
+      type: 'state', code: '123456', phase: 'playing', state: duelSkills,
+    }) });
+    document.fire('keydown', { code: 'KeyI', repeat: false });
+    document.fire('keyup', { code: 'KeyI' });
+    document.fire('keydown', { code: 'KeyI', repeat: false });
+    document.fire('keyup', { code: 'KeyI' });
+    assert.deepEqual(socket.sent.slice(-4).map(({ input }) => input.spear),
+      [true, false, true, false], 'two fast I taps preserve both rising edges during hitstop');
+    const spearButton = elements.get('spear-button');
+    spearButton.fire('pointerdown', { pointerId: 72 });
+    spearButton.fire('pointerup', { pointerId: 72 });
+    assert.deepEqual(socket.sent.slice(-2).map(({ input }) => input.spear), [true, false],
+      'touch 发射 uses the same explicit I confirmation');
+    const specialButton = elements.get('special-button');
+    specialButton.fire('pointerdown', { pointerId: 73 });
+    specialButton.fire('pointerup', { pointerId: 73 });
+    assert.deepEqual(socket.sent.slice(-2).map(({ input }) => input.special), [true, false],
+      'touch 光波 sends one down/release pulse');
+    const cancelButton = elements.get('aim-cancel-button');
+    cancelButton.fire('pointerdown', { pointerId: 74 });
+    cancelButton.fire('pointerup', { pointerId: 74 });
+    assert.deepEqual(socket.sent.slice(-2).map(({ input }) => input.aimCancel), [true, false]);
+    duelSkills.fighters[0].spearAiming = false;
+    duelSkills.fighters[0].spearRemaining = 0;
+    duelSkills.fighters[0].duelWaveCharge = 0;
+    duelSkills.fighters[0].duelWaveHits = 1;
+    socket.fire('message', { data: JSON.stringify({
+      type: 'state', code: '123456', phase: 'playing', state: duelSkills,
+    }) });
+    assert.equal(elements.get('spear-aim-controls').hidden, true);
+    assert.equal(elements.get('spear-button').disabled, true);
+    assert.match(elements.get('spear-status').textContent, /已用尽/);
+    assert.equal(elements.get('special-button').disabled, true);
+    assert.match(elements.get('special-status').textContent, /充能 1\/3/);
+
+    // A joining client must read P2's own resources, not the P1 HUD column.
+    socket.fire('message', { data: JSON.stringify({ type: 'start', code: '123456', role: 'p2', theme: 'city' }) });
+    const guestSkills = createDuelState('city');
+    guestSkills.fighters[0].spearRemaining = 5;
+    guestSkills.fighters[0].duelWaveCharge = 0;
+    guestSkills.fighters[1].spearRemaining = 1;
+    guestSkills.fighters[1].duelWaveCharge = 1;
+    guestSkills.fighters[1].facing = 1;
+    socket.fire('message', { data: JSON.stringify({
+      type: 'state', code: '123456', phase: 'playing', state: guestSkills,
+    }) });
+    assert.equal(elements.get('spear-guide-remaining').textContent, '1/5');
+    assert.match(elements.get('spear-status').textContent, /朝右/);
+    assert.equal(elements.get('special-button').disabled, false);
+    assert.match(elements.get('opponent-name').textContent, /你/);
+    assert.doesNotMatch(elements.get('player-name').textContent, /你/);
+    document.fire('keydown', { code: 'KeyJ', repeat: false });
+    document.fire('keydown', { code: 'KeyI', repeat: false });
+    socket.fire('message', { data: JSON.stringify({ type: 'countdown', code: '123456', seconds: 3 }) });
+    assert.equal(elements.get('spear-button').disabled, true, 'countdown blocks stale skill taps');
+    socket.fire('message', { data: JSON.stringify({ type: 'start', code: '123456', role: 'p1', theme: 'city' }) });
+    assert.equal(socket.sent.at(-1).input.attack, false, 'round start drops a held pre-countdown punch');
+    assert.equal(socket.sent.at(-1).input.spear, false, 'round start drops a held pre-countdown I');
+    socket.fire('message', { data: JSON.stringify({
+      type: 'state', code: '123456', phase: 'playing', state: createDuelState('city'),
+    }) });
 
     document.fire('keydown', { code: 'KeyK', repeat: false });
     assert.equal(socket.sent.at(-1).input.kick, true);

@@ -1,13 +1,13 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { createCombatState, createDuelState, createFighter, stepCombat } from '../shared/combat.js';
+import { DUEL_WORLD_WIDTH, createCombatState, createDuelState, createFighter, stepCombat } from '../shared/combat.js';
 import { platformPose, platformSurfaceY } from '../shared/platforms.js';
 
 const arena = (platforms = []) => ({
   theme: 'forest', width: 1920, groundY: 438, platforms, hazards: [],
 });
 
-test('campaign movement reaches the second half while the PvP boundary stays 960', () => {
+test('campaign movement reaches the second half while PvP uses its own 3x boundary', () => {
   const hero = createFighter({ id: 'hero', x: 1150, y: 438 });
   const campaign = createCombatState({ arena: arena(), fighters: [hero] });
   for (let tick = 0; tick < 170; tick++) stepCombat(campaign, { hero: { right: true } });
@@ -15,10 +15,10 @@ test('campaign movement reaches the second half while the PvP boundary stays 960
   assert.equal(campaign.arena.width, 1920);
 
   const duel = createDuelState();
-  assert.equal(duel.arena.width, 960);
-  duel.fighters[0].x = 920;
+  assert.equal(duel.arena.width, DUEL_WORLD_WIDTH);
+  duel.fighters[0].x = DUEL_WORLD_WIDTH - 40;
   for (let tick = 0; tick < 30; tick++) stepCombat(duel, { p1: { right: true } });
-  assert.equal(duel.fighters[0].x, 941);
+  assert.equal(duel.fighters[0].x, DUEL_WORLD_WIDTH - 19);
 });
 
 test('contiguous 12px stair treads can be walked up and down without jumping', () => {

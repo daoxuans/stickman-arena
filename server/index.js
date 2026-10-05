@@ -6,14 +6,18 @@ import { performance } from 'node:perf_hooks';
 import { fileURLToPath } from 'node:url';
 import { WebSocket, WebSocketServer } from 'ws';
 
-import { TICK_RATE, createDuelState, stepCombat } from '../shared/combat.js';
+import {
+  TICK_RATE, SPEAR_MIN_ANGLE, SPEAR_MAX_ANGLE, createDuelState, stepCombat,
+} from '../shared/combat.js';
 
 const projectRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const publicRoot = path.join(projectRoot, 'public');
 const sharedRoot = path.join(projectRoot, 'shared');
 const themes = new Set(['forest', 'city', 'ocean', 'land']);
-const inputKeys = ['left', 'right', 'jump', 'attack', 'kick', 'dodge'];
-const edgeKeys = ['jump', 'attack', 'kick', 'dodge'];
+const inputKeys = ['left', 'right', 'jump', 'attack', 'kick', 'dodge',
+  'spear', 'aimUp', 'aimDown', 'aimCancel', 'special'];
+const inputFields = new Set([...inputKeys, 'aimAngle']);
+const edgeKeys = ['jump', 'attack', 'kick', 'dodge', 'spear', 'aimCancel', 'special'];
 const mimeTypes = {
   '.css': 'text/css; charset=utf-8',
   '.html': 'text/html; charset=utf-8',
@@ -29,30 +33,45 @@ const mimeTypes = {
 };
 
 function emptyInput() {
-  return { left: false, right: false, jump: false, attack: false, kick: false, dodge: false };
+  return Object.fromEntries(inputKeys.map((key) => [key, false]));
 }
 
 function emptyPresses() {
-  return { jump: false, attack: false, kick: false, dodge: false };
+  return Object.fromEntries(edgeKeys.map((key) => [key, 0]));
 }
 
 function resetControls(room) {
   room.inputs = { p1: emptyInput(), p2: emptyInput() };
   room.pendingPresses = { p1: emptyPresses(), p2: emptyPresses() };
+  room.suppressedSpear = { p1: false, p2: false };
 }
 
 function acceptInput(room, role, input) {
   const previous = room.inputs[role];
   const pending = room.pendingPresses[role];
-  // A press and release can both arrive before the next simulation step.
-  // Latch at most one rising edge per action, rather than retaining a queue
-  // that a rapid or hostile client could grow without bound.
-  for (const key of edgeKeys) if (input[key] && !previous[key]) pending[key] = true;
+  if (!input.spear) room.suppressedSpear[role] = false;
+  // A press and release can both arrive between two simulation steps. Spear
+  // alone needs two distinct queued presses (I to aim, I to commit); every
+  // queue remains bounded so a hostile client cannot store unlimited moves.
+  for (const key of edgeKeys) {
+    if (input[key] && !previous[key]) {
+      pending[key] = Math.min(key === 'spear' ? 2 : 1, pending[key] + 1);
+    }
+  }
+  // A cancel or a competing action received after the queued I taps takes
+  // precedence. Suppress an I still physically held until its real release;
+  // otherwise it could become a ghost aim on the following server tick.
+  if (['aimCancel', 'jump', 'attack', 'kick', 'dodge']
+    .some((key) => input[key] && !previous[key])) {
+    pending.spear = 0;
+    if (input.spear) room.suppressedSpear[role] = true;
+  }
   room.inputs[role] = input;
 }
 
 function inputForTick(room, role) {
   const input = { ...room.inputs[role] };
+  if (room.suppressedSpear[role]) input.spear = false;
   const pending = room.pendingPresses[role];
   const sampledLastTick = room.state.fighters.find((fighter) => fighter.id === role)?.prevInput ?? {};
   for (const key of edgeKeys) {
@@ -63,7 +82,7 @@ function inputForTick(room, role) {
       input[key] = false;
     } else {
       input[key] = true;
-      pending[key] = false;
+      pending[key]--;
     }
   }
   return input;
@@ -140,10 +159,16 @@ async function serveFile(request, response) {
 
 function validateInput(input) {
   if (!input || typeof input !== 'object' || Array.isArray(input)) return null;
+  if (Object.keys(input).some((key) => !inputFields.has(key))) return null;
   const clean = emptyInput();
   for (const key of inputKeys) {
     if (key in input && typeof input[key] !== 'boolean') return null;
     clean[key] = input[key] === true;
+  }
+  if (Object.hasOwn(input, 'aimAngle')) {
+    if (typeof input.aimAngle !== 'number' || !Number.isFinite(input.aimAngle)
+        || input.aimAngle < SPEAR_MIN_ANGLE || input.aimAngle > SPEAR_MAX_ANGLE) return null;
+    clean.aimAngle = input.aimAngle;
   }
   return clean;
 }
@@ -309,6 +334,9 @@ export async function createGameServer({
       case 'input': {
         if (!session.room || !session.role) return sendError(socket, '请先加入房间');
         if (!Number.isSafeInteger(message.seq) || message.seq < 0) return sendError(socket, '输入序号无效');
+        if (Object.keys(message).some((key) => !['type', 'seq', 'input'].includes(key))) {
+          return sendError(socket, '输入格式错误');
+        }
         const input = validateInput(message.input);
         if (!input) return sendError(socket, '输入格式错误');
         // Countdown packets are ignored without consuming the sequence that
@@ -483,7 +511,7 @@ export async function createGameServer({
 
 if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
   const host = process.env.HOST || '127.0.0.1';
-  const port = Number(process.env.PORT ?? '3000');
+  const port = Number(process.env.PORT ?? '3001');
   createGameServer({ host, port }).then((game) => {
     console.log(`Stickman Arena: http://${host}:${game.port}`);
   }).catch((error) => {

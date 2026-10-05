@@ -4,8 +4,8 @@ import { attackOf, kickOf, TICK_RATE, SPEAR_GRAVITY, SPEAR_MAX_ANGLE, SPEAR_MIN_
 import { getEquipment } from '../shared/equipment.js';
 import { platformPose } from '../shared/platforms.js';
 
-// The viewport is 960 × 540, while campaign world coordinates may span 1920px.
-// The canvas backing store is scaled for high-density screens only.
+// The viewport is always 960 × 540. Campaign and duel world coordinates may
+// be wider; only the local camera moves, never authoritative combat geometry.
 const W = 960;
 const H = 540;
 const TAU = Math.PI * 2;
@@ -89,6 +89,10 @@ const SPIRIT_TINTS = {
 };
 const SPIRIT_BEAM_MS = 560;
 const SPIRIT_BEAM_CALM_MS = 330;
+const DUEL_WAVE_TINTS = [
+  { outer: '#73ddca', inner: '#b5f5dc', core: '#fffaf0', edge: '#f3c890' },
+  { outer: '#6ecbe9', inner: '#bbf2fa', core: '#f6ffff', edge: '#a6dfff' },
+];
 
 const PHOTO_THEMES = ['forest', 'city', 'ocean', 'land'];
 const PHOTO_BACKGROUNDS = Object.fromEntries(PHOTO_THEMES.map((theme) => [theme,
@@ -526,7 +530,7 @@ function drawPlatforms(ctx, platforms, theme, motionTick) {
   }
 }
 
-function drawHazards(ctx, hazards, theme, tick) {
+function drawHazards(ctx, hazards, theme, tick, duel = false) {
   for (const hazard of hazards || []) {
     const x = number(hazard.x);
     const y = number(hazard.y);
@@ -628,6 +632,17 @@ function drawHazards(ctx, hazards, theme, tick) {
         polygon(ctx, [[left, y + h - 5], [left + w / count / 2, active ? y + 2 : y + h - 9], [left + w / count, y + h - 5]], active ? (theme === 'city' ? '#f1b174' : '#d77d61') : '#61706a');
       }
     }
+    if (duel && periodic && activeTicks > 0 && !active && period - cycle <= 24) {
+      // A short, static countdown marker communicates an upcoming live hitbox
+      // without falsely lighting the trap during its inactive phase.
+      line(ctx, [[x, y - 5], [x + w, y - 5]], '#ffe6b1', 2);
+      polygon(ctx, [[x, y - 9], [x + 7, y - 5], [x, y - 1]], '#ffe6b1');
+      polygon(ctx, [[x + w, y - 9], [x + w - 7, y - 5], [x + w, y - 1]], '#ffe6b1');
+      ctx.fillStyle = '#fff1d1';
+      ctx.font = '700 12px "Microsoft YaHei UI", sans-serif';
+      ctx.textAlign = 'center';
+      ctx.fillText('机关即将启动', x + w / 2, y - 13);
+    }
     ctx.restore();
   }
 }
@@ -700,14 +715,14 @@ function drawFallingObject(ctx, falling, tick, reducedMotion) {
   ctx.restore();
 }
 
-function drawSpear(ctx, projectile, reducedMotion) {
+function drawSpear(ctx, projectile, reducedMotion, duel = false) {
   if (projectile?.kind !== 'spear') return;
   const x = number(projectile.x);
   const y = number(projectile.y);
   const angle = Math.atan2(number(projectile.vy), number(projectile.vx, 1));
   const friendly = projectile.team === 0;
-  const tip = friendly ? '#e5fff1' : '#fff0c6';
-  const shaft = friendly ? '#7dd2bd' : '#d79a70';
+  const tip = friendly ? '#e5fff1' : duel ? '#f0fdff' : '#fff0c6';
+  const shaft = friendly ? '#7dd2bd' : duel ? '#7bd6ed' : '#d79a70';
   ctx.save();
   ctx.translate(x, y);
   ctx.rotate(angle);
@@ -1136,11 +1151,14 @@ function drawAimedSpearMarker(ctx, preview, cameraX, tick, reducedMotion, color)
   ctx.restore();
 }
 
-function drawSpearWindup(ctx, fighter, tick, reducedMotion, groundY, cameraX, worldWidth) {
+function drawSpearWindup(ctx, fighter, tick, reducedMotion, groundY, cameraX, worldWidth,
+  duel = false) {
   const windup = number(fighter?.spearWindup);
-  const aiming = fighter?.team === 0 && fighter?.spearAiming === true;
+  // In a duel both fighters are humans and can hold an independently chosen
+  // arc. Campaign enemies still have only their auto-locked windup fields.
+  const aiming = fighter?.spearAiming === true;
   if (number(fighter?.hp, 100) <= 0 || (!aiming && windup <= 0)) return;
-  const committed = fighter.team === 0 && windup > 0
+  const committed = windup > 0
     && (fighter.spearLaunchFacing === -1 || fighter.spearLaunchFacing === 1);
   const chosenFlight = aiming || committed;
   const facing = number(committed ? fighter.spearLaunchFacing : fighter.facing, 1) < 0 ? -1 : 1;
@@ -1159,7 +1177,7 @@ function drawSpearWindup(ctx, fighter, tick, reducedMotion, groundY, cameraX, wo
   const preview = chosenFlight ? aimedSpearPreview(origin, flight, groundY, worldWidth) : null;
   const angle = Math.atan2(flight.vy + SPEAR_GRAVITY, flight.vx || facing);
   const charge = aiming ? 0 : clamp(1 - windup / SPEAR_WINDUP_TICKS, 0, 1);
-  const color = fighter.team === 0 ? '#b4f7da' : '#ffca92';
+  const color = fighter.team === 0 ? '#b4f7da' : duel ? '#a8eaf8' : '#ffca92';
   ctx.save();
   ctx.globalAlpha = aiming ? .78 : .26 + charge * .3;
   if (!reducedMotion && !committed) ctx.setLineDash([6, 7]);
@@ -1718,6 +1736,55 @@ function drawSpiritWave(ctx, item, progress, worldWidth, reducedMotion) {
     ctx.lineWidth = 2.4;
     ctx.stroke();
   }
+  ctx.restore();
+}
+
+function drawDuelWave(ctx, item, progress, worldWidth, reducedMotion) {
+  const facing = item.facing < 0 ? -1 : 1;
+  const originX = clamp(item.x + facing * 39, 0, worldWidth);
+  // The server checks a bounded forward corridor from the fighter's x. Do not
+  // extend the visual ray past that end or add campaign's all-target echo.
+  const endX = clamp(item.x + facing * item.reach, 0, worldWidth);
+  const length = Math.max(0, (endX - originX) * facing);
+  if (length < 4) return;
+  const halfHeight = clamp(item.halfHeight, 12, 72);
+  const colors = DUEL_WAVE_TINTS[item.team === 1 ? 1 : 0];
+  const calm = reducedMotion || item.calm;
+  const fade = clamp((1 - progress) / .7, 0, 1);
+  ctx.save();
+  ctx.translate(originX, item.y);
+  ctx.scale(facing, 1);
+  ctx.lineCap = 'butt';
+  ctx.beginPath();
+  ctx.moveTo(0, 0);
+  ctx.lineTo(length, 0);
+  ctx.globalAlpha = .64 * fade;
+  ctx.strokeStyle = '#153438';
+  ctx.lineWidth = halfHeight * 2;
+  ctx.stroke();
+  ctx.globalCompositeOperation = 'screen';
+  ctx.globalAlpha = .8 * fade;
+  ctx.strokeStyle = colors.outer;
+  ctx.lineWidth = halfHeight * 1.68;
+  ctx.stroke();
+  ctx.strokeStyle = colors.inner;
+  ctx.lineWidth = halfHeight * .98;
+  ctx.stroke();
+  ctx.strokeStyle = colors.core;
+  ctx.lineWidth = calm ? 6 : 10;
+  ctx.stroke();
+  // Two restrained rails and a palm flare read as a wuxia energy release;
+  // reduced motion retains the full fixed ray and its bounded end instead.
+  if (!calm) {
+    ctx.globalAlpha = .48 * fade;
+    line(ctx, [[7, -halfHeight + 4], [length * .47, -halfHeight + 8],
+      [Math.max(8, length - 9), -halfHeight + 3]], colors.edge, 2.1);
+    line(ctx, [[7, halfHeight - 4], [length * .53, halfHeight - 8],
+      [Math.max(8, length - 9), halfHeight - 3]], colors.edge, 2.1);
+  }
+  ctx.globalAlpha = .9 * fade;
+  ellipse(ctx, 0, 0, calm ? 10 : 14, calm ? 10 : 14, colors.core);
+  ellipse(ctx, Math.max(2, length - 7), 0, 6, calm ? 9 : 12, colors.core);
   ctx.restore();
 }
 
@@ -2443,6 +2510,33 @@ function drawAtmosphere(ctx, theme, tick, level) {
   ctx.restore();
 }
 
+function drawDuelOpponentDirection(ctx, fighters, player, cameraX) {
+  if (!player || number(player.hp, 100) <= 0) return;
+  const opponent = fighters.find((fighter) => fighter && fighter.id !== player.id
+    && fighter.team !== player.team && number(fighter.hp, 0) > 0);
+  if (!opponent) return;
+  const x = number(opponent.x);
+  if (x >= cameraX + 32 && x <= cameraX + W - 32) return;
+  const leftSide = x < cameraX + 32;
+  const boxX = leftSide ? 14 : W - 151;
+  const y = clamp(number(opponent.y, 350) - number(opponent.height, 88) * .55, 142, H - 94);
+  const distance = Math.round(Math.abs(x - number(player.x)));
+  const color = opponent.team === 1 ? WANDERER_PALETTES[1].eyeAccent
+    : WANDERER_PALETTES[0].eyeAccent;
+  ctx.save();
+  ctx.fillStyle = 'rgba(9, 26, 31, .91)';
+  ctx.fillRect(boxX, y - 18, 137, 38);
+  const arrowX = leftSide ? boxX + 16 : boxX + 121;
+  polygon(ctx, leftSide
+    ? [[arrowX - 9, y], [arrowX + 5, y - 9], [arrowX + 5, y + 9]]
+    : [[arrowX + 9, y], [arrowX - 5, y - 9], [arrowX - 5, y + 9]], color);
+  ctx.font = '700 12px "Microsoft YaHei UI", sans-serif';
+  ctx.fillStyle = '#f4f1df';
+  ctx.textAlign = 'center';
+  ctx.fillText(`对手 距离 ${distance}`, leftSide ? boxX + 84 : boxX + 55, y + 4);
+  ctx.restore();
+}
+
 export function createRenderer(canvas) {
   if (!canvas || typeof canvas.getContext !== 'function') throw new TypeError('createRenderer 需要有效的 Canvas 元素');
   const ctx = canvas.getContext('2d', { alpha: false });
@@ -2512,7 +2606,8 @@ export function createRenderer(canvas) {
     if (!event || typeof event !== 'object') return;
     reducedMotion = Boolean(motionMedia?.matches);
     const type = String(event.type || '').toLowerCase();
-    if (!['hit', 'dodge', 'land', 'ko', 'bones-scatter', 'kick', 'jump-kick', 'special-wave', 'fall-impact',
+    if (!['hit', 'dodge', 'land', 'ko', 'bones-scatter', 'kick', 'jump-kick', 'special-wave', 'duel-wave',
+      'duel-wave-ready', 'fall-impact',
       'spear-windup', 'spear-throw', 'spear-impact',
       'equipment-swing', 'equipment-pickup',
       'rock-windup', 'rock-throw', 'rock-impact', 'boss-rock-windup', 'boss-rock-throw',
@@ -2520,6 +2615,7 @@ export function createRenderer(canvas) {
       'boss-ward-windup', 'boss-ward', 'boss-ward-hit'].includes(type)) return;
     if (lastScene.startsWith('duel:') && (type.startsWith('equipment-')
       || type === 'hit' && event.delivery === 'equipment')) return;
+    if (lastScene.startsWith('campaign:') && (type === 'duel-wave' || type === 'duel-wave-ready')) return;
 
     const stamp = now();
     const stableId = event.id ?? event.eventId ?? event.uid;
@@ -2538,7 +2634,11 @@ export function createRenderer(canvas) {
       }
     }
 
-    const x = clamp(number(event.x, worldWidth / 2), -50, worldWidth + 50);
+    // A room event may arrive before the first 2880px snapshot establishes
+    // worldWidth. Preserve legitimate world coordinates across all three
+    // panels; the canvas viewport will clip what this client cannot see.
+    const eventWorldMax = Math.max(worldWidth + 50, 4096);
+    const x = clamp(number(event.x, worldWidth / 2), -50, eventWorldMax);
     const y = clamp(number(event.y, H / 2), -50, H + 50);
     if (type === 'ko') {
       const target = String(event.target ?? `ko:${stableId ?? `${Math.round(x)}:${Math.round(y)}:${stamp}`}`);
@@ -2552,7 +2652,8 @@ export function createRenderer(canvas) {
           : y + number(previous?.fighter.height ?? event.height, 88) * .45;
       const pose = {
         ...(previous?.fighter ?? {}), id: target, kind: previous?.fighter.kind ?? event.kind ?? 'hero',
-        x: clamp(x, 22, worldWidth - 22),
+        team: previous?.fighter.team ?? (target === 'p2' ? 1 : target === 'p1' ? 0 : undefined),
+        x: clamp(x, 22, Math.max(worldWidth - 22, 4096)),
         // Off-screen falls get a visible, bounded final gag at the arena edge.
         y: clamp(footY, 80, H + 8), facing,
         hp: 0, vx: 0, vy: 0, grounded: true, stun: 0, dodgeTicks: 0,
@@ -2618,6 +2719,26 @@ export function createRenderer(canvas) {
         shakeStrength = 3.5;
         shakeUntil = stamp + 120;
       }
+      if (rings.length > 45) rings.splice(0, rings.length - 45);
+      return;
+    }
+    if (type === 'duel-wave') {
+      const source = lastFighters.get(String(event.source))?.fighter;
+      // Events can precede the first wide-world frame. Keep the source's
+      // authoritative x rather than clipping it to this client's viewport.
+      rings.push({ type, x: clamp(number(event.x, x), -50, Math.max(worldWidth + 50, 4096)), y,
+        facing: number(event.facing, number(source?.facing, 1)) < 0 ? -1 : 1,
+        reach: clamp(number(event.reach, 800), 40, 4096),
+        halfHeight: clamp(number(event.halfHeight, 42), 12, 72),
+        team: number(source?.team, String(event.source) === 'p2' ? 1 : 0),
+        born: stamp, life: clamp(number(event.durationTicks, 14) * 1000 / TICK_RATE, 150, 420),
+        calm: reducedMotion });
+      if (rings.length > 45) rings.splice(0, rings.length - 45);
+      return;
+    }
+    if (type === 'duel-wave-ready') {
+      rings.push({ type, x, y, born: stamp, life: 360, radius: 34,
+        color: '#b8f7dd', calm: reducedMotion });
       if (rings.length > 45) rings.splice(0, rings.length - 45);
       return;
     }
@@ -2698,9 +2819,12 @@ export function createRenderer(canvas) {
     }
     const ultimate = type === 'jump-kick';
     const heavy = type === 'hit' && Boolean(event.heavy);
-    const specialHit = type === 'hit' && event.special === true;
+    const duelWaveHit = type === 'hit' && event.delivery === 'duel-wave';
+    const specialHit = type === 'hit' && (event.special === true || duelWaveHit);
     const equipmentHit = type === 'hit' && event.delivery === 'equipment';
     const fallingImpact = type === 'fall-impact';
+    const duelHazardHit = type === 'hit' && lastScene.startsWith('duel:')
+      && String(event.source ?? '').startsWith('hazard:');
     const targetX = specialHit || equipmentHit
       ? clamp(number(event.x, x), -50, Math.max(worldWidth + 50, 4096)) : x;
     const source = specialHit ? lastFighters.get(String(event.source))?.fighter : null;
@@ -2712,7 +2836,7 @@ export function createRenderer(canvas) {
       const direction = number(event.facing, number(source?.facing, 1)) < 0 ? -1 : 1;
       const accent = source?.kind === 'hero' && source.team === 1 ? '#b7f2f2'
         : source?.team === 1 ? '#ffc0a0' : '#f8cf8c';
-      impactMarks.push({ x: clamp(x - direction * 5, 0, worldWidth), y,
+      impactMarks.push({ x: clamp(x - direction * 5, 0, eventWorldMax), y,
         born: stamp, life: reducedMotion ? 145 : heavy ? 245 : 185,
         facing: direction, heavy, accent,
         tint: SPIRIT_TINTS[sceneTheme], reducedMotion });
@@ -2720,7 +2844,7 @@ export function createRenderer(canvas) {
     }
     // The jump-kick event is emitted on its first damaging frame. Its origin
     // is the fighter's torso, so shift only the decoration toward the foot.
-    const fx = ultimate ? clamp(x + facing * 84, 0, worldWidth) : targetX;
+    const fx = ultimate ? clamp(x + facing * 84, 0, eventWorldMax) : targetX;
     const fy = ultimate ? clamp(y + 10, 0, H) : y;
     const count = equipmentHit ? 0 : reducedMotion ? 5 : ultimate ? 20
       : specialHit ? 11 : fallingImpact ? 8 : heavy ? 18
@@ -2730,6 +2854,7 @@ export function createRenderer(canvas) {
     const palette = equipmentHit ? [getEquipment(event.equipmentId)?.color ?? '#b5edb0']
       : ultimate ? ['#eaffec', '#8de9df', '#f5d995']
       : specialHit ? ['#eafff4', '#80e4df', '#d9f8ed']
+        : duelHazardHit ? ['#fff1cb', '#f6ad73', '#d5e8df']
         : fallingImpact ? ['#f8e7c7', '#cbd7ca', '#a6bdba']
       : type === 'dodge' ? ['#e9f9df', '#8bbec0', '#c1e6d6']
       : type === 'land' ? ['#e9d1a5', '#b4a580', '#f6e9c8']
@@ -2750,7 +2875,9 @@ export function createRenderer(canvas) {
     rings.push({ x: fx, y: fy, born: stamp,
       life: equipmentHit ? 220 : ultimate ? 320 : fallingImpact ? 220 : type === 'kick' ? 190 : type === 'hit' ? 250 : 300,
       radius: equipmentHit ? 28 : ultimate ? 66 : fallingImpact ? 28 : heavy ? 57 : type === 'hit' ? 43 : type === 'kick' ? 25 : 34,
-      color: palette[0], type: equipmentHit ? 'equipment-hit' : specialHit ? 'special-hit' : type, facing,
+      color: palette[0], type: equipmentHit ? 'equipment-hit' : specialHit ? 'special-hit'
+        : duelHazardHit ? 'hazard-hit' : type, facing,
+      damage: duelHazardHit ? Math.max(0, Math.round(number(event.damage))) : undefined,
       tint: specialHit ? SPIRIT_TINTS[sceneTheme] : undefined,
       calm: specialHit && reducedMotion });
     if (!reducedMotion && ((type === 'hit' && !equipmentHit) || ultimate)) {
@@ -2772,6 +2899,11 @@ export function createRenderer(canvas) {
         drawSpiritWave(ctx, item, clamp(progress, 0, 1), worldWidth, reducedMotion);
         continue;
       }
+      if (item.type === 'duel-wave') {
+        if (mode === 'duel') drawDuelWave(ctx, item, clamp(progress, 0, 1), worldWidth, reducedMotion);
+        continue;
+      }
+      if (mode !== 'duel' && item.type === 'duel-wave-ready') continue;
       if (drawBossEffect(ctx, item, clamp(progress, 0, 1), reducedMotion, worldWidth)) continue;
       ctx.save();
       ctx.globalAlpha = (1 - progress) * (item.type === 'hit' || item.type === 'jump-kick'
@@ -2791,6 +2923,13 @@ export function createRenderer(canvas) {
         }
       }
       if (item.type === 'special-hit') drawSpiritHit(ctx, item, progress, reducedMotion);
+      if (item.type === 'hazard-hit' && item.damage > 0) {
+        ctx.fillStyle = '#fff2d3';
+        ctx.font = '800 13px "Microsoft YaHei UI", sans-serif';
+        ctx.textAlign = 'center';
+        ctx.fillText(`机关 -${item.damage}`, item.x,
+          item.y - 29 - (reducedMotion ? 0 : progress * 10));
+      }
       if (item.type === 'jump-kick' && !reducedMotion) {
         ctx.translate(item.x, item.y);
         ctx.scale(item.facing, 1);
@@ -2884,7 +3023,9 @@ export function createRenderer(canvas) {
     const avatarFor = (fighter) => avatar && localFighterId != null
       && fighter?.kind === 'hero' && String(fighter.id) === localFighterId ? avatar : null;
     const player = meta.mode === 'campaign'
-      ? fighters.find((fighter) => fighter?.team === 0) ?? fighters[0] : null;
+      ? fighters.find((fighter) => fighter?.team === 0) ?? fighters[0]
+      : meta.mode === 'duel' && localFighterId != null
+        ? fighters.find((fighter) => String(fighter?.id) === localFighterId) : null;
     const cameraTarget = player ? clamp(number(player.x) - W / 2, 0, worldWidth - W) : 0;
     if (firstFrame || reducedMotion || worldWidth === W) cameraX = cameraTarget;
     else {
@@ -2942,7 +3083,7 @@ export function createRenderer(canvas) {
     }
     // Hazards and their warnings remain readable even when a Boss drops loot
     // nearby; neither the collectible nor its badge obscures a dangerous edge.
-    drawHazards(ctx, arena.hazards, theme, tick);
+    drawHazards(ctx, arena.hazards, theme, tick, meta.mode === 'duel');
     if (meta.mode === 'campaign') drawFallingWarning(ctx, state.fallingObject, tick, reducedMotion, worldWidth);
 
     if (meta.mode === 'campaign' && Array.isArray(state.corpses)) {
@@ -2987,12 +3128,13 @@ export function createRenderer(canvas) {
       drawFighter(ctx, knockout?.fighter ?? current, index, groundY, tick,
         knockout?.reducedMotion ?? reducedMotion, knockout, time,
         expressionFor(current, state, meta), null, avatarFor(current), meta.mode === 'campaign');
-      if (meta.mode === 'campaign') {
-        drawSpearWindup(ctx, current, tick, reducedMotion, groundY, cameraX, worldWidth);
+      if (meta.mode === 'campaign' || meta.mode === 'duel') {
+        drawSpearWindup(ctx, current, tick, reducedMotion, groundY, cameraX, worldWidth,
+          meta.mode === 'duel');
       }
     });
     for (const projectile of state.projectiles || []) {
-      drawSpear(ctx, projectile, reducedMotion);
+      drawSpear(ctx, projectile, reducedMotion, meta.mode === 'duel');
       if (meta.mode === 'campaign') drawRock(ctx, projectile, reducedMotion);
     }
     if (meta.mode === 'campaign') drawFallingObject(ctx, state.fallingObject, tick, reducedMotion);
@@ -3001,6 +3143,7 @@ export function createRenderer(canvas) {
     ctx.restore();
     ctx.restore();
     drawAtmosphere(ctx, theme, tick, level);
+    if (meta.mode === 'duel') drawDuelOpponentDirection(ctx, fighters, player, cameraX);
     lastFighters = new Map(fighters.map((fighter, index) => fighter?.id == null ? null
       : [String(fighter.id), { fighter: { ...fighter }, index }]).filter(Boolean));
   }

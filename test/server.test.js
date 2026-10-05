@@ -216,6 +216,126 @@ test('a short tap during hitstop waits for the next step that samples controls',
   assert.equal(sampled.state.fighters[0].prevInput.jump, true);
 });
 
+test('two I taps arriving before a server frame aim then commit one bounded PvP spear', async (t) => {
+  const game = await createTestServer(t, { tickRate: 20, countdownSeconds: 0.02 });
+  const { a, b, first } = await startMatch(game);
+  assert.equal(first.state.arena.width, 2880);
+  assert.deepEqual(first.state.fighters.map((fighter) => fighter.spearRemaining), [5, 5]);
+  const pong = once(a.socket, 'pong');
+  for (const [seq, spear] of [[0, true], [1, false], [2, true], [3, false]]) {
+    a.send({ type: 'input', seq, input: { spear } });
+  }
+  a.socket.ping();
+  await pong;
+  const aimed = await a.inbox.next((message) => message.type === 'state'
+    && message.phase === 'playing'
+    && message.state.events.some((entry) => entry.type === 'spear-aim'));
+  assert.equal(aimed.state.fighters[0].spearAiming, true);
+  assert.equal(aimed.state.fighters[0].spearRemaining, 5);
+  const committed = await a.inbox.next((message) => message.type === 'state'
+    && message.phase === 'playing'
+    && message.state.events.some((entry) => entry.type === 'spear-windup'));
+  assert.ok(committed.state.tick >= aimed.state.tick + 2,
+    'the authority samples a release between the two I edges');
+  assert.ok(committed.state.fighters[0].spearWindup > 0);
+  assert.equal(committed.state.fighters[0].spearRemaining, 5);
+  const thrown = await a.inbox.next((message) => message.type === 'state'
+    && message.phase === 'playing'
+    && message.state.events.some((entry) => entry.type === 'spear-throw'), 5000);
+  assert.equal(thrown.state.fighters[0].spearRemaining, 4);
+  assert.equal(thrown.state.fighters[1].spearRemaining, 5);
+  assert.equal(thrown.state.events.filter((entry) => entry.type === 'spear-throw').length, 1);
+  const synchronized = await b.inbox.next((message) => message.type === 'state'
+    && message.state.tick === thrown.state.tick);
+  assert.deepEqual(synchronized.state.fighters, thrown.state.fighters);
+});
+
+test('Esc or a competing attack clears queued I taps without a ghost throw', async (t) => {
+  for (const cancel of ['aimCancel', 'attack']) {
+    await t.test(cancel, async (subtest) => {
+      const game = await createTestServer(subtest, { tickRate: 10, countdownSeconds: 0.02 });
+      const { a, first } = await startMatch(game);
+      const pong = once(a.socket, 'pong');
+      for (const [seq, input] of [
+        [0, { spear: true }], [1, { spear: false }],
+        [2, { spear: true }], [3, { spear: false }],
+        [4, { [cancel]: true }], [5, { [cancel]: false }],
+      ]) a.send({ type: 'input', seq, input });
+      a.socket.ping();
+      await pong;
+      let lastTick = first.state.tick;
+      for (let frame = 0; frame < 5; frame++) {
+        const next = await a.inbox.next((message) => message.type === 'state'
+          && message.phase === 'playing' && message.state.tick > lastTick);
+        lastTick = next.state.tick;
+        assert.equal(next.state.fighters[0].spearAiming, false, cancel);
+        assert.equal(next.state.fighters[0].spearWindup, 0, cancel);
+        assert.equal(next.state.fighters[0].spearRemaining, 5, cancel);
+        assert.ok(!next.state.events.some((entry) => entry.type.startsWith('spear-')),
+          `${cancel} must not produce a delayed spear event`);
+      }
+    });
+  }
+});
+
+test('duel inputs reject malformed angles, spoofed roles, private powers and unknown fields', async (t) => {
+  const game = await createTestServer(t, { countdownSeconds: 0.02 });
+  const { a, b, first } = await startMatch(game);
+  for (const input of [
+    { special: 1 }, { spear: 'true' }, { aimUp: 'yes' },
+    { aimAngle: null }, { aimAngle: 72.1 }, { aimAngle: -8 },
+    { bossSkill: 'rock' }, { equipment: true }, { hp: 0 },
+    { target: 'p1', attack: true },
+  ]) {
+    b.send({ type: 'input', seq: 0, input });
+    assert.equal((await b.inbox.next((message) => message.type === 'error')).message,
+      '输入格式错误', JSON.stringify(input));
+  }
+  b.send({ type: 'input', seq: 0, role: 'p1', input: { special: true } });
+  assert.equal((await b.inbox.next((message) => message.type === 'error')).message, '输入格式错误');
+  b.send({ type: 'input', seq: 0, input: { spear: true } });
+  const p2Aim = await b.inbox.next((message) => message.type === 'state'
+    && message.phase === 'playing' && message.state.tick > first.state.tick
+    && message.state.events.some((entry) => entry.type === 'spear-aim' && entry.source === 'p2'));
+  assert.equal(p2Aim.state.fighters[0].spearAiming, false);
+  assert.equal(p2Aim.state.fighters[1].spearAiming, true);
+  b.send({ type: 'input', seq: 1, input: { aimAngle: 57.5 } });
+  const adjusted = await b.inbox.next((message) => message.type === 'state'
+    && message.phase === 'playing' && message.state.tick > p2Aim.state.tick
+    && message.state.fighters[1].spearAimAngle === 57.5);
+  assert.equal(adjusted.state.fighters[0].spearRemaining, 5);
+});
+
+test('both consented rematches rebuild ammo and wave charge at their initial values', async (t) => {
+  const game = await createTestServer(t, {
+    countdownSeconds: 0.02, roundSeconds: 0.75,
+  });
+  const { a, b, code } = await startMatch(game);
+  // Two I edges separated by a sampled release, then a real launch.
+  await sendShortTap(a, 'spear', 0);
+  await sendShortTap(a, 'spear', 2);
+  const spent = await a.inbox.next((message) => message.type === 'state'
+    && message.state.events.some((entry) => entry.type === 'spear-throw'), 3000);
+  assert.equal(spent.state.fighters[0].spearRemaining, 4);
+  const finished = await a.inbox.next((message) => message.type === 'finished');
+  assert.equal(finished.code, code);
+  a.send({ type: 'rematch' });
+  b.send({ type: 'rematch' });
+  await Promise.all([
+    a.inbox.next((message) => message.type === 'start'),
+    b.inbox.next((message) => message.type === 'start'),
+  ]);
+  const fresh = await a.inbox.next((message) => message.type === 'state'
+    && message.phase === 'playing' && message.state.tick === 0);
+  assert.deepEqual(fresh.state.fighters.map(({ spearRemaining, duelWaveHits,
+    duelWaveCharge, spearAiming, spearWindup }) => ({
+    spearRemaining, duelWaveHits, duelWaveCharge, spearAiming, spearWindup,
+  })), [0, 1].map(() => ({ spearRemaining: 5, duelWaveHits: 0,
+    duelWaveCharge: 0, spearAiming: false, spearWindup: 0 })));
+  assert.equal(fresh.state.motionTick, 0, 'animated platforms reset their phase with the round');
+  assert.equal(fresh.state.projectiles.length, 0);
+});
+
 test('invalid and countdown input cannot poison the next round sequence or latch', async (t) => {
   const game = await createTestServer(t, { tickRate: 10, countdownSeconds: 0.3 });
   const a = await connect(game.port);

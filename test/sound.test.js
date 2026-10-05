@@ -274,6 +274,31 @@ test('jump kick and wave have a jade overtone; only a real hit gets a body thud'
   assert.equal(played.at(-1)[1], 940, 'a brief chime follows the spreading wave');
 });
 
+test('PvP wave charge and release are audible once without duplicating a target impact', () => {
+  const timer = clock();
+  const SoundEffects = soundClass(timer);
+  const sound = new SoundEffects();
+  const played = [];
+  let ducks = 0;
+  sound.tone = (...args) => played.push(['tone', ...args]);
+  sound.noise = (...args) => played.push(['noise', ...args]);
+  sound.duckMusic = () => { ducks++; };
+
+  sound.play({ type: 'duel-wave-ready', source: 'p2' });
+  assert.deepEqual(played.map(([kind]) => kind), ['tone', 'tone']);
+  assert.equal(ducks, 0, 'a readiness cue does not duck the whole score');
+  played.length = 0;
+  sound.play({ type: 'duel-wave', source: 'p2' });
+  assert.deepEqual(played.map(([kind]) => kind), ['tone', 'tone', 'noise', 'tone']);
+  assert.equal(ducks, 1, 'one wave release gives the foreground sound priority');
+  assert.deepEqual([...timer.pending.values()].map(({ delay }) => delay), [105]);
+  sound.play({ type: 'hit', delivery: 'duel-wave', target: 'p1' });
+  assert.equal(played.length, 4, 'the target hit does not layer a second heavy impact');
+  assert.equal(ducks, 1, 'one wave does not duck music twice');
+  timer.fire(105);
+  assert.equal(played.at(-1)[1], 940);
+});
+
 test('boss telegraph rises quietly and never plays while muted', () => {
   const SoundEffects = soundClass({});
   const sound = new SoundEffects();

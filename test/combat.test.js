@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import {
-  TICK_RATE, CORPSE_SETTLE_TICKS, CORPSE_HOLD_TICKS,
+  TICK_RATE, DUEL_WORLD_WIDTH, CORPSE_SETTLE_TICKS, CORPSE_HOLD_TICKS,
   SPEAR_WINDUP_TICKS, SPEARS_PER_LEVEL, SPEAR_GRAVITY, SPEAR_MIN_ANGLE, SPEAR_MAX_ANGLE,
   ROCK_GRAVITY, BOSS_SUMMON_CAP,
   createFighter,
@@ -33,10 +33,14 @@ function fallingHazard(overrides = {}) {
 test('duel uses a symmetric arena and a 99-second fixed-step clock', () => {
   const state = createDuelState('ocean');
   assert.equal(TICK_RATE, 60);
-  assert.equal(Object.hasOwn(state, 'spearRemaining'), false, 'duels have no campaign spear allowance');
+  assert.equal(Object.hasOwn(state, 'spearRemaining'), false, 'duel ammo is per fighter, not the campaign allowance');
   assert.equal(state.arena.theme, 'ocean');
+  assert.equal(state.arena.width, DUEL_WORLD_WIDTH);
   assert.equal(state.timerTicks, 99 * TICK_RATE);
   assert.deepEqual(state.fighters.map(({ id, hp }) => [id, hp]), [['p1', 100], ['p2', 100]]);
+  assert.deepEqual(state.fighters.map(({ name }) => name), ['赤色斗士', '青色斗士']);
+  assert.deepEqual(state.fighters.map(({ spearRemaining, duelWaveCharge }) =>
+    [spearRemaining, duelWaveCharge]), [[5, 0], [5, 0]]);
   stepCombat(state);
   assert.equal(state.timerTicks, 99 * TICK_RATE - 1);
 });
@@ -1267,18 +1271,18 @@ test('opposing projectiles can trade a same-frame KO regardless of array order',
   });
 });
 
-test('a duel cannot create spears even from a forged input or enabled fighter', () => {
+test('a duel has manual spears, but forged boss/equipment inputs cannot enter PvP', () => {
   const state = createDuelState();
-  state.fighters[0].spearEnabled = true;
-  for (let frame = 0; frame < 70; frame++) {
-    stepCombat(state, { p1: {
-      spear: frame % 3 === 0, aimUp: true, aimAngle: 72, aimCancel: frame % 7 === 0,
-    } });
-    assert.equal(state.projectiles.length, 0);
-    assert.equal(state.fighters[0].spearAiming, false);
-    assert.equal(state.fighters[0].spearWindup, 0);
-    assert.ok(!state.events.some((entry) => entry.type.startsWith('spear-')));
-  }
+  stepCombat(state, { p1: { spear: true, bossSkill: 'rock', equipment: true } });
+  assert.equal(state.fighters[0].spearAiming, true);
+  assert.equal(state.fighters[0].bossCast, null);
+  assert.equal(state.fighters[0].equipmentAttackId, null);
+  assert.equal(state.fighters[0].spearRemaining, 5);
+  assert.ok(state.events.some((entry) => entry.type === 'spear-aim'));
+  stepCombat(state, { p1: { spear: false } });
+  stepCombat(state, { p1: { spear: true } });
+  assert.ok(state.fighters[0].spearWindup > 0);
+  assert.ok(!state.events.some((entry) => entry.type.startsWith('boss-')));
 });
 
 test('an enemy under a two-tier target climbs instead of repeatedly punching beneath it', () => {
@@ -1366,7 +1370,7 @@ test('an enemy above the player walks off its platform and reacquires a reachabl
   assert.ok(hero.hp < 100, 'it reaches and strikes the player below');
 });
 
-test('campaign fighters and hazards can advance into the 1920px half, while PvP stays 960px', () => {
+test('campaign remains 1920px while PvP has a separate 2880px world', () => {
   const hero = createFighter({ id: 'hero', x: 980, y: 438, team: 0 });
   const state = createCombatState({ arena: arena({ width: 1920,
     fallingHazard: fallingHazard({ firstTick: 1, warningTicks: 1 }) }), fighters: [hero] });
@@ -1374,11 +1378,11 @@ test('campaign fighters and hazards can advance into the 1920px half, while PvP 
   assert.ok(hero.x > 1100 && hero.x <= 1901);
   assert.equal(state.arena.width, 1920);
   const duel = createDuelState();
-  assert.equal(duel.arena.width, 960);
-  duel.fighters[1].x = 940;
-  duel.fighters[1].vx = 20;
+  assert.equal(duel.arena.width, DUEL_WORLD_WIDTH);
+  duel.fighters[1].x = DUEL_WORLD_WIDTH - 40;
+  duel.fighters[1].vx = 100;
   stepCombat(duel);
-  assert.equal(duel.fighters[1].x, 941);
+  assert.equal(duel.fighters[1].x, DUEL_WORLD_WIDTH - 19);
 });
 
 test('a genuine campaign KO leaves a supported corpse for 27 plus 180 effective frames', () => {
