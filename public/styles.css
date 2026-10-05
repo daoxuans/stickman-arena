@@ -121,6 +121,7 @@ button:focus-visible, input:focus-visible, .map-stage:focus-visible {
 @keyframes arena-arrive { from { transform: translateY(8px); filter: brightness(.8); } to { transform: translateY(0); filter: brightness(1); } }
 .arena-frame::after { content: ""; position: absolute; z-index: 1; inset: auto 0 0; height: 55px; pointer-events: none; background: linear-gradient(0deg, rgba(5,20,21,.3), transparent); }
 #game-canvas { display: block; width: 100%; height: auto; aspect-ratio: 16/9; }
+#game-canvas.is-aiming { cursor: ns-resize; touch-action: none; }
 .frame-corner { position: absolute; z-index: 7; width: 19px; height: 19px; pointer-events: none; border-color: var(--signal); border-style: solid; }
 .frame-corner--tl { top: 8px; left: 8px; border-width: 2px 0 0 2px; }
 .frame-corner--tr { top: 8px; right: 8px; border-width: 2px 2px 0 0; }
@@ -170,12 +171,23 @@ button:focus-visible, input:focus-visible, .map-stage:focus-visible {
 .tail-separator { width: 1px; height: 15px; margin: 0 3px; background: #647975; }
 .special-status { padding: 6px 9px; border: 1px solid #5a817e; color: #b9e6df; background: rgba(48,91,88,.26); font-size: 10px; font-weight: 800; letter-spacing: .02em; white-space: nowrap; font-variant-numeric: tabular-nums; }
 .special-status.is-ready { border-color: #bdebd8; color: #effff4; background: rgba(48,143,132,.36); box-shadow: 0 0 15px rgba(139,233,223,.2); }
-.keyboard-guide { display: flex; gap: clamp(7px,1.3vw,18px); color: #adbfb7; font-size: 10px; white-space: nowrap; }
-.keyboard-guide > span { display: inline-flex; align-items: center; gap: 3px; }
+.spear-status { max-width: 100%; padding: 6px 9px; border: 1px solid #9c8061; color: #f0d6af; background: rgba(93,65,41,.27); font-size: 10px; font-weight: 800; letter-spacing: .02em; line-height: 1.4; font-variant-numeric: tabular-nums; }
+.spear-status.is-ready { border-color: #f3c985; color: #fff4dc; background: rgba(151,102,51,.39); box-shadow: 0 0 15px rgba(245,182,109,.2); }
+.spear-status.is-aiming { border-color: #8fe5d3; color: #e1fff3; background: rgba(47,106,91,.45); }
+.keyboard-guide { display: flex; flex-wrap: wrap; gap: 6px clamp(7px,1.3vw,18px); color: #adbfb7; font-size: 10px; }
+.keyboard-guide > span { display: inline-flex; align-items: center; gap: 3px; white-space: nowrap; }
 kbd { display: inline-block; min-width: 20px; padding: 3px 5px; border: 1px solid #5b7270; border-bottom-width: 2px; color: #eef0e3; font: 700 9px/1 "Bahnschrift", "Arial Narrow", sans-serif; text-align: center; }
 .touch-controls { display: none; }
 .touch-actions .touch-key--special { min-width: 68px; border-color: #a7e9d4; color: #102a2b; background: linear-gradient(135deg,#efffe9,#80d8d0); box-shadow: 0 0 16px rgba(135,226,211,.24); }
 .touch-actions .touch-key--special:disabled { opacity: .48; filter: saturate(.35); box-shadow: none; }
+.touch-actions .touch-key:disabled { opacity: .48; filter: saturate(.35); }
+.touch-actions .touch-key--spear { min-width: 68px; border-color: #e5c089; color: #392717; background: linear-gradient(135deg,#f6d3a0,#da9d68); }
+.touch-actions .touch-key--spear:disabled { opacity: .48; filter: saturate(.35); }
+.spear-aim-controls { display: flex; flex-basis: 100%; justify-content: flex-end; gap: 7px; }
+.spear-angle { display: inline-flex; align-items: center; color: #e1fff3; font-size: 13px; font-weight: 900; font-variant-numeric: tabular-nums; white-space: nowrap; }
+.spear-aim-controls .touch-key { min-width: 58px; border-color: #8ebcae; color: #e3fff2; background: #315b54; }
+.spear-aim-controls .touch-key--aim-cancel { border-color: #aab6a8; color: #e9eee2; background: #263d3d; }
+.spear-aim-controls .touch-key:disabled { opacity: .48; }
 
 .route-panel { overflow: hidden; min-width: 0; color: var(--paper-ink); background: var(--paper); box-shadow: 0 14px 35px rgba(0,0,0,.16); }
 .panel-header { display: flex; flex-direction: column; justify-content: center; min-height: 97px; padding: 20px 23px 16px; border-bottom: 1px solid #b9bdb0; }
@@ -267,6 +279,7 @@ kbd { display: inline-block; min-width: 20px; padding: 3px 5px; border: 1px soli
   .keyboard-guide { display: none; }
   .touch-controls { display: flex; flex-wrap: wrap; justify-content: space-between; gap: 8px 15px; padding: 14px 0 3px; touch-action: none; user-select: none; }
   .touch-movement, .touch-actions { display: flex; gap: 7px; }
+  .touch-actions { flex-wrap: wrap; justify-content: flex-end; }
   .touch-key { display: grid; place-items: center; min-width: 55px; height: 55px; padding: 0 9px; border: 1px solid #70817a; color: var(--bone); background: #283d3c; font-size: 11px; font-weight: 900; touch-action: none; user-select: none; -webkit-user-select: none; }
   .touch-key svg { width: 24px; height: 24px; stroke: currentColor; stroke-width: 2.4; stroke-linecap: round; stroke-linejoin: round; }
   .touch-key--attack { min-width: 72px; color: #152727; border-color: var(--signal); background: var(--signal); }
@@ -316,6 +329,7 @@ kbd { display: inline-block; min-width: 20px; padding: 3px 5px; border: 1px soli
   .arena-tail { min-height: 41px; }
   .touch-controls { gap: 5px; padding-top: 12px; }
   .touch-movement, .touch-actions { gap: 5px; }
+  .touch-actions { max-width: 100%; }
   .touch-key { min-width: 44px; height: 49px; font-size: 10px; }
   .touch-key--attack { min-width: 58px; }
   .panel-header h2 { font-size: 20px; }
@@ -328,6 +342,7 @@ kbd { display: inline-block; min-width: 20px; padding: 3px 5px; border: 1px soli
   .stage-glyph { display: none; }
   .touch-key { min-width: 44px; height: 45px; padding-inline: 4px; }
   .touch-key--attack { min-width: 51px; }
+  .spear-aim-controls .touch-key { min-width: 52px; }
   .overlay-rule { margin-bottom: 4px; }
   .overlay-kicker { display: none; }
   .overlay-content p { line-height: 1.25; }
@@ -335,6 +350,7 @@ kbd { display: inline-block; min-width: 20px; padding: 3px 5px; border: 1px soli
 @media (pointer: coarse) and (min-width: 761px) {
   .touch-controls { display: flex; flex-wrap: wrap; justify-content: space-between; gap: 8px 15px; padding: 14px 0 3px; touch-action: none; user-select: none; }
   .touch-movement, .touch-actions { display: flex; gap: 7px; }
+  .touch-actions { flex-wrap: wrap; justify-content: flex-end; }
   .touch-key { display: grid; place-items: center; min-width: 55px; height: 55px; padding: 0 9px; border: 1px solid #70817a; color: var(--bone); background: #283d3c; font-size: 11px; font-weight: 900; touch-action: none; user-select: none; }
   .touch-key svg { width: 24px; height: 24px; stroke: currentColor; stroke-width: 2.4; stroke-linecap: round; stroke-linejoin: round; }
   .touch-key--attack { min-width: 72px; color: #152727; border-color: var(--signal); background: var(--signal); }

@@ -1,11 +1,16 @@
 /**
  * Deterministic, fixed-step combat shared by the campaign and the room server.
- * Coordinates are logical canvas pixels (960 x 540); a fighter's y is at its feet.
+ * Coordinates are logical world pixels (campaign 1920 x 540, duel 960 x 540);
+ * a fighter's y is at its feet. The canvas viewport remains 960 x 540.
  * Every call to stepCombat advances exactly one 1/60-second simulation tick.
  */
+import { platformPose, platformSurfaceY } from './platforms.js';
+
 export const TICK_RATE = 60;
 export const WORLD_WIDTH = 960;
 export const WORLD_HEIGHT = 540;
+export const CORPSE_SETTLE_TICKS = 27;
+export const CORPSE_HOLD_TICKS = 180;
 
 const GRAVITY = 0.58;
 const MAX_FALL_SPEED = 13;
@@ -14,6 +19,15 @@ const DODGE_SPEED = 10.5;
 const DODGE_TICKS = 11;
 const DODGE_COOLDOWN = 54;
 const FALL_TICKS = 30;
+export const SPEAR_WINDUP_TICKS = 20;
+const SPEAR_SPEED = 18;
+export const SPEAR_GRAVITY = 0.9;
+export const SPEAR_MIN_ANGLE = 8;
+export const SPEAR_MAX_ANGLE = 72;
+const SPEAR_AIMED_SPEED = 26;
+const SPEAR_AIM_STEP = 1.25;
+const SPEAR_DEFAULT_ANGLE = 42;
+const SPEAR_LIFETIME = 94;
 
 const ARCHETYPES = {
   hero: { hp: 100, speed: 4.45, mass: 1, damage: 1, height: 88 },
@@ -46,16 +60,19 @@ const KICKS = Object.freeze({
   air: Object.freeze({ duration: 26, activeFrom: 7, activeTo: 16, damage: 16, reach: 96, knockback: 10.2, stun: 24, freeze: 7 }),
 });
 
-const BUTTONS = ['left', 'right', 'jump', 'attack', 'kick', 'dodge'];
+const BUTTONS = ['left', 'right', 'jump', 'attack', 'kick', 'dodge', 'spear',
+  'aimUp', 'aimDown', 'aimCancel'];
 
 function inputOf(value) {
   const input = {};
   for (const button of BUTTONS) input[button] = value?.[button] === true;
+  input.aimAngle = Number.isFinite(value?.aimAngle) ? value.aimAngle : null;
   return input;
 }
 
 function event(state, type, fields = {}) {
   state.events.push({ id: `${state.tick}:${state.events.length}`, type, ...fields });
+  if (type === 'ko') rememberEnemyCorpse(state, fields.target);
 }
 
 function clamp(value, low, high) {
@@ -66,8 +83,17 @@ function approach(value, target, amount) {
   return value < target ? Math.min(target, value + amount) : Math.max(target, value - amount);
 }
 
+function standingSurface(platform, tick, fighter, x) {
+  const pose = platformPose(platform, tick);
+  const halfFoot = fighter.width * 0.35;
+  if (x + halfFoot <= pose.left || x - halfFoot >= pose.right) return null;
+  const y = platformSurfaceY(pose, clamp(x, pose.left, pose.right));
+  return y === null ? null : { y, pose };
+}
+
 export function createFighter({
   id, name, x, y = 438, team = 0, kind = 'hero', maxHp, damageScale = 1,
+  spearEnabled = false,
 } = {}) {
   if (!id || !Number.isFinite(x) || !Number.isFinite(y)) {
     throw new TypeError('A fighter needs an id and finite x/y coordinates');
@@ -85,8 +111,12 @@ export function createFighter({
     dodgeTicks: 0, dodgeCooldown: 0,
     attackStage: 0, attackTick: 0, comboStage: 0, comboWindow: 0,
     kickType: null, kickTick: 0, airKickUsed: false,
+    spearEnabled: spearEnabled === true,
+    spearWindup: 0, spearCooldown: 0, spearAimX: null, spearAimY: null,
+    spearAiming: false, spearAimAngle: SPEAR_DEFAULT_ANGLE, spearLaunchFacing: null,
     attackBuffered: false, hitIds: [],
-    prevInput: { left: false, right: false, jump: false, attack: false, kick: false, dodge: false },
+    prevInput: { left: false, right: false, jump: false, attack: false, kick: false,
+      dodge: false, spear: false, aimUp: false, aimDown: false, aimCancel: false, aimAngle: null },
   };
 }
 
@@ -95,6 +125,8 @@ export function createCombatState({ mode = 'campaign', arena = {}, fighters = []
     mode,
     arena: {
       theme: arena.theme ?? 'forest',
+      width: Number.isFinite(arena.width) && arena.width >= WORLD_WIDTH
+        ? Math.floor(arena.width) : WORLD_WIDTH,
       groundY: arena.groundY ?? 438,
       platforms: arena.platforms ?? [],
       hazards: arena.hazards ?? [],
@@ -104,10 +136,15 @@ export function createCombatState({ mode = 'campaign', arena = {}, fighters = []
     fighters,
     events: [],
     tick: 0,
+    motionTick: 0,
     hitstop: 0,
     fallingClock: 0,
     fallingIndex: 0,
     fallingObject: null,
+    projectiles: [],
+    projectileSerial: 0,
+    corpses: [],
+    aftermath: false,
     status: 'playing',
     timerTicks: Math.max(0, Math.floor(durationTicks)),
     winner: null,
@@ -171,6 +208,283 @@ function emitKickEvent(state, fighter, type) {
   });
 }
 
+export function spearOrigin(fighter, facing = fighter.facing) {
+  const direction = facing < 0 ? -1 : 1;
+  return {
+    x: fighter.x + direction * (fighter.width * 0.44 + 14),
+    y: fighter.y - fighter.height * 0.65,
+  };
+}
+
+/** The player's chosen angle sets velocity; both preview and projectile use it. */
+export function spearAimedFlight(facing, angleDegrees) {
+  const angle = clamp(Number.isFinite(angleDegrees) ? angleDegrees : SPEAR_DEFAULT_ANGLE,
+    SPEAR_MIN_ANGLE, SPEAR_MAX_ANGLE) * Math.PI / 180;
+  return {
+    vx: (facing < 0 ? -1 : 1) * SPEAR_AIMED_SPEED * Math.cos(angle),
+    vy: -SPEAR_AIMED_SPEED * Math.sin(angle),
+  };
+}
+
+/** Match the projectile's discrete gravity step, including its landing tick. */
+export function spearFlight(originX, originY, aimX, aimY) {
+  const dx = aimX - originX;
+  const dy = aimY - originY;
+  const ticks = clamp(Math.abs(dx) / SPEAR_SPEED, 14, 40);
+  return {
+    vx: dx / ticks,
+    vy: dy / ticks - SPEAR_GRAVITY * (ticks + 1) / 2,
+    ticks,
+  };
+}
+
+export function spearTrajectoryPoint(originX, originY, flight, elapsedTicks) {
+  return {
+    x: originX + flight.vx * elapsedTicks,
+    y: originY + flight.vy * elapsedTicks
+      + SPEAR_GRAVITY * elapsedTicks * (elapsedTicks + 1) / 2,
+  };
+}
+
+function corpseSurface(state, x, koY) {
+  const groundY = state.arena.groundY;
+  let chosen = { x, y: groundY, platformIndex: null, supportT: null };
+  for (const [index, platform] of state.arena.platforms.entries()) {
+    const pose = platformPose(platform, state.motionTick);
+    const y = platformSurfaceY(pose, x);
+    // A plank overhead must not catch a body already below it.
+    if (y === null || y < Math.min(koY, groundY) - 3 || y >= chosen.y) continue;
+    const span = pose.right - pose.left;
+    chosen = {
+      x, y, platformIndex: index,
+      supportT: span > 0 ? clamp((x - pose.left) / span, 0, 1) : 0.5,
+    };
+  }
+  return chosen;
+}
+
+function corpseContactOffsets(corpse, hero, worldWidth, footX = corpse.x) {
+  // Match the prone silhouette's foot-to-head span (including its inward
+  // flip at an arena edge); the player's half-width adds contact tolerance.
+  const facing = corpse.facing < 0 ? -1 : 1;
+  const reach = (83 + 22) * (corpse.kind === 'boss' ? 1.28 : 1);
+  const naturalHeadX = footX - facing * reach;
+  const fallDirection = naturalHeadX < 10 || naturalHeadX > worldWidth - 10 ? -1 : 1;
+  const headOffset = -facing * fallDirection * reach;
+  const padding = 10 + hero.width * 0.35;
+  return {
+    low: Math.min(0, headOffset) - padding,
+    high: Math.max(0, headOffset) + padding,
+  };
+}
+
+function standsOnCorpseSupport(state, corpse, hero) {
+  if (!hero.grounded) return false;
+  const tolerance = 2;
+  if (corpse.platformIndex === null) {
+    return Math.abs(hero.y - state.arena.groundY) <= tolerance;
+  }
+  const platform = state.arena.platforms[corpse.platformIndex];
+  if (!platform) return false;
+  const current = standingSurface(platform, state.motionTick, hero, hero.x);
+  // A sloped or moving plank's foot height is evaluated at the current x and
+  // simulation frame; it need not match the corpse's foot y at another x.
+  return Boolean(current && Math.abs(hero.y - current.y) <= tolerance);
+}
+
+/** Record a genuine enemy KO before a new wave removes the dead fighter. */
+function rememberEnemyCorpse(state, targetId) {
+  if (state.mode !== 'campaign' || !Array.isArray(state.corpses)
+      || state.corpses.some((corpse) => corpse.id === targetId)) return;
+  const fighter = state.fighters.find((candidate) => candidate.id === targetId);
+  if (!fighter || fighter.team !== 1 || fighter.hp > 0) return;
+  const support = corpseSurface(state, fighter.x, fighter.y);
+  const hero = state.fighters.find((candidate) => candidate.team === 0 && candidate.hp > 0);
+  const bornTick = state.motionTick;
+  const corpse = {
+    id: fighter.id, kind: fighter.kind, team: fighter.team,
+    facing: fighter.facing, width: fighter.width, height: fighter.height,
+    x: support.x, y: support.y, koX: fighter.x, koY: fighter.y,
+    bornTick, settleTick: bornTick + CORPSE_SETTLE_TICKS,
+    expireTick: bornTick + CORPSE_SETTLE_TICKS + CORPSE_HOLD_TICKS,
+    // Internal support/entry bookkeeping is deterministic simulation state.
+    platformIndex: support.platformIndex, supportT: support.supportT,
+    wasInside: false,
+  };
+  if (hero) {
+    const { low, high } = corpseContactOffsets(corpse, hero, state.arena.width);
+    corpse.wasInside = hero.x - corpse.x >= low && hero.x - corpse.x <= high
+      && hero.stun === 0 && hero.dodgeTicks === 0
+      && standsOnCorpseSupport(state, corpse, hero);
+  }
+  state.corpses.push(corpse);
+}
+
+function advanceCorpses(state, heroBefore = null) {
+  if (state.mode !== 'campaign' || !state.corpses.length) return;
+  const hero = state.fighters.find((fighter) => fighter.team === 0 && fighter.hp > 0);
+  const remaining = [];
+  for (const corpse of state.corpses) {
+    const previousX = corpse.x;
+    if (corpse.platformIndex !== null) {
+      const platform = state.arena.platforms[corpse.platformIndex];
+      if (platform) {
+        const pose = platformPose(platform, state.motionTick);
+        corpse.x = pose.left + (pose.right - pose.left) * corpse.supportT;
+        corpse.y = pose.leftY + (pose.rightY - pose.leftY) * corpse.supportT;
+      } else {
+        corpse.platformIndex = null;
+        corpse.y = state.arena.groundY;
+      }
+    }
+    if (state.motionTick >= corpse.expireTick) continue;
+    if (hero) {
+      const { low, high } = corpseContactOffsets(corpse, hero, state.arena.width);
+      const previousOffsets = corpseContactOffsets(corpse, hero, state.arena.width, previousX);
+      const relativeX = hero.x - corpse.x;
+      const inside = relativeX >= low && relativeX <= high;
+      const validSupport = hero.stun === 0 && hero.dodgeTicks === 0
+        && standsOnCorpseSupport(state, corpse, hero);
+      const previousRelativeX = heroBefore ? heroBefore.x - previousX : relativeX;
+      const crossedEntireBody = previousRelativeX < previousOffsets.low && relativeX > high
+        || previousRelativeX > previousOffsets.high && relativeX < low;
+      const entered = !corpse.wasInside && validSupport && (inside || crossedEntireBody);
+      const walked = heroBefore?.grounded && Math.abs(hero.x - heroBefore.x) > 0.35
+        && Math.abs(hero.vx) > 0.35 && heroBefore.stun === 0 && hero.stun === 0
+        && heroBefore.dodgeTicks === 0 && hero.dodgeTicks === 0;
+      if (state.motionTick >= corpse.settleTick && entered && walked) {
+        event(state, 'bones-scatter', {
+          target: corpse.id, x: corpse.x, y: corpse.y, kind: corpse.kind,
+          facing: corpse.facing, width: corpse.width, height: corpse.height,
+        });
+        continue;
+      }
+      // Off-support/airborne contact does not consume a later valid entry;
+      // stationary landing does occupy the body until the player leaves again.
+      corpse.wasInside = inside && validSupport;
+    }
+    remaining.push(corpse);
+  }
+  state.corpses = remaining;
+}
+
+function spearTarget(state, fighter) {
+  return state.fighters.filter((other) => other.hp > 0 && other.team !== fighter.team
+    && (other.x - fighter.x) * fighter.facing >= -other.width * 0.35)
+    .sort((a, b) => {
+      const distanceA = Math.hypot(a.x - fighter.x, (a.y - fighter.y) * 0.8);
+      const distanceB = Math.hypot(b.x - fighter.x, (b.y - fighter.y) * 0.8);
+      return distanceA - distanceB || (a.id < b.id ? -1 : a.id > b.id ? 1 : 0);
+    })[0];
+}
+
+function startingSpearAngle(origin, target, facing) {
+  if (!target) return SPEAR_DEFAULT_ANGLE;
+  const distance = (target.x - origin.x) * facing;
+  if (distance <= 0 || distance > 800) return SPEAR_DEFAULT_ANGLE;
+  const targetY = target.y - target.height * 0.57;
+  let bestAngle = SPEAR_DEFAULT_ANGLE;
+  let bestError = Infinity;
+  // Seed the lower ballistic solution; the player may still raise the arc.
+  for (let angle = SPEAR_MIN_ANGLE; angle <= 45; angle += 0.5) {
+    const flight = spearAimedFlight(facing, angle);
+    const ticks = distance / Math.abs(flight.vx);
+    const error = Math.abs(spearTrajectoryPoint(origin.x, origin.y, flight, ticks).y - targetY);
+    if (error < bestError) {
+      bestError = error;
+      bestAngle = angle;
+    }
+  }
+  return bestAngle;
+}
+
+/** Escape, window blur or mode switch can drop an unconfirmed aim without a tick. */
+export function cancelSpearAim(fighter) {
+  if (!fighter?.spearAiming) return false;
+  fighter.spearAiming = false;
+  fighter.spearLaunchFacing = null;
+  return true;
+}
+
+function cancelSpear(state, fighter) {
+  if (cancelSpearAim(fighter)) {
+    const origin = spearOrigin(fighter);
+    event(state, 'spear-aim-cancel', {
+      x: origin.x, y: origin.y, source: fighter.id,
+    });
+  }
+  fighter.spearWindup = 0;
+  fighter.spearAimX = null;
+  fighter.spearAimY = null;
+  fighter.spearLaunchFacing = null;
+}
+
+function beginPlayerAim(state, fighter) {
+  const origin = spearOrigin(fighter);
+  fighter.spearAiming = true;
+  fighter.spearAimAngle = startingSpearAngle(origin, spearTarget(state, fighter), fighter.facing);
+  event(state, 'spear-aim', {
+    x: origin.x, y: origin.y, source: fighter.id,
+    facing: fighter.facing, angle: fighter.spearAimAngle,
+  });
+}
+
+function confirmPlayerSpear(state, fighter) {
+  fighter.spearAiming = false;
+  fighter.spearLaunchFacing = fighter.facing < 0 ? -1 : 1;
+  fighter.spearWindup = SPEAR_WINDUP_TICKS;
+  const origin = spearOrigin(fighter, fighter.spearLaunchFacing);
+  event(state, 'spear-windup', {
+    x: origin.x, y: origin.y, source: fighter.id,
+    facing: fighter.spearLaunchFacing, angle: fighter.spearAimAngle,
+    windupTicks: SPEAR_WINDUP_TICKS,
+  });
+}
+
+function beginSpear(state, fighter) {
+  const origin = spearOrigin(fighter);
+  const target = spearTarget(state, fighter);
+  fighter.spearAimX = target
+    ? target.x + (Math.abs(target.x - fighter.x) < 30 ? fighter.facing * 14 : 0)
+    : fighter.x + fighter.facing * 480;
+  fighter.spearAimY = target ? target.y - target.height * 0.57 : origin.y;
+  fighter.spearWindup = SPEAR_WINDUP_TICKS;
+  // The player's twenty-frame throw is its own recovery; enemy throws stay
+  // paced so their telegraph is a readable, occasional threat.
+  fighter.spearCooldown = fighter.team === 0 ? 0 : 156;
+  event(state, 'spear-windup', {
+    x: origin.x, y: origin.y, source: fighter.id, facing: fighter.facing,
+    targetX: fighter.spearAimX, targetY: fighter.spearAimY,
+    windupTicks: SPEAR_WINDUP_TICKS,
+  });
+}
+
+function launchSpear(state, fighter) {
+  const facing = fighter.spearLaunchFacing ?? fighter.facing;
+  const origin = spearOrigin(fighter, facing);
+  // The warning locks its landing point at startup. Movement during windup
+  // must not silently retarget the throw after the player has read its arc.
+  const flight = fighter.team === 0 && fighter.spearLaunchFacing !== null
+    ? spearAimedFlight(facing, fighter.spearAimAngle)
+    : spearFlight(origin.x, origin.y, fighter.spearAimX, fighter.spearAimY);
+  const projectile = {
+    id: `spear-${++state.projectileSerial}`, kind: 'spear',
+    source: fighter.id, team: fighter.team,
+    x: origin.x, y: origin.y,
+    vx: flight.vx,
+    vy: flight.vy,
+    radius: 7, damage: (fighter.team === 0 ? 22 : 14 * fighter.damageScale),
+    ttl: SPEAR_LIFETIME,
+  };
+  state.projectiles.push(projectile);
+  event(state, 'spear-throw', {
+    x: projectile.x, y: projectile.y, source: fighter.id,
+    projectileId: projectile.id, vx: projectile.vx, vy: projectile.vy,
+    facing,
+  });
+  fighter.spearLaunchFacing = null;
+}
+
 function applyDamage(state, target, { amount, direction, knockback, stun, invulnerable = 9, source = null, heavy = false }) {
   if (target.hp <= 0 || target.invulnerable > 0 || target.dodgeTicks > 0) return false;
   const damage = Math.max(1, Math.round(amount));
@@ -182,6 +496,7 @@ function applyDamage(state, target, { amount, direction, knockback, stun, invuln
   target.attackTick = 0;
   target.kickType = null;
   target.kickTick = 0;
+  cancelSpear(state, target);
   target.attackBuffered = false;
   target.comboWindow = 0;
   target.vx = direction * knockback / target.mass;
@@ -197,6 +512,15 @@ function applyDamage(state, target, { amount, direction, knockback, stun, invuln
   return true;
 }
 
+function verticalHitOverlap(attacker, target, kickType = null) {
+  if (kickType) {
+    return attacker.y - attacker.height * (kickType === 'air' ? 0.68 : 0.53) < target.y - 10
+      && attacker.y + (kickType === 'air' ? 14 : -6) > target.y - target.height + 12;
+  }
+  return attacker.y - attacker.height + 15 < target.y - 18
+    && attacker.y - 17 > target.y - target.height + 12;
+}
+
 function collectAttacks(state) {
   const intents = [];
   for (const attacker of state.fighters) {
@@ -207,11 +531,7 @@ function collectAttacks(state) {
     for (const target of state.fighters) {
       if (target.team === attacker.team || target.hp <= 0 || attacker.hitIds.includes(target.id)) continue;
       const forward = (target.x - attacker.x) * attacker.facing;
-      const verticalOverlap = attacker.kickType
-        ? attacker.y - attacker.height * (attacker.kickType === 'air' ? 0.68 : 0.53) < target.y - 10
-          && attacker.y + (attacker.kickType === 'air' ? 14 : -6) > target.y - target.height + 12
-        : attacker.y - attacker.height + 15 < target.y - 18
-          && attacker.y - 17 > target.y - target.height + 12;
+      const verticalOverlap = verticalHitOverlap(attacker, target, attacker.kickType);
       if (forward < -target.width * 0.35 || forward > strike.reach + target.width * 0.45 || !verticalOverlap) continue;
       attacker.hitIds.push(target.id);
       intents.push({
@@ -244,6 +564,127 @@ function resolveAttacks(state) {
     })) {
       state.hitstop = Math.max(state.hitstop, strike.freeze);
     }
+  }
+}
+
+function sweptBoxHit(startX, startY, nextX, nextY, left, right, top, bottom) {
+  const bounds = [
+    [startX, nextX - startX, left, right],
+    [startY, nextY - startY, top, bottom],
+  ];
+  let entry = 0;
+  let exit = 1;
+  for (const [start, delta, min, max] of bounds) {
+    if (Math.abs(delta) < 1e-9) {
+      if (start < min || start > max) return null;
+      continue;
+    }
+    const near = (min - start) / delta;
+    const far = (max - start) / delta;
+    entry = Math.max(entry, Math.min(near, far));
+    exit = Math.min(exit, Math.max(near, far));
+    if (entry > exit) return null;
+  }
+  return entry;
+}
+
+function sweptFighterHit(projectile, target, nextX, nextY) {
+  return sweptBoxHit(projectile.x, projectile.y, nextX, nextY,
+    target.x - target.width * 0.44 - projectile.radius,
+    target.x + target.width * 0.44 + projectile.radius,
+    target.y - target.height - projectile.radius,
+    target.y - 8 + projectile.radius);
+}
+
+function sweptPlatformHit(projectile, platform, nextX, nextY, motionTick) {
+  const pose = platformPose(platform, motionTick);
+  const cosine = Math.cos(pose.angle);
+  const sine = Math.sin(pose.angle);
+  const local = (x, y) => ({
+    x: (x - pose.centerX) * cosine + (y - pose.centerY) * sine,
+    y: (y - pose.centerY) * cosine - (x - pose.centerX) * sine,
+  });
+  const start = local(projectile.x, projectile.y);
+  const end = local(nextX, nextY);
+  return sweptBoxHit(start.x, start.y, end.x, end.y,
+    -pose.width / 2 - projectile.radius, pose.width / 2 + projectile.radius,
+    -projectile.radius, Math.max(6, pose.height) + projectile.radius);
+}
+
+/** A swept path prevents fast spears from tunnelling through a thin stick figure. */
+function resolveProjectiles(state) {
+  if (state.mode !== 'campaign') {
+    state.projectiles = [];
+    return;
+  }
+  const active = [];
+  const impacts = [];
+  for (const projectile of state.projectiles) {
+    const nextVy = projectile.vy + SPEAR_GRAVITY;
+    const nextX = projectile.x + projectile.vx;
+    const nextY = projectile.y + nextVy;
+    let victim = null;
+    let collisionTime = Infinity;
+    let surface = null;
+    for (const target of state.fighters) {
+      if (target.hp <= 0 || target.team === projectile.team) continue;
+      const time = sweptFighterHit(projectile, target, nextX, nextY);
+      if (time !== null && (time < collisionTime
+        || (time === collisionTime && target.id < victim.id))) {
+        victim = target;
+        collisionTime = time;
+      }
+    }
+    for (const platform of state.arena.platforms) {
+      const time = sweptPlatformHit(projectile, platform, nextX, nextY, state.motionTick);
+      if (time !== null && time <= collisionTime) {
+        victim = null;
+        collisionTime = time;
+        surface = 'platform';
+      }
+    }
+    const groundY = state.arena.groundY - projectile.radius;
+    const groundTime = nextY > projectile.y && nextY >= groundY
+      ? Math.max(0, (groundY - projectile.y) / (nextY - projectile.y)) : Infinity;
+    if (groundTime < collisionTime) {
+      victim = null;
+      collisionTime = groundTime;
+      surface = 'ground';
+    }
+    if (collisionTime <= 1) {
+      impacts.push({ projectile, victim, surface,
+        x: projectile.x + (nextX - projectile.x) * collisionTime,
+        y: projectile.y + (nextY - projectile.y) * collisionTime });
+    } else if (projectile.ttl <= 1 || nextX < -40 || nextX > state.arena.width + 40
+      || nextY < -80 || nextY > WORLD_HEIGHT + 40) {
+      impacts.push({ projectile, victim: null, surface: 'air', x: nextX, y: nextY });
+    } else {
+      projectile.x = nextX;
+      projectile.y = nextY;
+      projectile.vy = nextVy;
+      projectile.ttl--;
+      active.push(projectile);
+    }
+  }
+  state.projectiles = active;
+  // Detect every trajectory before damage interrupts fighters, so simultaneous
+  // opposite-direction throws can trade a KO regardless of presentation order.
+  impacts.sort((a, b) => a.projectile.id.localeCompare(b.projectile.id));
+  for (const { projectile, victim, surface, x, y } of impacts) {
+    const before = victim?.hp ?? 0;
+    const damaged = victim && applyDamage(state, victim, {
+      amount: projectile.damage, direction: Math.sign(projectile.vx) || 1,
+      knockback: 6, stun: 19, source: projectile.source, heavy: true,
+    });
+    if (victim && !damaged) {
+      event(state, 'evade', { x: victim.x, y: victim.y - victim.height / 2, target: victim.id });
+    }
+    if (damaged) state.hitstop = Math.max(state.hitstop, 3);
+    event(state, 'spear-impact', {
+      x, y, source: projectile.source, projectileId: projectile.id,
+      target: victim?.id ?? null, damage: damaged ? before - victim.hp : 0,
+      blocked: Boolean(victim && !damaged), surface,
+    });
   }
 }
 
@@ -337,13 +778,18 @@ function advanceFallingHazard(state) {
   const seed = Number.isFinite(config.seed) ? Math.floor(config.seed) : 0;
   const target = candidates[((seed + index) % candidates.length + candidates.length) % candidates.length];
   const scatter = [-8, 0, 8, -4, 4][((seed * 17 + index * 7) % 5 + 5) % 5];
-  const x = clamp(target.x + scatter, 20, WORLD_WIDTH - 20);
-  let impactY = state.arena.groundY;
-  for (const platform of state.arena.platforms) {
-    if (x >= platform.x && x <= platform.x + platform.w) impactY = Math.min(impactY, platform.y);
-  }
+  const x = clamp(target.x + scatter, 20, state.arena.width - 20);
   const warningTicks = Number.isFinite(config.warningTicks)
     ? Math.max(1, Math.floor(config.warningTicks)) : 40;
+  // Mark the projected impact plane, not a plank's stale baseline. The mark
+  // remains fixed once warned, preserving the existing sidestep rule.
+  const predictedTick = state.motionTick + warningTicks + FALL_TICKS;
+  let impactY = state.arena.groundY;
+  for (const platform of state.arena.platforms) {
+    const pose = platformPose(platform, predictedTick);
+    const surface = platformSurfaceY(pose, x);
+    if (surface !== null) impactY = Math.min(impactY, surface);
+  }
   const radius = Number.isFinite(config.radius) ? clamp(config.radius, 2, 20) : 8;
   state.fallingObject = {
     kind: config.type ?? 'hail', x, y: -radius, impactY, radius, index,
@@ -361,12 +807,14 @@ function moveFighter(state, fighter, input) {
   const attackPressed = input.attack && !was.attack;
   const kickPressed = input.kick && !was.kick;
   const dodgePressed = input.dodge && !was.dodge;
+  const spearPressed = input.spear && !was.spear;
   fighter.prevInput = input;
 
   if (fighter.hp <= 0) {
+    cancelSpear(state, fighter);
     fighter.vx *= 0.89;
     fighter.vy = Math.min(MAX_FALL_SPEED, fighter.vy + GRAVITY);
-    fighter.x = clamp(fighter.x + fighter.vx, 19, WORLD_WIDTH - 19);
+    fighter.x = clamp(fighter.x + fighter.vx, 19, state.arena.width - 19);
     fighter.y = Math.min(state.arena.groundY, fighter.y + fighter.vy);
     return;
   }
@@ -375,6 +823,7 @@ function moveFighter(state, fighter, input) {
   if (fighter.hurtFlash > 0) fighter.hurtFlash--;
   if (fighter.hazardCooldown > 0) fighter.hazardCooldown--;
   if (fighter.dodgeCooldown > 0) fighter.dodgeCooldown--;
+  if (fighter.spearCooldown > 0) fighter.spearCooldown--;
   if (fighter.comboWindow > 0) {
     fighter.comboWindow--;
     if (fighter.comboWindow === 0 && fighter.attackStage === 0) fighter.comboStage = 0;
@@ -383,10 +832,18 @@ function moveFighter(state, fighter, input) {
   if (fighter.grounded) fighter.coyote = 6;
   else if (fighter.coyote > 0) fighter.coyote--;
   if (fighter.jumpBuffer > 0) fighter.jumpBuffer--;
+  const otherActionPressed = jumpPressed || attackPressed || kickPressed || dodgePressed;
+  if (fighter.spearAiming && (input.aimCancel || otherActionPressed)) cancelSpear(state, fighter);
+  if (fighter.spearAiming) {
+    const nextAngle = input.aimAngle ?? fighter.spearAimAngle
+      + (Number(input.aimUp) - Number(input.aimDown)) * SPEAR_AIM_STEP;
+    fighter.spearAimAngle = clamp(nextAngle, SPEAR_MIN_ANGLE, SPEAR_MAX_ANGLE);
+  }
   if (jumpPressed && fighter.kickType === null) fighter.jumpBuffer = 8;
 
   if (dodgePressed && fighter.stun === 0 && fighter.attackStage === 0
-      && fighter.kickType === null && fighter.dodgeCooldown === 0 && fighter.dodgeTicks === 0) {
+      && fighter.kickType === null && fighter.spearWindup === 0
+      && fighter.dodgeCooldown === 0 && fighter.dodgeTicks === 0) {
     const direction = Number(input.right) - Number(input.left);
     if (direction !== 0) fighter.facing = direction;
     fighter.dodgeTicks = DODGE_TICKS;
@@ -398,6 +855,8 @@ function moveFighter(state, fighter, input) {
   if (fighter.dodgeTicks > 0) {
     fighter.dodgeTicks--;
     fighter.vx = fighter.facing * DODGE_SPEED * (fighter.dodgeTicks < 3 ? 0.56 : 1);
+  } else if (fighter.stun === 0 && fighter.spearWindup > 0) {
+    fighter.vx *= fighter.grounded ? 0.55 : 0.82;
   } else if (fighter.stun === 0) {
     const direction = Number(input.right) - Number(input.left);
     if (direction !== 0) {
@@ -413,7 +872,7 @@ function moveFighter(state, fighter, input) {
   }
 
   if (fighter.jumpBuffer > 0 && fighter.coyote > 0 && fighter.stun === 0
-      && fighter.dodgeTicks === 0 && fighter.kickType === null) {
+      && fighter.dodgeTicks === 0 && fighter.kickType === null && fighter.spearWindup === 0) {
     fighter.vy = JUMP_SPEED;
     fighter.grounded = false;
     fighter.coyote = 0;
@@ -423,12 +882,13 @@ function moveFighter(state, fighter, input) {
 
   // Jump resolves first, so jump+kick in the same simulation tick is an air kick.
   if (kickPressed && fighter.stun === 0 && fighter.dodgeTicks === 0
-      && fighter.attackStage === 0 && fighter.kickType === null
+      && fighter.attackStage === 0 && fighter.kickType === null && fighter.spearWindup === 0
       && (fighter.grounded || !fighter.airKickUsed)) {
     startKick(state, fighter, fighter.grounded ? 'ground' : 'air');
   }
 
-  if (attackPressed && fighter.stun === 0 && fighter.dodgeTicks === 0 && fighter.kickType === null) {
+  if (attackPressed && fighter.stun === 0 && fighter.dodgeTicks === 0
+      && fighter.kickType === null && fighter.spearWindup === 0) {
     if (fighter.attackStage > 0) fighter.attackBuffered = fighter.attackStage < 3;
     else startAttack(fighter, fighter.comboWindow > 0 ? Math.min(3, fighter.comboStage + 1) : 1);
   }
@@ -458,22 +918,92 @@ function moveFighter(state, fighter, input) {
     }
   }
 
+  if (state.mode === 'campaign' && spearPressed
+      && (fighter.team !== 0 || (!input.aimCancel && !otherActionPressed))
+      && fighter.stun === 0
+      && fighter.dodgeTicks === 0 && fighter.attackStage === 0
+      && fighter.kickType === null && fighter.spearWindup === 0 && fighter.spearCooldown === 0
+      && (fighter.team === 0 || fighter.spearEnabled)) {
+    if (fighter.team === 0) {
+      if (fighter.spearAiming) confirmPlayerSpear(state, fighter);
+      else beginPlayerAim(state, fighter);
+    } else beginSpear(state, fighter);
+  }
+  if (fighter.spearWindup > 0) {
+    fighter.spearWindup--;
+    if (fighter.spearWindup === 0) {
+      launchSpear(state, fighter);
+      fighter.spearAimX = null;
+      fighter.spearAimY = null;
+    }
+  }
+
+  const oldX = fighter.x;
   const oldY = fighter.y;
-  fighter.x = clamp(fighter.x + fighter.vx, 19, WORLD_WIDTH - 19);
+  const wasGrounded = fighter.grounded;
+  // A rider inherits horizontal platform displacement before their own
+  // movement. The previous and current poses are the same geometry used by
+  // rendering, projectile collision and the AI's platform routes.
+  let platformCarryX = 0;
+  if (wasGrounded && fighter.vy >= 0) {
+    let closestSurface = Infinity;
+    for (const platform of state.arena.platforms) {
+      if (platform.motion !== 'float' || platform.axis !== 'x') continue;
+      const previous = standingSurface(platform, state.motionTick - 1, fighter, oldX);
+      if (!previous) continue;
+      const distance = Math.abs(oldY - previous.y);
+      if (distance > 2.5 || distance >= closestSurface) continue;
+      const currentPose = platformPose(platform, state.motionTick);
+      platformCarryX = currentPose.centerX - previous.pose.centerX;
+      closestSurface = distance;
+    }
+  }
+  fighter.x = clamp(fighter.x + fighter.vx + platformCarryX, 19, state.arena.width - 19);
   fighter.vy = Math.min(MAX_FALL_SPEED, fighter.vy + GRAVITY);
   fighter.y += fighter.vy;
   fighter.grounded = false;
 
-  if (fighter.vy >= 0) {
+  // A standing fighter follows the same fixed-tick surface drawn by the
+  // renderer. This also lets a grounded fighter step onto adjacent 12px
+  // treads; ordinary high platforms remain one-way jump landings.
+  let support = null;
+  if (wasGrounded && fighter.vy >= 0) {
+    for (const platform of state.arena.platforms) {
+      const previous = standingSurface(platform, state.motionTick - 1, fighter, oldX);
+      const current = standingSurface(platform, state.motionTick, fighter, fighter.x);
+      if (!previous || !current || Math.abs(oldY - previous.y) > 2.5) continue;
+      const difference = Math.abs(oldY - previous.y);
+      if (!support || difference < support.difference) support = { y: current.y, difference };
+    }
+    for (const platform of state.arena.platforms) {
+      if (platform.kind !== 'stair') continue;
+      const current = standingSurface(platform, state.motionTick, fighter, fighter.x);
+      if (!current || fighter.x < current.pose.left || fighter.x >= current.pose.right
+          || Math.abs(current.y - oldY) > 12.5) continue;
+      support = { y: current.y, difference: Math.abs(current.y - oldY) };
+      break;
+    }
+    if (!support && state.arena.groundY >= oldY
+        && state.arena.groundY - oldY <= 12.5) {
+      support = { y: state.arena.groundY, difference: state.arena.groundY - oldY };
+    }
+  }
+  if (support) {
+    fighter.y = support.y;
+    fighter.vy = 0;
+    fighter.grounded = true;
+  } else if (fighter.vy >= 0) {
     let landingY = state.arena.groundY;
     for (const platform of state.arena.platforms) {
-      if (oldY <= platform.y + 1 && fighter.y >= platform.y
-        && fighter.x + fighter.width * 0.35 > platform.x
-        && fighter.x - fighter.width * 0.35 < platform.x + platform.w) {
-        landingY = Math.min(landingY, platform.y);
-      }
+      const current = standingSurface(platform, state.motionTick, fighter, fighter.x);
+      if (!current) continue;
+      const previous = standingSurface(platform, state.motionTick - 1, fighter, oldX)
+        ?? standingSurface(platform, state.motionTick - 1, fighter, fighter.x);
+      if (oldY <= (previous?.y ?? current.y) + 1 && fighter.y >= current.y)
+        landingY = Math.min(landingY, current.y);
     }
-    if (fighter.y >= landingY && oldY <= landingY + 1) {
+    if (fighter.y >= landingY && (landingY < state.arena.groundY
+      || oldY <= state.arena.groundY + 1)) {
       const fallSpeed = fighter.vy;
       fighter.y = landingY;
       fighter.vy = 0;
@@ -490,6 +1020,7 @@ function moveFighter(state, fighter, input) {
   }
   if (fighter.y > WORLD_HEIGHT + 70) {
     fighter.hp = 0;
+    cancelSpear(state, fighter);
     event(state, 'ko', { x: fighter.x, y: WORLD_HEIGHT - 10, target: fighter.id, source: 'fall' });
   }
   // The jump-kick burst belongs to the first real damage frame, not startup.
@@ -528,43 +1059,122 @@ export function stepCombat(state, inputsById = {}) {
     return state;
   }
 
+  const hero = state.mode === 'campaign'
+    ? state.fighters.find((fighter) => fighter.team === 0) : null;
+  const heroBefore = hero ? {
+    x: hero.x, y: hero.y, grounded: hero.grounded,
+    stun: hero.stun, dodgeTicks: hero.dodgeTicks,
+  } : null;
+  state.motionTick++;
+
+  if (state.mode === 'campaign' && state.aftermath) {
+    // The victory walk runs in simulation time, but no remaining enemy,
+    // projectile or environmental hazard can undo an already earned KO.
+    const controls = inputsById[hero?.id];
+    if (hero) moveFighter(state, hero, inputOf({
+      left: controls?.left, right: controls?.right, jump: controls?.jump,
+    }));
+    advanceCorpses(state, heroBefore);
+    return state;
+  }
+
   for (const fighter of state.fighters) moveFighter(state, fighter, inputOf(inputsById[fighter.id]));
   resolveAttacks(state);
+  resolveProjectiles(state);
   for (const fighter of state.fighters) resolveHazards(state, fighter);
   advanceFallingHazard(state);
+  advanceCorpses(state, heroBefore);
   if (state.mode === 'duel') resolveDuel(state);
   return state;
 }
 
-/** Predictable sparring AI: distinct tempos, readable attacks and occasional evasions. */
+function ascentRoute(fighter, target, state) {
+  const routes = (state.arena.platforms ?? []).flatMap((platform) => {
+    const pose = platformPose(platform, state.motionTick);
+    if (pose.right - pose.left < 42) return [];
+    const margin = Math.min(24, (pose.right - pose.left) * 0.28);
+    const landingX = clamp(target.x, pose.left + margin, pose.right - margin);
+    const surface = platformSurfaceY(pose, landingX);
+    const rise = fighter.y - surface;
+    if (rise <= 20 || rise >= 124) return [];
+    return [{
+      platform, pose, landingX,
+      score: Math.abs(landingX - fighter.x) + Math.abs(landingX - target.x) * 0.25
+        + rise * 0.06,
+    }];
+  }).sort((a, b) => a.score - b.score || a.pose.centerY - b.pose.centerY
+    || a.pose.left - b.pose.left);
+  return routes[0] ?? null;
+}
+
+function supportingPlatform(fighter, state) {
+  for (const platform of state.arena.platforms ?? []) {
+    const support = standingSurface(platform, state.motionTick, fighter, fighter.x);
+    if (support && Math.abs(fighter.y - support.y) < 3)
+      return { left: support.pose.left, right: support.pose.right };
+  }
+  return null;
+}
+
+/** Deterministic pursuit: align with a reachable platform before jumping; never punch empty air. */
 export function aiInput(fighter, target, state) {
   if (!fighter || !target || fighter.hp <= 0 || target.hp <= 0) return inputOf();
   const distance = target.x - fighter.x;
   const gap = Math.abs(distance);
+  const verticalGap = fighter.y - target.y;
+  // Fighter heights differ (especially the boss). A fixed 65px cutoff leaves
+  // a dead zone where a shorter enemy cannot punch but no longer tries to
+  // climb the platform directly overhead.
+  const punchOverlap = verticalHitOverlap(fighter, target);
+  const targetAbove = verticalGap > 0 && !punchOverlap;
+  const targetBelow = verticalGap < 0 && !punchOverlap;
   const isBoss = fighter.kind === 'boss';
   const isRusher = fighter.kind === 'rusher' || fighter.kind === 'runner';
   const isGuard = fighter.kind === 'guard';
   const cadence = isBoss ? 54 : isRusher ? 43 : isGuard ? 55 : 63;
-  const offset = [...fighter.id].reduce((sum, char) => sum + char.charCodeAt(0), 0) % cadence;
+  const idSeed = [...fighter.id].reduce((sum, char) => sum + char.charCodeAt(0), 0);
+  const offset = idSeed % cadence;
   const kickCadence = isRusher ? 198 : 224;
-  const kickOffset = [...fighter.id].reduce((sum, char) => sum + char.charCodeAt(0), 0) % kickCadence;
   const phase = (state.tick + offset) % cadence;
   const wantedGap = isBoss ? 59 : isRusher ? 48 : 57;
   const targetDirection = Math.sign(distance);
-  // Overlapping hitboxes have no useful left/right side; avoid rapid flips as they cross.
   const needsTurn = gap > (target.width ?? 29) * 0.35 && targetDirection !== fighter.facing;
   const canTurn = fighter.stun === 0 && fighter.dodgeTicks === 0
-    && fighter.attackStage === 0 && fighter.kickType === null;
-  const walking = gap > wantedGap || (needsTurn && canTurn) ? targetDirection : 0;
+    && fighter.attackStage === 0 && fighter.kickType === null && fighter.spearWindup === 0;
+  let walking = gap > wantedGap || (needsTurn && canTurn) ? targetDirection : 0;
+  let route = null;
+  if (targetAbove) {
+    route = ascentRoute(fighter, target, state);
+    const destinationX = route?.landingX ?? target.x;
+    walking = Math.abs(destinationX - fighter.x) > 25 ? Math.sign(destinationX - fighter.x) : 0;
+  } else if (targetBelow && fighter.grounded) {
+    const support = supportingPlatform(fighter, state);
+    if (support) {
+      const exitRight = target.x > support.right
+        || (target.x >= support.left && fighter.x - support.left > support.right - fighter.x);
+      const exitX = exitRight ? support.right + fighter.width : support.left - fighter.width;
+      walking = Math.sign(exitX - fighter.x);
+    }
+  }
+  const freeToAct = fighter.stun === 0 && fighter.dodgeTicks === 0
+    && fighter.attackStage === 0 && fighter.kickType === null && fighter.spearWindup === 0;
+  const jumpForHeight = targetAbove && fighter.grounded && freeToAct
+    && (route ? Math.abs(fighter.x - route.landingX) <= 30
+      : verticalGap <= 130 && gap <= 72)
+    && (state.tick + idSeed) % 36 === 7;
   return {
     left: walking < 0,
     right: walking > 0,
-    jump: (target.y < fighter.y - 36 && gap < 190 && phase === 13)
-      || (isRusher && gap > 120 && gap < 225 && phase === 3),
-    attack: !needsTurn && gap < (isBoss ? 100 : 83) && phase < (isBoss ? 5 : 3),
-    kick: !needsTurn && !isBoss && fighter.grounded && fighter.attackStage === 0 && fighter.kickType === null
-      && gap < 80 && (state.tick + kickOffset) % kickCadence === 0,
-    dodge: !needsTurn && (isBoss || isGuard || isRusher) && gap < 104
-      && target.attackStage > 0 && phase === 19,
+    jump: jumpForHeight || (!targetAbove && isRusher && gap > 120 && gap < 225 && phase === 3),
+    attack: !needsTurn && fighter.spearWindup === 0 && gap < (isBoss ? 100 : 83)
+      && punchOverlap && phase < (isBoss ? 5 : 3),
+    kick: !needsTurn && !isBoss && freeToAct && fighter.grounded
+      && verticalHitOverlap(fighter, target, 'ground') && gap < 80
+      && (state.tick + idSeed % kickCadence) % kickCadence === 0,
+    dodge: !needsTurn && !targetAbove && !targetBelow && (isBoss || isGuard || isRusher)
+      && gap < 104 && target.attackStage > 0 && phase === 19,
+    spear: state.mode === 'campaign' && fighter.team === 1 && fighter.spearEnabled
+      && freeToAct && !needsTurn && gap > 140 && gap < 640
+      && (state.tick + idSeed * 11) % 127 === 0,
   };
 }

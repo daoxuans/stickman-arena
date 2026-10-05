@@ -64,6 +64,7 @@ test('all 56 stages have four ordered themes, unique scenes, valid waves and nin
     assert.equal(level.stage, index % 14 + 1);
     assert.ok(level.waves.length >= 1);
     assert.equal(level.groundY, level.arena.groundY);
+    assert.equal(level.arena.width, 1920);
     assert.ok(level.enemyCount >= 1);
     assert.ok(level.platforms.length >= 1);
     for (const wave of level.waves) {
@@ -73,7 +74,7 @@ test('all 56 stages have four ordered themes, unique scenes, valid waves and nin
       }
     }
     for (const item of [...level.platforms, ...level.hazards]) {
-      assert.ok(item.x >= 0 && item.x + item.w <= 960);
+      assert.ok(item.x >= 0 && item.x + item.w <= level.arena.width);
       assert.ok(item.y >= 0 && item.y + item.h <= 540);
     }
   }
@@ -190,6 +191,111 @@ test('waves advance one by one, then clear unlocks exactly the next room', () =>
   assert.equal(result.progress.currentLevel, 3);
   assert.deepEqual(result.progress.cleared, [1, 2]);
   assert.equal(new CampaignSession({ storage: store }).start().level.number, 3);
+});
+
+test('a 1920px stage uses its far half and never spawns enemies on a ground hazard', () => {
+  const opening = new CampaignSession({ storage: storage() }).start();
+  assert.equal(opening.combat.arena.width, 1920);
+  const firstEnemy = opening.combat.fighters.find((fighter) => fighter.team === 1);
+  assert.ok(firstEnemy.x >= 1450 && firstEnemy.x <= 1550,
+    `first wave draws the player across the scrolling arena: ${firstEnemy.x}`);
+
+  const later = new CampaignSession({ storage: seedProgress(22, 19) });
+  later.start();
+  for (const enemy of later.combat.fighters.filter((fighter) => fighter.team === 1)) {
+    assert.ok(enemy.x >= 46 && enemy.x <= later.combat.arena.width - 46);
+    assert.ok(Math.abs(enemy.x - later.combat.fighters[0].x) >= 190);
+    assert.ok(later.combat.arena.hazards.every((hazard) =>
+      enemy.x + 22 <= hazard.x - 8 || enemy.x - 22 >= hazard.x + hazard.w + 8));
+  }
+});
+
+test('the campaign spear aims before any KO, needs confirmation, repeats, and survives retry', () => {
+  const session = new CampaignSession({ storage: seedProgress(7, 5) });
+  assert.equal(Object.hasOwn(session.start(), 'spearCharges'), false);
+  const enemy = session.combat.fighters.find((fighter) => fighter.team === 1);
+  enemy.x = 500;
+  enemy.hp = 60;
+  enemy.stun = 300;
+  session.combat.fighters.filter((fighter) => fighter.team === 1 && fighter !== enemy)
+    .forEach((fighter) => { fighter.x = 900; fighter.stun = 300; });
+  session.combat.arena.platforms = []; // Interception is verified in the combat physics tests.
+  const firstAim = session.step({ spear: true });
+  assert.ok(firstAim.events.some((entry) => entry.type === 'spear-aim'));
+  assert.equal(session.combat.fighters[0].spearWindup, 0);
+  session.step({ spear: false, aimUp: true });
+  const confirmed = session.step({ spear: true });
+  assert.ok(confirmed.events.some((entry) => entry.type === 'spear-windup'));
+  let throws = 0;
+  let hits = 0;
+  for (let frame = 0; frame < 65; frame++) {
+    const result = session.step({ spear: true });
+    throws += result.events.filter((entry) => entry.type === 'spear-throw').length;
+    hits += result.events.filter((entry) => entry.type === 'hit'
+      && entry.source === 'hero' && entry.target === enemy.id).length;
+    assert.ok(!result.events.some((entry) => entry.type === 'spear-ready'));
+  }
+  assert.equal(throws, 1, 'a held key never repeats the throw');
+  assert.equal(hits, 1);
+  assert.equal(enemy.hp, 38);
+  session.step({ spear: false });
+  assert.ok(session.step({ spear: true }).events.some((entry) => entry.type === 'spear-aim'));
+  session.step({ spear: false });
+  assert.ok(session.step({ spear: true }).events.some((entry) => entry.type === 'spear-windup'));
+  assert.equal(session.combat.fighters[0].spearCooldown, 0);
+
+  session.combat.fighters[0].hp = 0;
+  assert.equal(session.step().phase, 'failed');
+  const retry = session.retry();
+  assert.equal(retry.level.number, 5);
+  assert.ok(session.step({ spear: true }).events.some((entry) => entry.type === 'spear-aim'));
+});
+
+test('a spear KO remains a personal KO for the existing light-wave skill', () => {
+  const session = new CampaignSession({ storage: seedProgress(7, 5) });
+  session.start();
+  const enemy = session.combat.fighters.find((fighter) => fighter.team === 1);
+  enemy.x = 500;
+  enemy.hp = 1;
+  enemy.stun = 300;
+  session.combat.fighters.filter((fighter) => fighter.team === 1 && fighter !== enemy)
+    .forEach((fighter) => { fighter.x = 900; fighter.stun = 300; });
+  session.combat.arena.platforms = [];
+  assert.ok(session.step({ spear: true }).events.some((entry) => entry.type === 'spear-aim'));
+  session.step({ spear: false });
+  let ko = null;
+  for (let frame = 0; frame < 65 && !ko; frame++) {
+    const result = session.step({ spear: true });
+    ko = result.events.find((entry) => entry.type === 'ko' && entry.target === enemy.id);
+  }
+  assert.equal(ko?.source, 'hero');
+  assert.equal(session.snapshot().specialKills, 1);
+  assert.equal(session.snapshot().specialCharges, 0);
+  assert.equal(Object.hasOwn(session.snapshot(), 'spearCharges'), false);
+});
+
+test('an uncharged wave leaves spear aim alone; a charged wave cancels aim or windup', () => {
+  const session = new CampaignSession({ storage: seedProgress(7, 5) });
+  session.start();
+  const hero = session.combat.fighters[0];
+  session.step({ spear: true });
+  assert.equal(hero.spearAiming, true);
+  session.step({ spear: false, special: true });
+  assert.equal(hero.spearAiming, true, 'an unavailable wave must not cancel aiming');
+  session.step({ special: false });
+  session.specialCharges = 1;
+  const wave = session.step({ special: true });
+  assert.ok(wave.events.some((entry) => entry.type === 'special-wave'));
+  assert.equal(hero.spearAiming, false);
+  assert.equal(hero.spearWindup, 0);
+
+  session.step({ special: false, spear: true });
+  session.step({ spear: false });
+  session.step({ spear: true });
+  assert.ok(hero.spearWindup > 0, 'a second I press commits the spear');
+  session.specialCharges = 1;
+  session.step({ special: true });
+  assert.equal(hero.spearWindup, 0, 'a charged wave also interrupts committed windup');
 });
 
 test('light-wave charges are available only in rooms with more than three enemies and require two player KOs', () => {
@@ -338,4 +444,202 @@ test('storage access denial falls back to in-memory progress', () => {
   assert.equal(first.step().progress.deaths, 1);
   const second = new CampaignSession({ storage: denied, storageKey });
   assert.equal(second.start().progress.deaths, 1);
+});
+
+test('the first stage keeps a real final KO playable until its corpse expires', () => {
+  const store = storage();
+  const session = new CampaignSession({ storage: store });
+  session.start();
+  const [hero, enemy] = session.combat.fighters;
+  enemy.x = hero.x + 40;
+  enemy.hp = 1;
+  enemy.stun = 500;
+  enemy.vx = 0;
+  session.combat.projectiles.push({
+    id: 'leftover-spear', kind: 'spear', source: enemy.id, team: 1,
+    x: 1200, y: 250, vx: -3, vy: 0, radius: 7, damage: 99, ttl: 100,
+  });
+  session.combat.fallingObject = { phase: 'warning', warningRemaining: 100,
+    kind: 'cone', x: hero.x, y: -8, impactY: hero.y, radius: 8 };
+  let result;
+  for (let frame = 0; frame < 12; frame++) {
+    if (frame === 4) {
+      hero.attackBuffered = true;
+      hero.comboWindow = 14;
+    }
+    result = session.step({ attack: frame === 0 });
+    if (result.phase === 'aftermath') break;
+  }
+  assert.equal(result.phase, 'aftermath');
+  assert.equal(result.progress.currentLevel, 1);
+  assert.deepEqual(result.progress.cleared, []);
+  assert.equal(JSON.parse(store.getItem(STORAGE_KEY)).currentLevel, 1,
+    'winning is not saved before the post-KO window ends');
+  assert.equal(result.combat.corpses.length, 1);
+  assert.equal(result.combat.corpses[0].id, enemy.id);
+  assert.equal(result.combat.aftermath, true);
+  assert.equal(result.combat.projectiles.length, 0);
+  assert.equal(result.combat.fallingObject, null);
+  assert.equal(hero.attackStage, 0);
+  assert.equal(hero.attackTick, 0);
+  assert.equal(hero.attackBuffered, false);
+  assert.equal(hero.comboWindow, 0);
+  const deadline = result.combat.corpses[0].expireTick;
+  const stoppedAt = result.combat.motionTick;
+  while (session.combat.hitstop > 0) {
+    result = session.step({ right: true });
+    assert.equal(result.combat.motionTick, stoppedAt, 'KO hitstop pauses the aftermath clock');
+  }
+  const hp = hero.hp;
+  const startX = hero.x;
+  result.combat.arena.hazards.push({ x: startX - 15, y: hero.y - 20,
+    w: 30, h: 24, damage: 100 });
+  result = session.step({ right: true, attack: true, spear: true, special: true });
+  assert.ok(hero.x > startX, 'the player can walk through the short victory aftermath');
+  assert.equal(hero.hp, hp, 'hazards and any AI damage stay off');
+  assert.ok(!result.events.some((entry) => entry.type === 'spear-aim'
+    || entry.type === 'special-wave'));
+  while (session.combat.motionTick < deadline - 1) result = session.step();
+  assert.equal(result.phase, 'aftermath');
+  assert.equal(result.combat.corpses.length, 1);
+  result = session.step();
+  assert.equal(result.combat.motionTick, deadline);
+  assert.equal(result.combat.corpses.length, 0);
+  assert.equal(result.phase, 'cleared');
+  assert.equal(result.progress.currentLevel, 2);
+  assert.deepEqual(result.progress.cleared, [1]);
+  assert.ok(result.events.some((entry) => entry.type === 'level-clear'));
+  assert.equal(JSON.parse(store.getItem(STORAGE_KEY)).currentLevel, 2);
+});
+
+test('victory aftermath clears a finishing kick or dodge and queued inputs without erasing KO feedback', () => {
+  for (const active of ['kick', 'dodge']) {
+    const session = new CampaignSession({ storage: storage() });
+    session.start();
+    const [hero, enemy] = session.combat.fighters;
+    enemy.x = hero.x + 180;
+    enemy.hp = 1;
+    enemy.stun = 500;
+    session.combat.arena.platforms = [];
+    session.combat.projectiles.push({
+      id: `finisher-${active}`, kind: 'spear', source: hero.id, team: 0,
+      x: enemy.x - 25, y: enemy.y - 40, vx: 10, vy: 0,
+      radius: 7, damage: 22, ttl: 20,
+    });
+    hero.attackBuffered = true;
+    hero.comboStage = 2;
+    hero.comboWindow = 12;
+    hero.jumpBuffer = 5;
+    if (active === 'kick') {
+      hero.kickType = 'ground';
+      hero.kickTick = 2;
+    } else hero.dodgeTicks = 5;
+    const result = session.step();
+    assert.equal(result.phase, 'aftermath', active);
+    assert.ok(result.events.some((entry) => entry.type === 'ko' && entry.target === enemy.id));
+    assert.ok(result.combat.hitstop > 0, 'the final impact remains perceptible');
+    assert.deepEqual({
+      attackStage: hero.attackStage, attackTick: hero.attackTick,
+      attackBuffered: hero.attackBuffered, comboStage: hero.comboStage,
+      comboWindow: hero.comboWindow, kickType: hero.kickType, kickTick: hero.kickTick,
+      dodgeTicks: hero.dodgeTicks, jumpBuffer: hero.jumpBuffer,
+    }, {
+      attackStage: 0, attackTick: 0, attackBuffered: false, comboStage: 0,
+      comboWindow: 0, kickType: null, kickTick: 0, dodgeTicks: 0, jumpBuffer: 0,
+    });
+    while (session.combat.hitstop > 0) session.step();
+    const after = session.step({ right: true, attack: true, kick: true,
+      dodge: true, spear: true });
+    assert.equal(after.phase, 'aftermath');
+    assert.equal(hero.attackStage, 0);
+    assert.equal(hero.kickType, null);
+    assert.equal(hero.dodgeTicks, 0);
+    assert.ok(!after.events.some((entry) => entry.type === 'kick'
+      || entry.type === 'jump-kick' || entry.type === 'spear-aim'));
+  }
+});
+
+test('scattering just before expiry leaves 36 effective frames for the bones animation', () => {
+  const session = new CampaignSession({ storage: storage() });
+  session.start();
+  const [hero, enemy] = session.combat.fighters;
+  enemy.x = hero.x + 40;
+  enemy.hp = 1;
+  enemy.stun = 500;
+  for (let frame = 0; frame < 12 && session.phase === 'playing'; frame++) {
+    session.step({ attack: frame === 0 });
+  }
+  assert.equal(session.phase, 'aftermath');
+  const corpse = session.combat.corpses[0];
+  const originalDeadline = corpse.expireTick;
+  while (session.combat.motionTick < originalDeadline - 3) session.step();
+  hero.x = corpse.x - 60;
+  hero.y = corpse.y;
+  hero.vx = 0;
+  hero.vy = 0;
+  hero.grounded = true;
+  session.step(); // First leave the corpse's horizontal region.
+  assert.equal(corpse.wasInside, false);
+  hero.x = corpse.x - 20.5;
+  hero.vx = 0;
+  const scattered = session.step({ right: true });
+  assert.equal(scattered.combat.motionTick, originalDeadline - 1);
+  assert.equal(scattered.events.filter((entry) => entry.type === 'bones-scatter').length, 1);
+  assert.equal(scattered.combat.corpses.length, 0);
+  assert.equal(scattered.phase, 'aftermath');
+  const extendedDeadline = session.aftermathUntilTick;
+  assert.equal(extendedDeadline, scattered.combat.motionTick + 36);
+  assert.equal(scattered.specialKills, 0);
+  while (session.combat.motionTick < originalDeadline) session.step();
+  assert.equal(session.phase, 'aftermath', 'early scattering never shortens the original hold');
+  while (session.combat.motionTick < extendedDeadline - 1) session.step();
+  assert.equal(session.phase, 'aftermath');
+  const cleared = session.step();
+  assert.equal(cleared.combat.motionTick, extendedDeadline);
+  assert.equal(cleared.phase, 'cleared');
+  assert.deepEqual(cleared.progress.cleared, [1]);
+});
+
+test('earlier-wave corpses survive replacement and a retry clears all ephemeral remains', () => {
+  const session = new CampaignSession({ storage: seedProgress(2, 1) });
+  session.start();
+  const [hero, enemy] = session.combat.fighters;
+  enemy.x = hero.x + 40;
+  enemy.hp = 1;
+  enemy.stun = 500;
+  let result;
+  for (let frame = 0; frame < 12; frame++) {
+    result = session.step({ attack: frame === 0 });
+    if (result.waveNumber === 2) break;
+  }
+  assert.equal(result.phase, 'playing');
+  assert.equal(result.waveNumber, 2);
+  assert.equal(result.combat.corpses.length, 1);
+  assert.equal(result.combat.corpses[0].id, enemy.id);
+  assert.equal(result.combat.fighters.some((fighter) => fighter.id === enemy.id), false,
+    'the corpse has its own lifetime after the dead fighter leaves the wave');
+  hero.hp = 0;
+  assert.equal(session.step().phase, 'failed');
+  const retry = session.retry();
+  assert.equal(retry.level.number, 1);
+  assert.deepEqual(retry.combat.corpses, []);
+  assert.equal(retry.combat.aftermath, false);
+});
+
+test('a real same-frame double KO still fails before starting an aftermath', () => {
+  const session = new CampaignSession({ storage: storage() });
+  session.start();
+  const [hero, enemy] = session.combat.fighters;
+  enemy.x = hero.x + 40;
+  enemy.facing = -1;
+  hero.hp = 1;
+  enemy.hp = 1;
+  hero.attackStage = enemy.attackStage = 1;
+  hero.attackTick = enemy.attackTick = 4;
+  const result = session.step();
+  assert.ok(result.events.some((entry) => entry.type === 'ko' && entry.target === hero.id));
+  assert.ok(result.events.some((entry) => entry.type === 'ko' && entry.target === enemy.id));
+  assert.equal(result.phase, 'failed');
+  assert.equal(result.combat.aftermath, false);
+  assert.equal(result.progress.deaths, 1);
 });

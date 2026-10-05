@@ -74,6 +74,23 @@ test('muting or starting a new round prevents a queued tomato sound', () => {
   assert.equal(played.length, 2, 'a cancelled KO never plays after a round change');
 });
 
+test('walking over a fallen enemy plays one restrained, dry bone rattle and respects mute', () => {
+  const SoundEffects = soundClass({});
+  const sound = new SoundEffects();
+  const played = [];
+  sound.tone = (...args) => played.push(['tone', ...args]);
+  sound.noise = (...args) => played.push(['noise', ...args]);
+
+  sound.play({ type: 'bones-scatter' });
+  assert.deepEqual(played.map(([kind]) => kind), ['tone', 'tone', 'noise']);
+  assert.ok(played[0][4] <= 0.04 && played[2][2] <= 0.03,
+    'the dry scatter cue should stay below a heavy combat impact');
+  assert.equal(played[2][3], 2400, 'the scatter has a crisp but filtered texture');
+  sound.enabled = false;
+  sound.play({ type: 'bones-scatter' });
+  assert.equal(played.length, 3, 'muting silences the new effect too');
+});
+
 test('falling-object warnings stay quiet, while impacts make restrained material cues', () => {
   const SoundEffects = soundClass({});
   const sound = new SoundEffects();
@@ -90,6 +107,25 @@ test('falling-object warnings stay quiet, while impacts make restrained material
   played.length = 0;
   sound.play({ type: 'fall-impact', kind: 'pebble' });
   assert.ok(played[0][1] < 650, 'a pebble should sound lower than hail');
+});
+
+test('spear windup and release have distinct cues, and a blocked impact stays subtle', () => {
+  const SoundEffects = soundClass({});
+  const sound = new SoundEffects();
+  const played = [];
+  sound.tone = (...args) => played.push(['tone', ...args]);
+  sound.noise = (...args) => played.push(['noise', ...args]);
+
+  sound.play({ type: 'spear-windup' });
+  assert.deepEqual(played.map(([name]) => name), ['tone']);
+  played.length = 0;
+  sound.play({ type: 'spear-throw' });
+  assert.deepEqual(played.map(([name]) => name), ['tone', 'noise']);
+  played.length = 0;
+  sound.play({ type: 'spear-impact', blocked: false });
+  assert.equal(played.length, 0, 'an unblocked spear also produces the standard hit cue');
+  sound.play({ type: 'spear-impact', blocked: true });
+  assert.deepEqual(played.map(([name]) => name), ['tone']);
 });
 
 test('tomato noise passes through a low-pass filter before reaching the output', () => {

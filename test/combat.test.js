@@ -1,9 +1,14 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import {
-  TICK_RATE, createFighter, createCombatState, createDuelState,
-  stepCombat, aiInput, attackOf, kickOf,
+  TICK_RATE, CORPSE_SETTLE_TICKS, CORPSE_HOLD_TICKS,
+  SPEAR_WINDUP_TICKS, SPEAR_GRAVITY, SPEAR_MIN_ANGLE, SPEAR_MAX_ANGLE,
+  createFighter,
+  createCombatState, createDuelState, stepCombat, aiInput, attackOf, kickOf,
+  cancelSpearAim, spearOrigin, spearFlight, spearAimedFlight, spearTrajectoryPoint,
 } from '../shared/combat.js';
+import { getLevel } from '../shared/levels.js';
+import { platformPose, platformSurfaceY } from '../shared/platforms.js';
 
 function arena(overrides = {}) {
   return { theme: 'forest', groundY: 438, platforms: [], hazards: [], ...overrides };
@@ -623,4 +628,909 @@ test('ordinary enemy AI kicks occasionally while the balanced boss AI does not',
     state.tick = tick;
     assert.equal(aiInput(boss, state.fighters[0], state).kick, false);
   }
+});
+
+test('an unlimited campaign spear first aims, then fires only after a fresh confirmation', () => {
+  const state = sparring(520);
+  const [hero, enemy] = state.fighters;
+  assert.equal(Object.hasOwn(hero, 'spearCharges'), false);
+  const events = [];
+  stepCombat(state, { hero: { spear: true } });
+  events.push(...state.events);
+  assert.equal(hero.spearAiming, true);
+  assert.equal(hero.spearWindup, 0);
+  assert.ok(state.events.some((entry) => entry.type === 'spear-aim'));
+  for (let frame = 0; frame < SPEAR_WINDUP_TICKS + 5; frame++) {
+    stepCombat(state, { hero: { spear: true } });
+    events.push(...state.events);
+    assert.equal(hero.spearAiming, true, 'holding I must not confirm or launch');
+  }
+  assert.equal(state.projectiles.length, 0);
+  stepCombat(state, { hero: { spear: false } });
+  stepCombat(state, { hero: { spear: true } });
+  events.push(...state.events);
+  assert.equal(hero.spearAiming, false);
+  assert.equal(hero.spearWindup, SPEAR_WINDUP_TICKS - 1);
+  assert.ok(state.events.some((entry) => entry.type === 'spear-windup'));
+  for (let frame = 0; frame < SPEAR_WINDUP_TICKS + 35; frame++) {
+    stepCombat(state, { hero: { spear: true } });
+    events.push(...state.events);
+  }
+  assert.equal(events.filter((entry) => entry.type === 'spear-throw').length, 1);
+  assert.equal(events.filter((entry) => entry.type === 'spear-impact').length, 1);
+  assert.equal(events.filter((entry) => entry.type === 'hit' && entry.source === 'hero').length, 1);
+  assert.equal(enemy.hp, 42 - 22);
+  assert.equal(state.projectiles.length, 0);
+  stepCombat(state, { hero: { spear: false } });
+  stepCombat(state, { hero: { spear: true } });
+  assert.ok(state.events.some((entry) => entry.type === 'spear-aim'));
+  stepCombat(state, { hero: { spear: false } });
+  stepCombat(state, { hero: { spear: true } });
+  assert.ok(state.events.some((entry) => entry.type === 'spear-windup'));
+  assert.equal(hero.spearCooldown, 0);
+});
+
+test('near, middle and distant throws follow visible parabolic arcs and still hit', () => {
+  for (const [distance, rise] of [[120, 4], [300, 7], [620, 60]]) {
+    const state = sparring(300 + distance);
+    const launchY = state.fighters[0].y - state.fighters[0].height * 0.65;
+    const samples = [];
+    const observed = [];
+    for (let frame = 0; frame < SPEAR_WINDUP_TICKS + 75 && !observed.some((entry) => entry.type === 'spear-impact'); frame++) {
+      stepCombat(state, { hero: { spear: frame === 0 || frame === 2 } });
+      observed.push(...state.events);
+      if (state.projectiles.length) samples.push(state.projectiles[0].y);
+    }
+    assert.ok(observed.some((entry) => entry.type === 'spear-throw'), `${distance}px launch`);
+    assert.ok(observed.some((entry) => entry.type === 'spear-impact'
+      && entry.target === 'enemy' && entry.damage === 22), `${distance}px hit`);
+    const apexY = Math.min(...samples);
+    assert.ok(apexY <= launchY - rise,
+      `${distance}px trajectory rises ${Math.round(launchY - apexY)}px, expected at least ${rise}px`);
+    if (distance >= 300) {
+      assert.ok(samples.at(-1) > apexY + rise * 0.45,
+        `${distance}px trajectory descends after its apex`);
+    }
+    assert.equal(state.fighters[1].hp, 20);
+  }
+});
+
+test('the shared spear arc predicts every discrete gravity step and its locked aim point', () => {
+  for (const [aimX, aimY] of [[320, 380], [620, 250], [820, 400]]) {
+    const flight = spearFlight(200, 300, aimX, aimY);
+    assert.deepEqual(spearTrajectoryPoint(200, 300, flight, 0), { x: 200, y: 300 });
+    const endpoint = spearTrajectoryPoint(200, 300, flight, flight.ticks);
+    assert.ok(Math.abs(endpoint.x - aimX) < 1e-9);
+    assert.ok(Math.abs(endpoint.y - aimY) < 1e-9);
+    let x = 200;
+    let y = 300;
+    let vy = flight.vy;
+    for (let tick = 1; tick <= Math.floor(flight.ticks); tick++) {
+      vy += SPEAR_GRAVITY;
+      x += flight.vx;
+      y += vy;
+      const point = spearTrajectoryPoint(200, 300, flight, tick);
+      assert.ok(Math.abs(point.x - x) < 1e-9);
+      assert.ok(Math.abs(point.y - y) < 1e-9);
+    }
+  }
+});
+
+test('manual aim uses bounded angles, optional finite pointer input, and locks facing on confirm', () => {
+  const state = sparring(800);
+  const hero = state.fighters[0];
+  assert.equal(SPEAR_MIN_ANGLE, 8);
+  assert.equal(SPEAR_MAX_ANGLE, 72);
+  stepCombat(state, { hero: { spear: true } });
+  const seededAngle = hero.spearAimAngle;
+  assert.ok(seededAngle >= SPEAR_MIN_ANGLE && seededAngle <= SPEAR_MAX_ANGLE);
+  stepCombat(state, { hero: { aimUp: true, right: true } });
+  assert.equal(hero.spearAimAngle, Math.min(SPEAR_MAX_ANGLE, seededAngle + 1.25));
+  assert.ok(hero.vx > 0, 'movement remains available in aim mode');
+  stepCombat(state, { hero: { aimAngle: 999 } });
+  assert.equal(hero.spearAimAngle, SPEAR_MAX_ANGLE);
+  stepCombat(state, { hero: { aimAngle: -200 } });
+  assert.equal(hero.spearAimAngle, SPEAR_MIN_ANGLE);
+  stepCombat(state, { hero: { aimAngle: Infinity, aimDown: true } });
+  assert.equal(hero.spearAimAngle, SPEAR_MIN_ANGLE, 'non-finite pointer angles are ignored');
+  stepCombat(state, { hero: { aimAngle: 32.5, left: true } });
+  assert.equal(hero.facing, -1);
+  assert.equal(hero.spearAimAngle, 32.5);
+
+  stepCombat(state, { hero: { spear: true } });
+  assert.equal(hero.spearAiming, false);
+  assert.equal(hero.spearWindup, SPEAR_WINDUP_TICKS - 1);
+  assert.equal(hero.spearLaunchFacing, -1);
+  assert.equal(state.events.find((entry) => entry.type === 'spear-windup')?.angle, 32.5);
+  for (let tick = 1; tick < SPEAR_WINDUP_TICKS; tick++) {
+    stepCombat(state, { hero: { right: true, aimAngle: 70, aimUp: true } });
+  }
+  const thrown = state.events.find((entry) => entry.type === 'spear-throw');
+  assert.ok(thrown);
+  assert.equal(thrown.facing, -1);
+  assert.deepEqual({ vx: thrown.vx, vy: thrown.vy }, spearAimedFlight(-1, 32.5));
+  assert.equal(hero.spearAimAngle, 32.5, 'aim inputs cannot retarget a committed throw');
+  assert.equal(hero.spearLaunchFacing, null);
+});
+
+test('manual preview and real projectile share their origin, velocity and each discrete gravity step', () => {
+  const state = sparring(800);
+  const hero = state.fighters[0];
+  stepCombat(state, { hero: { spear: true } });
+  stepCombat(state, { hero: { aimAngle: 33 } });
+  assert.equal(hero.spearAimAngle, 33);
+  stepCombat(state, { hero: { spear: true } });
+  for (let tick = 1; tick < SPEAR_WINDUP_TICKS; tick++) stepCombat(state);
+  const thrown = state.events.find((entry) => entry.type === 'spear-throw');
+  assert.ok(thrown);
+  const lockedFlight = spearAimedFlight(thrown.facing, 33);
+  assert.deepEqual({ vx: thrown.vx, vy: thrown.vy }, lockedFlight);
+  assert.deepEqual(spearOrigin(hero), { x: thrown.x, y: thrown.y });
+  for (let tick = 1; tick <= 10; tick++) {
+    if (tick > 1) stepCombat(state);
+    const projectile = state.projectiles[0];
+    assert.ok(projectile, `flight still exists at tick ${tick}`);
+    const predicted = spearTrajectoryPoint(thrown.x, thrown.y, lockedFlight, tick);
+    assert.ok(Math.abs(projectile.x - predicted.x) < 1e-9);
+    assert.ok(Math.abs(projectile.y - predicted.y) < 1e-9);
+  }
+});
+
+test('cancel, punch, kick, jump and dodge leave aim without throwing; a new press can start again', () => {
+  for (const action of ['aimCancel', 'attack', 'kick', 'jump', 'dodge']) {
+    const state = sparring(800);
+    const hero = state.fighters[0];
+    stepCombat(state, { hero: { spear: true } });
+    stepCombat(state);
+    stepCombat(state, { hero: { [action]: true } });
+    assert.equal(hero.spearAiming, false, `${action} cancels the unconfirmed aim`);
+    assert.equal(hero.spearWindup, 0);
+    assert.equal(state.projectiles.length, 0);
+    assert.ok(state.events.some((entry) => entry.type === 'spear-aim-cancel'), `${action} has a HUD cue`);
+    if (action === 'attack') assert.equal(hero.attackStage, 1);
+    if (action === 'kick') assert.equal(hero.kickType, 'ground');
+    if (action === 'jump') assert.ok(hero.vy < 0);
+    if (action === 'dodge') assert.ok(hero.dodgeTicks > 0);
+  }
+
+  const state = sparring(800);
+  const hero = state.fighters[0];
+  stepCombat(state, { hero: { spear: true } });
+  const tick = state.tick;
+  assert.equal(cancelSpearAim(hero), true, 'blur can discard a pending aim without a simulation step');
+  assert.equal(state.tick, tick);
+  assert.equal(cancelSpearAim(hero), false);
+  stepCombat(state, { hero: { spear: true } });
+  assert.equal(hero.spearAiming, false, 'holding the original press does not restart');
+  stepCombat(state);
+  stepCombat(state, { hero: { spear: true } });
+  assert.equal(hero.spearAiming, true, 'release and fresh press reopens unlimited aim');
+  stepCombat(state, { hero: { spear: false, aimCancel: true } });
+  stepCombat(state, { hero: { spear: true, aimCancel: true } });
+  assert.equal(hero.spearAiming, false, 'cancel and I in the same tick must not reopen the aim');
+});
+
+test('a moving or jumping target cannot silently redirect a telegraphed spear', () => {
+  const hero = createFighter({ id: 'hero', x: 650, y: 438 });
+  const enemy = createFighter({ id: 'enemy', x: 180, y: 438, team: 1,
+    kind: 'grunt', spearEnabled: true });
+  enemy.facing = 1;
+  const state = createCombatState({ arena: arena({ width: 1920 }), fighters: [hero, enemy] });
+  stepCombat(state, { enemy: { spear: true } });
+  const warning = state.events.find((entry) => entry.type === 'spear-windup');
+  assert.ok(warning);
+  for (let tick = 2; tick <= SPEAR_WINDUP_TICKS; tick++) {
+    stepCombat(state, { hero: { right: true, jump: tick === 2 } });
+  }
+  const thrown = state.events.find((entry) => entry.type === 'spear-throw');
+  assert.ok(thrown);
+  assert.ok(hero.x - warning.targetX > 65, 'the player has left the warned lane');
+  assert.ok(warning.targetY - (hero.y - hero.height * 0.57) > 50,
+    'the player has also jumped above the warned height');
+  const flight = spearFlight(thrown.x, thrown.y, warning.targetX, warning.targetY);
+  assert.ok(Math.abs(thrown.vx - flight.vx) < 1e-9);
+  assert.ok(Math.abs(thrown.vy - flight.vy) < 1e-9);
+  const first = spearTrajectoryPoint(thrown.x, thrown.y, flight, 1);
+  assert.ok(Math.abs(state.projectiles[0].x - first.x) < 1e-9);
+  assert.ok(Math.abs(state.projectiles[0].y - first.y) < 1e-9);
+});
+
+test('hitstop freezes both aim adjustment and the confirmed spear windup clock', () => {
+  const state = sparring(520);
+  stepCombat(state, { hero: { spear: true } });
+  const hero = state.fighters[0];
+  const initialAngle = hero.spearAimAngle;
+  assert.equal(state.motionTick, 1);
+  state.hitstop = 4;
+  for (let frame = 0; frame < 4; frame++) {
+    stepCombat(state, { hero: { aimUp: true } });
+    assert.equal(state.motionTick, 1);
+    assert.equal(hero.spearAimAngle, initialAngle);
+  }
+  stepCombat(state, { hero: { aimUp: true } });
+  assert.equal(state.motionTick, 2);
+  assert.equal(hero.spearAimAngle, initialAngle + 1.25);
+  stepCombat(state, { hero: { spear: true } });
+  const remaining = hero.spearWindup;
+  assert.equal(remaining, SPEAR_WINDUP_TICKS - 1);
+  state.hitstop = 4;
+  const motionTick = state.motionTick;
+  for (let frame = 0; frame < 4; frame++) {
+    stepCombat(state, { hero: { spear: true } });
+    assert.equal(state.motionTick, motionTick);
+    assert.equal(hero.spearWindup, remaining);
+  }
+  stepCombat(state, { hero: { spear: true } });
+  assert.equal(state.motionTick, motionTick + 1);
+  assert.equal(hero.spearWindup, remaining - 1);
+});
+
+test('a hit cancels aim, an interrupted windup can be retried, and dodge absorbs a projectile', () => {
+  const state = sparring(350);
+  const [hero, enemy] = state.fighters;
+  enemy.attackStage = 1;
+  enemy.attackTick = 4;
+  stepCombat(state, { hero: { spear: true } });
+  assert.ok(state.events.some((entry) => entry.type === 'spear-aim'));
+  assert.ok(state.events.some((entry) => entry.type === 'spear-aim-cancel'));
+  assert.equal(hero.spearAiming, false, 'the punch interrupts the open aim');
+  assert.equal(state.projectiles.length, 0);
+  while (hero.stun > 0 || state.hitstop > 0) stepCombat(state);
+  stepCombat(state, { hero: { spear: true } });
+  assert.ok(state.events.some((entry) => entry.type === 'spear-aim'),
+    'a new press after recovery starts aiming without a consumable resource');
+  stepCombat(state);
+  stepCombat(state, { hero: { spear: true } });
+  assert.ok(state.events.some((entry) => entry.type === 'spear-windup'));
+  assert.ok(hero.spearWindup > 0);
+  hero.invulnerable = 0;
+  enemy.x = hero.x + 50;
+  enemy.y = hero.y;
+  enemy.facing = -1;
+  enemy.attackStage = 1;
+  enemy.attackTick = 4;
+  enemy.hitIds = [];
+  stepCombat(state);
+  assert.equal(hero.spearWindup, 0, 'a new punch interrupts the committed throw');
+  assert.equal(state.projectiles.length, 0);
+
+  const guarded = sparring(350);
+  const target = guarded.fighters[1];
+  target.dodgeTicks = 5;
+  guarded.projectiles.push({
+    id: 'spear-test', kind: 'spear', source: 'hero', team: 0,
+    x: 280, y: 390, vx: 120, vy: 0, radius: 7, damage: 22, ttl: 20,
+  });
+  stepCombat(guarded);
+  assert.equal(target.hp, 42);
+  assert.equal(guarded.projectiles.length, 0);
+  assert.ok(guarded.events.some((entry) => entry.type === 'spear-impact'
+    && entry.target === target.id && entry.blocked && entry.damage === 0));
+});
+
+test('KO clears a pending aim or windup without launching a late projectile', () => {
+  for (const confirmed of [false, true]) {
+    const state = sparring(350);
+    const [hero, enemy] = state.fighters;
+    hero.hp = 1;
+    stepCombat(state, { hero: { spear: true } });
+    if (confirmed) {
+      stepCombat(state);
+      stepCombat(state, { hero: { spear: true } });
+      assert.ok(hero.spearWindup > 0);
+    }
+    enemy.x = hero.x + 50;
+    enemy.facing = -1;
+    enemy.attackStage = 1;
+    enemy.attackTick = 4;
+    stepCombat(state);
+    assert.equal(hero.hp, 0);
+    assert.equal(hero.spearAiming, false);
+    assert.equal(hero.spearWindup, 0);
+    assert.equal(hero.spearLaunchFacing, null);
+    assert.equal(state.projectiles.length, 0);
+    assert.ok(state.events.some((entry) => entry.type === 'ko' && entry.target === hero.id));
+  }
+});
+
+test('swept spears stop on static, floating and rotating wooden platforms', () => {
+  for (const platform of [
+    { x: 350, y: 344, w: 100, h: 14 },
+    { x: 350, y: 344, w: 100, h: 14, motion: 'float', baseY: 344,
+      period: 120, amplitude: 10, phase: 0 },
+    { x: 350, y: 344, w: 100, h: 14, motion: 'rotate', baseX: 400, baseY: 344,
+      baseAngle: 0, period: 120, amplitude: 0.22, phase: 30 },
+  ]) {
+    const state = createCombatState({ arena: arena({ platforms: [platform] }),
+      fighters: sparring(520).fighters });
+    state.projectiles.push({
+      id: 'spear-platform', kind: 'spear', source: 'hero', team: 0,
+      x: 300, y: 350, vx: 200, vy: 0, radius: 7, damage: 22, ttl: 20,
+    });
+    stepCombat(state);
+    assert.equal(state.fighters[1].hp, 42);
+    assert.equal(state.projectiles.length, 0);
+    assert.ok(state.events.some((entry) => entry.type === 'spear-impact'
+      && entry.surface === 'platform' && entry.target === null));
+  }
+});
+
+test('opposing projectiles can trade a same-frame KO regardless of array order', () => {
+  const run = (reverse) => {
+    const state = sparring(390);
+    state.fighters.forEach((fighter) => { fighter.hp = 1; });
+    const shots = [
+      { id: 'spear-a', kind: 'spear', source: 'hero', team: 0,
+        x: 320, y: 390, vx: 100, vy: 0, radius: 7, damage: 10, ttl: 20 },
+      { id: 'spear-b', kind: 'spear', source: 'enemy', team: 1,
+        x: 370, y: 390, vx: -100, vy: 0, radius: 7, damage: 10, ttl: 20 },
+    ];
+    state.projectiles.push(...(reverse ? shots.reverse() : shots));
+    stepCombat(state);
+    return {
+      hp: state.fighters.map((fighter) => fighter.hp),
+      knockouts: state.events.filter((entry) => entry.type === 'ko')
+        .map(({ target, source }) => ({ target, source })).sort((a, b) => a.target.localeCompare(b.target)),
+    };
+  };
+  assert.deepEqual(run(false), run(true));
+  assert.deepEqual(run(false), {
+    hp: [0, 0], knockouts: [
+      { target: 'enemy', source: 'hero' }, { target: 'hero', source: 'enemy' },
+    ],
+  });
+});
+
+test('a duel cannot create spears even from a forged input or enabled fighter', () => {
+  const state = createDuelState();
+  state.fighters[0].spearEnabled = true;
+  for (let frame = 0; frame < 70; frame++) {
+    stepCombat(state, { p1: {
+      spear: frame % 3 === 0, aimUp: true, aimAngle: 72, aimCancel: frame % 7 === 0,
+    } });
+    assert.equal(state.projectiles.length, 0);
+    assert.equal(state.fighters[0].spearAiming, false);
+    assert.equal(state.fighters[0].spearWindup, 0);
+    assert.ok(!state.events.some((entry) => entry.type.startsWith('spear-')));
+  }
+});
+
+test('an enemy under a two-tier target climbs instead of repeatedly punching beneath it', () => {
+  const hero = createFighter({ id: 'hero', x: 600, y: 238, team: 0 });
+  const enemy = createFighter({ id: 'enemy', x: 600, y: 438, team: 1, kind: 'rusher' });
+  const state = createCombatState({ arena: arena({ width: 1920, platforms: [
+    { x: 500, y: 338, w: 200, h: 14 },
+    { x: 540, y: 238, w: 160, h: 14 },
+  ] }), fighters: [hero, enemy] });
+  let jumped = 0;
+  let futilePunches = 0;
+  for (let frame = 0; frame < 340 && hero.hp === 100; frame++) {
+    const controls = aiInput(enemy, hero, state);
+    if (controls.jump) jumped++;
+    if (enemy.y - hero.y > 95 && controls.attack) futilePunches++;
+    stepCombat(state, { enemy: controls });
+  }
+  assert.ok(jumped >= 2, `AI should ascend in steps, observed ${jumped} jump requests`);
+  assert.equal(futilePunches, 0);
+  assert.ok(hero.hp < 100, 'the pursuer eventually reaches the player on the upper platform');
+});
+
+test('enemy reaches the drifting upper platform in each chapter\'s late stages', () => {
+  for (const levelNumber of [13, 14, 27, 28, 41, 42, 55, 56]) {
+    const level = getLevel(levelNumber);
+    const drift = level.platforms.find((platform) => platform.motion === 'float'
+      && platform.axis === 'x');
+    assert.ok(drift, `level ${levelNumber} includes the late horizontal platform`);
+    const pose = platformPose(drift, 0);
+    const hero = createFighter({ id: 'hero', x: pose.centerX, y: pose.centerY });
+    hero.invulnerable = 10000;
+    const enemy = createFighter({ id: 'enemy', x: hero.x - 160,
+      y: level.groundY, team: 1, kind: 'rusher' });
+    const state = createCombatState({ arena: { ...level.arena, hazards: [], fallingHazard: null },
+      fighters: [hero, enemy] });
+    let jumps = 0;
+    let landedBesideHero = false;
+    let attacks = 0;
+    for (let frame = 0; frame < 360; frame++) {
+      const controls = aiInput(enemy, hero, state);
+      if (controls.jump) jumps++;
+      if (controls.attack) attacks++;
+      stepCombat(state, { enemy: controls });
+      if (enemy.grounded && Math.abs(enemy.y - hero.y) < 2) landedBesideHero = true;
+    }
+    assert.ok(jumps >= 2, `level ${levelNumber}: pursuer keeps climbing after its first step`);
+    assert.equal(landedBesideHero, true, `level ${levelNumber}: reaches the drifting plank`);
+    assert.ok(attacks > 0, `level ${levelNumber}: attacks once it can actually hit`);
+  }
+});
+
+test('a close enemy uses its reachable punch lane instead of jumping at the player', () => {
+  const hero = createFighter({ id: 'hero', x: 600, y: 338 });
+  const enemy = createFighter({ id: 'enemy', x: 630, y: 383, team: 1, kind: 'rusher' });
+  const boss = createFighter({ id: 'boss', x: 660, y: 413, team: 1, kind: 'boss' });
+  const state = createCombatState({ arena: arena(), fighters: [hero, enemy, boss] });
+  let attacks = 0;
+  for (let tick = 0; tick < 120; tick++) {
+    state.tick = tick;
+    for (const attacker of [enemy, boss]) {
+      const controls = aiInput(attacker, hero, state);
+      assert.equal(controls.jump, false, `${attacker.kind} has a reachable punch lane`);
+      if (controls.attack) attacks++;
+    }
+  }
+  assert.ok(attacks > 0);
+});
+
+test('an enemy above the player walks off its platform and reacquires a reachable attack lane', () => {
+  const hero = createFighter({ id: 'hero', x: 450, y: 438, team: 0 });
+  const enemy = createFighter({ id: 'enemy', x: 450, y: 338, team: 1, kind: 'rusher' });
+  const state = createCombatState({ arena: arena({ platforms: [
+    { x: 400, y: 338, w: 140, h: 14 },
+  ] }), fighters: [hero, enemy] });
+  let escapedPlatform = false;
+  let uselessPunches = 0;
+  for (let frame = 0; frame < 260 && hero.hp === 100; frame++) {
+    const controls = aiInput(enemy, hero, state);
+    if (enemy.y - hero.y < -95 && controls.attack) uselessPunches++;
+    stepCombat(state, { enemy: controls });
+    if (enemy.y > 375) escapedPlatform = true;
+  }
+  assert.equal(uselessPunches, 0);
+  assert.equal(escapedPlatform, true, 'the pursuer leaves the upper plank');
+  assert.ok(hero.hp < 100, 'it reaches and strikes the player below');
+});
+
+test('campaign fighters and hazards can advance into the 1920px half, while PvP stays 960px', () => {
+  const hero = createFighter({ id: 'hero', x: 980, y: 438, team: 0 });
+  const state = createCombatState({ arena: arena({ width: 1920,
+    fallingHazard: fallingHazard({ firstTick: 1, warningTicks: 1 }) }), fighters: [hero] });
+  for (let frame = 0; frame < 125; frame++) stepCombat(state, { hero: { right: true } });
+  assert.ok(hero.x > 1100 && hero.x <= 1901);
+  assert.equal(state.arena.width, 1920);
+  const duel = createDuelState();
+  assert.equal(duel.arena.width, 960);
+  duel.fighters[1].x = 940;
+  duel.fighters[1].vx = 20;
+  stepCombat(duel);
+  assert.equal(duel.fighters[1].x, 941);
+});
+
+test('a genuine campaign KO leaves a supported corpse for 27 plus 180 effective frames', () => {
+  const state = sparring(350);
+  const [hero, enemy] = state.fighters;
+  enemy.hp = 1;
+  hero.attackStage = 1;
+  hero.attackTick = 4;
+  stepCombat(state);
+  assert.equal(enemy.hp, 0);
+  assert.ok(state.events.some((entry) => entry.type === 'ko' && entry.target === enemy.id));
+  assert.equal(state.corpses.length, 1);
+  const corpse = state.corpses[0];
+  assert.deepEqual([
+    corpse.id, corpse.kind, corpse.team, corpse.facing, corpse.width, corpse.height,
+    corpse.x, corpse.y, corpse.koX, corpse.koY,
+  ], [enemy.id, enemy.kind, 1, enemy.facing, enemy.width, enemy.height,
+    enemy.x, state.arena.groundY, enemy.x, enemy.y]);
+  assert.equal(corpse.settleTick - corpse.bornTick, CORPSE_SETTLE_TICKS);
+  assert.equal(corpse.expireTick - corpse.settleTick, CORPSE_HOLD_TICKS);
+  const frozenTick = state.motionTick;
+  const frozenFrames = state.hitstop;
+  for (let frame = 0; frame < frozenFrames; frame++) stepCombat(state);
+  assert.equal(state.motionTick, frozenTick, 'hitstop cannot age the body');
+  assert.equal(state.corpses.length, 1);
+  while (state.motionTick < corpse.expireTick - 1) stepCombat(state);
+  assert.equal(state.corpses.length, 1);
+  stepCombat(state);
+  assert.equal(state.motionTick, corpse.expireTick);
+  assert.equal(state.corpses.length, 0, 'it expires without a second KO event');
+  assert.ok(!state.events.some((entry) => entry.type === 'ko' || entry.type === 'bones-scatter'));
+});
+
+test('walk-away and re-entry scatters once; an overhead jump or stationary landing does not', () => {
+  const state = sparring(342);
+  const [hero, enemy] = state.fighters;
+  enemy.hp = 1;
+  hero.attackStage = 1;
+  hero.attackTick = 4;
+  stepCombat(state);
+  const corpse = state.corpses[0];
+  assert.equal(corpse.wasInside, false, 'the killer begins in front of the fallen feet');
+  while (state.motionTick < corpse.settleTick) stepCombat(state, { hero: { left: true } });
+  assert.equal(state.corpses.length, 1);
+  assert.equal(corpse.wasInside, false, 'the player remains outside the body region');
+  const hp = hero.hp;
+  hero.x = corpse.x - 31;
+  hero.y = corpse.y - 90;
+  hero.vx = 0;
+  hero.vy = 0;
+  hero.grounded = false;
+  for (let frame = 0; frame < 8; frame++) {
+    stepCombat(state, { hero: { right: true } });
+    assert.ok(!state.events.some((entry) => entry.type === 'bones-scatter'));
+  }
+  assert.ok(hero.x > corpse.x - 20, 'the jump enters the silhouette horizontally');
+  assert.equal(corpse.wasInside, false, 'airborne overlap does not occupy the grounded body');
+  hero.y = corpse.y;
+  hero.vy = 0;
+  hero.vx = 0;
+  hero.grounded = true;
+  stepCombat(state);
+  assert.equal(state.corpses.length, 1, 'dropping vertically into an occupied region is not a walk-over');
+  assert.equal(corpse.wasInside, true, 'a stationary landing occupies the body until exit');
+  for (let frame = 0; frame < 24 && corpse.wasInside; frame++) {
+    stepCombat(state, { hero: { left: true } });
+  }
+  assert.equal(corpse.wasInside, false);
+  let scatters = [];
+  for (let frame = 0; frame < 50 && state.corpses.length; frame++) {
+    stepCombat(state, { hero: { right: true } });
+    scatters.push(...state.events.filter((entry) => entry.type === 'bones-scatter'));
+  }
+  assert.equal(state.corpses.length, 0);
+  assert.equal(scatters.length, 1);
+  assert.deepEqual({ target: scatters[0].target, x: scatters[0].x, y: scatters[0].y,
+    kind: scatters[0].kind, facing: scatters[0].facing,
+    width: scatters[0].width, height: scatters[0].height },
+  { target: enemy.id, x: corpse.x, y: corpse.y, kind: corpse.kind,
+    facing: corpse.facing, width: corpse.width, height: corpse.height });
+  assert.equal(hero.hp, hp);
+  for (let frame = 0; frame < 20; frame++) {
+    stepCombat(state, { hero: { left: true } });
+    assert.ok(!state.events.some((entry) => entry.type === 'bones-scatter'
+      || entry.type === 'ko'));
+  }
+});
+
+test('a corpse rides a drifting plank, but one on the ground cannot be scattered from above', () => {
+  const plank = { x: 400, y: 338, w: 140, h: 14, motion: 'float', axis: 'x',
+    baseX: 400, baseY: 338, amplitude: 32, period: 120 };
+  const hero = createFighter({ id: 'hero', x: 430, y: 338, team: 0 });
+  const enemy = createFighter({ id: 'enemy', x: 470, y: 338, team: 1, kind: 'grunt' });
+  enemy.hp = 1;
+  hero.attackStage = 1;
+  hero.attackTick = 4;
+  const state = createCombatState({ fighters: [hero, enemy], arena: arena({ platforms: [plank] }) });
+  stepCombat(state);
+  assert.equal(state.corpses.length, 1);
+  const corpse = state.corpses[0];
+  assert.equal(corpse.platformIndex, 0);
+  const startX = corpse.x;
+  while (state.motionTick < corpse.settleTick) stepCombat(state);
+  const pose = platformPose(plank, state.motionTick);
+  assert.ok(Math.abs(corpse.x - (pose.left + (pose.right - pose.left) * corpse.supportT)) < 1e-9);
+  assert.ok(corpse.x > startX, 'the corpse travels with its platform');
+  assert.equal(corpse.y, 338);
+  hero.x = corpse.x - 25;
+  hero.y = 238;
+  hero.vx = 0;
+  hero.vy = 0;
+  hero.grounded = false;
+  for (let frame = 0; frame < 6; frame++) {
+    stepCombat(state, { hero: { right: true } });
+    assert.ok(!state.events.some((entry) => entry.type === 'bones-scatter'));
+  }
+  assert.equal(state.corpses.length, 1);
+  hero.x = corpse.x - 50;
+  hero.y = corpse.y;
+  hero.vx = 0;
+  hero.vy = 0;
+  hero.grounded = true;
+  stepCombat(state);
+  assert.equal(corpse.wasInside, false);
+  let sharedPlankScatter = null;
+  for (let frame = 0; frame < 25 && !sharedPlankScatter; frame++) {
+    stepCombat(state, { hero: { right: true } });
+    sharedPlankScatter = state.events.find((entry) => entry.type === 'bones-scatter');
+  }
+  assert.ok(sharedPlankScatter, 'walking on the same translating plank reaches the body');
+
+  const ground = sparring(342);
+  ground.arena.platforms = [{ x: 280, y: 338, w: 140, h: 14 }];
+  ground.fighters[1].hp = 1;
+  ground.fighters[0].attackStage = 1;
+  ground.fighters[0].attackTick = 4;
+  stepCombat(ground);
+  const groundCorpse = ground.corpses[0];
+  assert.equal(groundCorpse.y, 438, 'an overhead plank cannot catch a ground KO');
+  while (ground.motionTick < groundCorpse.settleTick) stepCombat(ground);
+  const upperHero = ground.fighters[0];
+  upperHero.x = groundCorpse.x - 60;
+  upperHero.y = 338;
+  upperHero.vx = 0;
+  upperHero.vy = 0;
+  upperHero.grounded = true;
+  for (let frame = 0; frame < 14; frame++) {
+    stepCombat(ground, { hero: { right: true } });
+    assert.ok(!ground.events.some((entry) => entry.type === 'bones-scatter'));
+  }
+  assert.equal(ground.corpses.length, 1);
+});
+
+test('walk-over contact covers the rendered head and flips inward at a world edge', () => {
+  const ordinary = sparring(350);
+  ordinary.fighters[1].hp = 1;
+  ordinary.fighters[0].attackStage = 1;
+  ordinary.fighters[0].attackTick = 4;
+  stepCombat(ordinary);
+  const body = ordinary.corpses[0];
+  const walker = ordinary.fighters[0];
+  walker.x = body.x + 140;
+  walker.vx = 0;
+  while (ordinary.motionTick < body.settleTick) stepCombat(ordinary);
+  assert.equal(body.wasInside, false);
+  let headScatter = null;
+  for (let frame = 0; frame < 30 && !headScatter; frame++) {
+    stepCombat(ordinary, { hero: { left: true } });
+    headScatter = ordinary.events.find((entry) => entry.type === 'bones-scatter');
+  }
+  assert.ok(headScatter);
+  assert.ok(walker.x > body.x + 100, 'the visible head, not only the feet, is walkable');
+
+  const hero = createFighter({ id: 'hero', x: 1855, y: 438, team: 0 });
+  const enemy = createFighter({ id: 'edge-enemy', x: 1895, y: 438, team: 1, kind: 'grunt' });
+  enemy.hp = 1;
+  hero.attackStage = 1;
+  hero.attackTick = 4;
+  const edge = createCombatState({ fighters: [hero, enemy], arena: arena({ width: 1920 }) });
+  stepCombat(edge);
+  const flipped = edge.corpses[0];
+  hero.x = flipped.x - 150;
+  hero.vx = 0;
+  while (edge.motionTick < flipped.settleTick) stepCombat(edge);
+  let inwardScatter = null;
+  for (let frame = 0; frame < 30 && !inwardScatter; frame++) {
+    stepCombat(edge, { hero: { right: true } });
+    inwardScatter = edge.events.find((entry) => entry.type === 'bones-scatter');
+  }
+  assert.ok(inwardScatter);
+  assert.ok(hero.x < flipped.x - 90, 'the reversed head is inside the arena');
+});
+
+test('a grounded hero on a shallow overhead plank cannot scatter a ground corpse through it', () => {
+  const state = sparring(350);
+  state.arena.platforms = [{ x: 320, y: 420, w: 200, h: 14 }];
+  const [hero, enemy] = state.fighters;
+  enemy.hp = 1;
+  hero.attackStage = 1;
+  hero.attackTick = 4;
+  stepCombat(state);
+  const corpse = state.corpses[0];
+  assert.equal(corpse.platformIndex, null);
+  assert.equal(corpse.y - 420, 18, 'the plank is inside the former loose foot-height tolerance');
+  while (state.motionTick < corpse.settleTick) stepCombat(state);
+  hero.x = corpse.x + 140;
+  hero.y = 420;
+  hero.vx = 0;
+  hero.vy = 0;
+  hero.grounded = true;
+  stepCombat(state); // The player starts beyond the visible fallen head.
+  assert.equal(corpse.wasInside, false);
+  for (let frame = 0; frame < 15; frame++) {
+    stepCombat(state, { hero: { left: true } });
+    assert.equal(hero.grounded, true);
+    assert.ok(!state.events.some((entry) => entry.type === 'bones-scatter'));
+  }
+  assert.equal(corpse.wasInside, false, 'an upper-platform crossing does not consume a ground entry');
+  assert.equal(state.corpses.length, 1, 'close feet at different support levels do not count');
+
+  hero.x = corpse.x + 140;
+  hero.y = state.arena.groundY;
+  hero.vx = 0;
+  hero.vy = 0;
+  hero.grounded = true;
+  stepCombat(state);
+  assert.equal(corpse.wasInside, false);
+  let scatter = null;
+  for (let frame = 0; frame < 30 && !scatter; frame++) {
+    stepCombat(state, { hero: { left: true } });
+    scatter = state.events.find((entry) => entry.type === 'bones-scatter');
+  }
+  assert.ok(scatter, 'walking along the actual ground still scatters it');
+});
+
+test('an upper-stair overlap remains armed until a walking stair-to-ground transition', () => {
+  const state = sparring(350);
+  state.arena.platforms = [{ x: 400, y: 426, w: 140, h: 14 }];
+  const [hero, enemy] = state.fighters;
+  enemy.hp = 1;
+  hero.attackStage = 1;
+  hero.attackTick = 4;
+  stepCombat(state);
+  const corpse = state.corpses[0];
+  assert.equal(corpse.platformIndex, null);
+  while (state.motionTick < corpse.settleTick) stepCombat(state);
+  hero.x = 510;
+  hero.y = 426;
+  hero.vx = 0;
+  hero.vy = 0;
+  hero.grounded = true;
+  stepCombat(state);
+  assert.equal(corpse.wasInside, false);
+  let scatter = null;
+  let overlappedFromAbove = false;
+  for (let frame = 0; frame < 70 && !scatter; frame++) {
+    stepCombat(state, { hero: { left: true } });
+    if (hero.x < corpse.x + 105 && hero.y === 426) {
+      overlappedFromAbove = true;
+      assert.equal(corpse.wasInside, false, 'the stair crossing has not consumed ground entry');
+    }
+    scatter = state.events.find((entry) => entry.type === 'bones-scatter');
+  }
+  assert.equal(overlappedFromAbove, true);
+  assert.ok(scatter, 'the seamless grounded step down enters the ground corpse');
+  assert.equal(hero.y, state.arena.groundY);
+  assert.equal(state.corpses.length, 0);
+});
+
+test('an upper-stair overlap at the original KO does not disarm its later ground entry', () => {
+  const plank = { x: 400, y: 426, w: 140, h: 14 };
+  const hero = createFighter({ id: 'hero', team: 0, x: 410, y: 426 });
+  const enemy = createFighter({ id: 'enemy', team: 1, x: 350, y: 438, kind: 'grunt' });
+  hero.facing = -1;
+  hero.attackStage = 1;
+  hero.attackTick = 4;
+  enemy.hp = 1;
+  const state = createCombatState({ arena: arena({ platforms: [plank] }), fighters: [hero, enemy] });
+  stepCombat(state);
+  const corpse = state.corpses[0];
+  assert.ok(corpse);
+  assert.equal(corpse.platformIndex, null);
+  assert.ok(hero.x > corpse.x && hero.x < corpse.x + 105,
+    'the killer is horizontally inside the corpse at the KO');
+  assert.equal(corpse.wasInside, false, 'different supports cannot disarm at creation');
+  while (state.motionTick < corpse.settleTick) stepCombat(state);
+  let scatter = null;
+  for (let frame = 0; frame < 30 && !scatter; frame++) {
+    stepCombat(state, { hero: { left: true } });
+    scatter = state.events.find((entry) => entry.type === 'bones-scatter');
+  }
+  assert.equal(scatter?.target, enemy.id);
+  assert.equal(hero.y, state.arena.groundY);
+});
+
+test('walking into an unsettled body arms its same-support occupancy without a delayed scatter', () => {
+  const state = sparring(350);
+  const [hero, enemy] = state.fighters;
+  enemy.hp = 1;
+  hero.attackStage = 1;
+  hero.attackTick = 4;
+  stepCombat(state);
+  const corpse = state.corpses[0];
+  while (state.hitstop > 0) stepCombat(state);
+  hero.x = corpse.x + 127;
+  hero.vx = 0;
+  for (let frame = 0; frame < 8 && !corpse.wasInside; frame++) {
+    stepCombat(state, { hero: { left: true } });
+    assert.ok(!state.events.some((entry) => entry.type === 'bones-scatter'));
+  }
+  assert.ok(state.motionTick < corpse.settleTick);
+  assert.equal(corpse.wasInside, true);
+  while (state.motionTick < corpse.settleTick + 3) {
+    stepCombat(state);
+    assert.ok(!state.events.some((entry) => entry.type === 'bones-scatter'));
+  }
+  for (let frame = 0; frame < 25 && corpse.wasInside; frame++) {
+    stepCombat(state, { hero: { right: true } });
+  }
+  assert.equal(corpse.wasInside, false);
+  let scatter = null;
+  for (let frame = 0; frame < 25 && !scatter; frame++) {
+    stepCombat(state, { hero: { left: true } });
+    scatter = state.events.find((entry) => entry.type === 'bones-scatter');
+  }
+  assert.equal(scatter?.target, enemy.id);
+});
+
+test('a same-support overlap at KO requires leaving and re-entering after the settle', () => {
+  const state = sparring(350);
+  const [hero, enemy] = state.fighters;
+  hero.x = 390;
+  hero.facing = -1;
+  enemy.hp = 1;
+  hero.attackStage = 1;
+  hero.attackTick = 4;
+  stepCombat(state);
+  const corpse = state.corpses[0];
+  assert.equal(corpse.wasInside, true, 'the KO starts with the killer on the fallen body');
+  while (state.motionTick < corpse.settleTick + 4) {
+    stepCombat(state);
+    assert.ok(!state.events.some((entry) => entry.type === 'bones-scatter'));
+  }
+  assert.equal(corpse.wasInside, true);
+  for (let frame = 0; frame < 35 && corpse.wasInside; frame++) {
+    stepCombat(state, { hero: { left: true } });
+  }
+  assert.equal(corpse.wasInside, false);
+  let scatter = null;
+  for (let frame = 0; frame < 35 && !scatter; frame++) {
+    stepCombat(state, { hero: { right: true } });
+    scatter = state.events.find((entry) => entry.type === 'bones-scatter');
+  }
+  assert.equal(scatter?.target, enemy.id);
+});
+
+test('stunned and dodging crossings do not consume a later valid walk-over', () => {
+  for (const status of ['stun', 'dodgeTicks']) {
+    const state = sparring(350);
+    const [hero, enemy] = state.fighters;
+    enemy.hp = 1;
+    hero.attackStage = 1;
+    hero.attackTick = 4;
+    stepCombat(state);
+    const corpse = state.corpses[0];
+    while (state.motionTick < corpse.settleTick) stepCombat(state);
+    hero.x = corpse.x + 140;
+    hero.y = corpse.y;
+    hero.vx = 0;
+    hero.vy = 0;
+    hero.grounded = true;
+    stepCombat(state);
+    assert.equal(corpse.wasInside, false);
+    hero[status] = 12;
+    if (status === 'dodgeTicks') hero.facing = -1;
+    hero.vx = -8;
+    for (let frame = 0; frame < 4; frame++) {
+      stepCombat(state, { hero: { left: true } });
+      assert.ok(!state.events.some((entry) => entry.type === 'bones-scatter'));
+    }
+    assert.ok(hero.x < corpse.x + 125, `${status} crossed the head contact boundary`);
+    assert.equal(corpse.wasInside, false, `${status} cannot latch a valid walk-over`);
+    hero[status] = 0;
+    hero.x = corpse.x + 140;
+    hero.vx = 0;
+    stepCombat(state);
+    let scatter = null;
+    for (let frame = 0; frame < 30 && !scatter; frame++) {
+      stepCombat(state, { hero: { left: true } });
+      scatter = state.events.find((entry) => entry.type === 'bones-scatter');
+    }
+    assert.equal(scatter?.target, enemy.id, status);
+  }
+});
+
+test('walking along the same animated sloped plank scatters despite different foot y values', () => {
+  const plank = { x: 350, y: 338, w: 320, h: 14, motion: 'rotate',
+    baseX: 510, baseY: 338, baseAngle: 0.2, amplitude: 0.06, period: 120 };
+  const initial = platformPose(plank, 0);
+  const hero = createFighter({ id: 'hero', team: 0, x: 470,
+    y: platformSurfaceY(initial, 470) });
+  const enemy = createFighter({ id: 'enemy', team: 1, x: 510,
+    y: platformSurfaceY(initial, 510), kind: 'grunt' });
+  enemy.hp = 1;
+  hero.attackStage = 1;
+  hero.attackTick = 4;
+  const state = createCombatState({ fighters: [hero, enemy], arena: arena({ platforms: [plank] }) });
+  stepCombat(state);
+  const corpse = state.corpses[0];
+  assert.equal(corpse.platformIndex, 0);
+  while (state.motionTick < corpse.settleTick) stepCombat(state);
+  hero.x = corpse.x + 145;
+  hero.y = platformSurfaceY(platformPose(plank, state.motionTick), hero.x);
+  hero.vx = 0;
+  hero.vy = 0;
+  hero.grounded = true;
+  stepCombat(state);
+  assert.equal(corpse.wasInside, false);
+  let scatter = null;
+  for (let frame = 0; frame < 30 && !scatter; frame++) {
+    stepCombat(state, { hero: { left: true } });
+    scatter = state.events.find((entry) => entry.type === 'bones-scatter');
+  }
+  assert.ok(scatter);
+  assert.ok(Math.abs(hero.y - corpse.y) > 24,
+    'slope geometry, not a flat 24px foot difference, decides shared support');
+});
+
+test('PvP KOs never create campaign corpses or a post-fight walk phase', () => {
+  const duel = createDuelState();
+  const [first, second] = duel.fighters;
+  first.x = 300;
+  second.x = 340;
+  second.hp = 1;
+  first.attackStage = 1;
+  first.attackTick = 4;
+  stepCombat(duel);
+  assert.equal(duel.status, 'finished');
+  assert.equal(duel.corpses.length, 0);
+  assert.equal(duel.aftermath, false);
 });

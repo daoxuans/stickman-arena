@@ -1,8 +1,9 @@
-import { aiInput, createCombatState, createFighter, stepCombat } from '../shared/combat.js';
+import { aiInput, cancelSpearAim, createCombatState, createFighter, stepCombat } from '../shared/combat.js';
 import { MAX_LEVEL, checkpointFor, getLevel, isCheckpoint } from '../shared/levels.js';
 
 export const STORAGE_KEY = 'stickman-arena.campaign.v1';
 const SPECIAL_INVULNERABLE_TICKS = 36;
+const SCATTER_FINISH_TICKS = 36;
 
 const memoryValues = new Map();
 const memoryStorage = {
@@ -44,11 +45,26 @@ function validProgress(value) {
 
 function copyArena(level) {
   return {
-    theme: level.theme, groundY: level.groundY,
+    theme: level.theme, width: level.arena.width, groundY: level.groundY,
     platforms: level.platforms.map((platform) => ({ ...platform })),
     hazards: level.hazards.map((hazard) => ({ ...hazard })),
     fallingHazard: level.arena.fallingHazard ? { ...level.arena.fallingHazard } : null,
   };
+}
+
+function safeSpawnX(level, desired, playerX, occupied, direction) {
+  const width = level.arena.width ?? 960;
+  const clampX = (x) => Math.max(46, Math.min(width - 46, x));
+  for (let step = 0; step <= 20; step++) {
+    for (const side of step === 0 ? [0] : [direction, -direction]) {
+      const x = clampX(desired + side * step * 66);
+      if (Math.abs(x - playerX) < 190 || occupied.some((other) => Math.abs(other - x) < 58)) continue;
+      if (level.hazards.some((hazard) => x + 22 > hazard.x - 8
+        && x - 22 < hazard.x + hazard.w + 8)) continue;
+      return x;
+    }
+  }
+  return clampX(desired);
 }
 
 /** A local, fully deterministic campaign. Only the small progress record is saved. */
@@ -66,6 +82,7 @@ export class CampaignSession {
     this.specialKills = 0;
     this.specialCharges = 0;
     this.specialHeld = false;
+    this.aftermathUntilTick = null;
     this.#load();
   }
 
@@ -111,6 +128,7 @@ export class CampaignSession {
     this.specialKills = 0;
     this.specialCharges = 0;
     this.specialHeld = false;
+    this.aftermathUntilTick = null;
     this.phase = 'playing';
     const player = createFighter({
       id: 'hero', name: '火柴斗士', x: 170, y: level.groundY, team: 0, kind: 'hero', maxHp: 100,
@@ -127,19 +145,38 @@ export class CampaignSession {
     const level = getLevel(this.levelNumber);
     const wave = level.waves[this.waveIndex];
     const player = this.combat.fighters.find((fighter) => fighter.team === 0);
+    // A new wave is a fresh aiming situation; do not keep an old arc or a
+    // confirmed throw pointed at a fighter that no longer exists.
+    cancelSpearAim(player);
+    player.spearWindup = 0;
+    player.spearAimAngle = null;
+    player.spearLaunchFacing = null;
+    player.spearAimX = null;
+    player.spearAimY = null;
     const count = wave.groups.reduce((total, group) => total + group.count, 0);
-    const spawnOnRight = player.x < 490;
+    const width = this.combat.arena.width;
+    const spawnOnRight = player.x < width * 0.62;
+    const direction = spawnOnRight ? 1 : -1;
+    const baseX = this.waveIndex === 0 && width > 960
+      ? width * 0.78 : width <= 960
+        ? (spawnOnRight ? 710 : 250)
+        : player.x + direction * 480;
     this.combat.fighters = this.combat.fighters.filter((fighter) => fighter.team === 0 || fighter.hp > 0);
+    this.combat.projectiles = [];
     let serial = 0;
+    const occupied = [];
 
     for (const group of wave.groups) {
       for (let index = 0; index < group.count; index++) {
-        const distance = count === 1 ? 0 : serial * 70;
-        const x = spawnOnRight ? 710 + distance : 250 - distance;
+        const distance = count === 1 ? 0 : serial * (width > 960 ? 84 : 70);
+        const x = safeSpawnX(level, baseX + direction * distance, player.x, occupied, direction);
+        occupied.push(x);
         this.combat.fighters.push(createFighter({
           id: `enemy-${level.number}-${wave.index}-${serial}`,
           name: group.name, kind: group.kind, team: 1,
           x, y: level.groundY, maxHp: group.maxHp, damageScale: group.damageScale,
+          spearEnabled: level.number >= 15 && group.kind !== 'boss'
+            && serial === 0 && (level.number + wave.index) % 2 === 0,
         }));
         serial++;
       }
@@ -159,6 +196,12 @@ export class CampaignSession {
     player.attackTick = 0;
     player.kickType = null;
     player.kickTick = 0;
+    cancelSpearAim(player);
+    player.spearWindup = 0;
+    player.spearAimAngle = null;
+    player.spearLaunchFacing = null;
+    player.spearAimX = null;
+    player.spearAimY = null;
     player.attackBuffered = false;
     player.comboWindow = 0;
     player.dodgeTicks = 0;
@@ -175,6 +218,9 @@ export class CampaignSession {
       target.attackTick = 0;
       target.kickType = null;
       target.kickTick = 0;
+      target.spearWindup = 0;
+      target.spearAimX = null;
+      target.spearAimY = null;
       target.attackBuffered = false;
       target.comboWindow = 0;
       const direction = Math.sign(target.x - player.x) || player.facing;
@@ -186,12 +232,68 @@ export class CampaignSession {
     return { x: player.x, y: player.y - player.height * .52, hits };
   }
 
+  #beginAftermath(player) {
+    this.phase = 'aftermath';
+    this.combat.aftermath = true;
+    this.aftermathUntilTick = Math.max(this.combat.motionTick,
+      ...this.combat.corpses.map((corpse) => corpse.expireTick));
+    this.combat.projectiles = [];
+    this.combat.fallingObject = null;
+    cancelSpearAim(player);
+    // The finishing hit remains in the event stream (and its hitstop stays),
+    // but no buffered combo, kick or dodge can start another active move while
+    // the player is only meant to walk/jump through the victory aftermath.
+    player.attackStage = 0;
+    player.attackTick = 0;
+    player.attackBuffered = false;
+    player.comboStage = 0;
+    player.comboWindow = 0;
+    player.kickType = null;
+    player.kickTick = 0;
+    player.dodgeTicks = 0;
+    player.jumpBuffer = 0;
+    for (const fighter of this.combat.fighters) {
+      fighter.spearWindup = 0;
+      fighter.spearLaunchFacing = null;
+    }
+  }
+
+  #completeLevel() {
+    const level = getLevel(this.levelNumber);
+    if (!this.progress.cleared.includes(level.number)) this.progress.cleared.push(level.number);
+    this.progress.cleared.sort((a, b) => a - b);
+    this.progress.completed = level.number === MAX_LEVEL;
+    if (!this.progress.completed) this.progress.currentLevel = level.number + 1;
+    this.phase = this.progress.completed ? 'completed' : 'cleared';
+    this.combat.aftermath = false;
+    this.aftermathUntilTick = null;
+    this.combat.events.push({
+      id: `${this.combat.tick}:level-clear`, type: 'level-clear', level: level.number,
+    });
+    this.#save();
+  }
+
   /** Advance one fixed 1/60-second tick. The light wave is campaign-only. */
   step(input = {}) {
-    if (this.phase !== 'playing') return this.snapshot();
+    if (this.phase !== 'playing' && this.phase !== 'aftermath') return this.snapshot();
     const player = this.combat.fighters.find((fighter) => fighter.team === 0);
+    if (this.phase === 'aftermath') {
+      const beforeTick = this.combat.motionTick;
+      stepCombat(this.combat, { [player.id]: {
+        left: input.left === true, right: input.right === true, jump: input.jump === true,
+      } });
+      if (this.combat.motionTick > beforeTick && player.specialWaveTicks > 0) {
+        player.specialWaveTicks--;
+      }
+      if (this.combat.events.some((outcome) => outcome.type === 'bones-scatter')) {
+        this.aftermathUntilTick = Math.max(this.aftermathUntilTick,
+          this.combat.motionTick + SCATTER_FINISH_TICKS);
+      }
+      if (this.combat.motionTick >= this.aftermathUntilTick) this.#completeLevel();
+      return this.snapshot();
+    }
     // Hitstop does not sample actions. The browser retains short taps until
-    // the next live tick, so a held button must not spend charges while frozen.
+    // the next live tick, so an edge-triggered action is not lost while frozen.
     const samplingInput = this.combat.hitstop === 0;
     const specialDown = input.special === true;
     const special = samplingInput && specialDown && !this.specialHeld
@@ -199,7 +301,7 @@ export class CampaignSession {
       ? this.#castSpecial(player) : null;
     if (samplingInput) this.specialHeld = specialDown;
     const inputsById = { [player.id]: special
-      ? { ...input, attack: false, kick: false, dodge: false } : input };
+      ? { ...input, attack: false, kick: false, dodge: false, spear: false } : input };
     for (const enemy of this.combat.fighters) {
       if (enemy.team === 1 && enemy.hp > 0) inputsById[enemy.id] = aiInput(enemy, player, this.combat);
     }
@@ -208,7 +310,7 @@ export class CampaignSession {
     if (special) {
       this.combat.events.push({
         id: `${this.combat.tick}:special-wave`, type: 'special-wave',
-        x: special.x, y: special.y, source: player.id, radius: 960,
+        x: special.x, y: special.y, source: player.id, radius: this.combat.arena.width,
       });
       for (const hit of special.hits) {
         this.combat.events.push({
@@ -231,7 +333,6 @@ export class CampaignSession {
         }
       }
     }
-
     // Failure takes precedence even if the last blow knocked both sides out.
     if (player.hp <= 0) {
       this.failedLevel = this.levelNumber;
@@ -251,17 +352,10 @@ export class CampaignSession {
         this.waveIndex++;
         player.hp = Math.min(player.maxHp, player.hp + (bossEntering ? 30 : 12));
         this.#spawnWave();
-      } else {
-        if (!this.progress.cleared.includes(level.number)) this.progress.cleared.push(level.number);
-        this.progress.cleared.sort((a, b) => a - b);
-        this.progress.completed = level.number === MAX_LEVEL;
-        if (!this.progress.completed) this.progress.currentLevel = level.number + 1;
-        this.phase = this.progress.completed ? 'completed' : 'cleared';
-        this.combat.events.push({
-          id: `${this.combat.tick}:level-clear`, type: 'level-clear', level: level.number,
-        });
-        this.#save();
-      }
+      } else if (this.combat.events.some((outcome) => outcome.type === 'ko'
+        && this.combat.fighters.some((fighter) => fighter.id === outcome.target && fighter.team === 1))) {
+        this.#beginAftermath(player);
+      } else this.#completeLevel();
     }
     return this.snapshot();
   }
@@ -297,6 +391,8 @@ export class CampaignSession {
       specialEligible: this.specialEligible,
       specialKills: this.specialKills,
       specialCharges: this.specialCharges,
+      aftermathRemainingTicks: this.phase === 'aftermath'
+        ? Math.max(0, this.aftermathUntilTick - this.combat.motionTick) : 0,
       progress: { ...this.progress, cleared: [...this.progress.cleared] },
     };
   }

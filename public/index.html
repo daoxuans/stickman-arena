@@ -91,7 +91,8 @@
         <div class="arena-tail">
           <div class="checkpoint-status"><span class="checkpoint-diamond" aria-hidden="true"></span><span id="checkpoint-label">最近存档 · 第 01 关</span><span class="tail-separator" aria-hidden="true"></span><span id="progress-label">征途 01 / 56</span></div>
           <span id="special-status" class="special-status" role="status" aria-live="polite" hidden>光波充能</span>
-          <div class="keyboard-guide" aria-label="键盘操作说明"><span><kbd>A</kbd><kbd>D</kbd> 移动</span><span><kbd>J</kbd> 攻击</span><span><kbd>K</kbd> 踢腿 / 空中跳踢</span><span><kbd>SPACE</kbd> 跳跃</span><span><kbd>SHIFT</kbd> 闪避</span><span id="special-key-guide" hidden><kbd>L</kbd> 光波</span></div>
+          <span id="spear-status" class="spear-status" role="status" aria-live="polite" hidden>投矛不限次数 · 按 I 瞄准，再按 I 发射</span>
+          <div class="keyboard-guide" aria-label="键盘操作说明"><span><kbd>A</kbd><kbd>D</kbd> 移动</span><span><kbd>J</kbd> 攻击</span><span><kbd>K</kbd> 踢腿 / 空中跳踢</span><span><kbd>SPACE</kbd> 跳跃</span><span><kbd>SHIFT</kbd> 闪避</span><span id="spear-key-guide" hidden><kbd>I</kbd> 瞄准/发射 <kbd>↑</kbd><kbd>↓</kbd> 调角</span><span id="special-key-guide" hidden><kbd>L</kbd> 光波</span></div>
         </div>
 
         <div class="touch-controls" aria-label="触控操作">
@@ -104,9 +105,16 @@
             <button class="touch-key touch-key--jump" data-key="jump" type="button">跳跃</button>
             <button class="touch-key touch-key--kick" data-key="kick" type="button" aria-label="踢腿，空中使用可释放跳踢大招">踢腿</button>
             <button class="touch-key touch-key--attack" data-key="attack" type="button">攻击</button>
+            <button id="spear-button" class="touch-key touch-key--spear" data-key="spear" type="button" aria-label="投矛" disabled hidden>投矛</button>
             <button id="special-button" class="touch-key touch-key--special" data-key="special" type="button" aria-label="无敌光波" disabled hidden>光波</button>
           </div>
-          <span class="touch-tip">空中按「踢腿」释放跳踢大招</span>
+          <div id="spear-aim-controls" class="spear-aim-controls" aria-label="投矛仰角调节" hidden>
+            <span id="spear-angle" class="spear-angle" aria-live="off">仰角 42°</span>
+            <button id="aim-up-button" class="touch-key touch-key--aim" data-key="aimUp" type="button" aria-label="抬高投矛仰角，按住连续调整">抬高</button>
+            <button id="aim-down-button" class="touch-key touch-key--aim" data-key="aimDown" type="button" aria-label="压低投矛仰角，按住连续调整">压低</button>
+            <button id="aim-cancel-button" class="touch-key touch-key--aim-cancel" data-key="aimCancel" type="button" aria-label="取消投矛瞄准">取消</button>
+          </div>
+          <span id="touch-tip" class="touch-tip">空中按「踢腿」释放跳踢大招 · 投矛先瞄准、再发射</span>
         </div>
       </section>
 

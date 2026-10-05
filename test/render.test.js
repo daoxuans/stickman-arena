@@ -1,6 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { attackOf } from '../shared/combat.js';
+import { attackOf, spearAimedFlight, spearOrigin, spearTrajectoryPoint } from '../shared/combat.js';
+import { platformPose } from '../shared/platforms.js';
 import { createRenderer } from '../public/render.js';
 
 const ATTACK_WINDOWS = [
@@ -12,10 +13,28 @@ const ATTACK_WINDOWS = [
   { kind: 'boss', stage: 3, from: 16, to: 22 },
 ];
 
+const SHADOW_WANDERER = {
+  head: '#08151b',
+  limbCore: '#35454b',
+  hatOutline: '#081219',
+  hatCrown: '#1c2932',
+  hatRim: '#4db2bd',
+  hatWeave: '#567e8d',
+  p1: { capeEdge: '#632029', cape: '#c73642', scarf: '#b62236',
+    eye: '#fff9f2', eyeAccent: '#ff555a' },
+  p2: { capeEdge: '#14394b', cape: '#23758b', scarf: '#287f98',
+    eye: '#e9feff', eyeAccent: '#7be8f1' },
+};
+
 function recordingCanvas() {
   const fills = [];
   const strokes = [];
+  const rects = [];
+  const images = [];
+  const rotations = [];
+  const labels = [];
   const stack = [];
+  let drawOrder = 0;
   let drawing = {
     scaleX: 1, offsetX: 0, offsetY: 0,
     fillStyle: '', strokeStyle: '', lineWidth: 1, globalAlpha: 1,
@@ -30,6 +49,15 @@ function recordingCanvas() {
     setTransform(x) { drawing.scaleX = x; drawing.offsetX = 0; drawing.offsetY = 0; },
     scale(x) { drawing.scaleX *= x; },
     translate(x, y) { drawing.offsetX += x * drawing.scaleX; drawing.offsetY += y; },
+    rotate(angle) { rotations.push({ angle, originX: drawing.offsetX, originY: drawing.offsetY }); },
+    fillRect(x, y, w, h) {
+      rects.push({ x, y, w, h, color: drawing.fillStyle,
+        originX: drawing.offsetX, originY: drawing.offsetY, scaleX: drawing.scaleX });
+    },
+    drawImage(_image, ...args) {
+      images.push({ args, originX: drawing.offsetX, scaleX: drawing.scaleX });
+    },
+    fillText(value, x, y) { labels.push({ value, x, y, originX: drawing.offsetX }); },
     beginPath() { path = []; },
     moveTo(x, y) { path.push([x, y]); },
     lineTo(x, y) { path.push([x, y]); },
@@ -41,9 +69,11 @@ function recordingCanvas() {
     fill() {
       fills.push({ color: drawing.fillStyle, scaleX: drawing.scaleX,
         originX: drawing.offsetX, originY: drawing.offsetY,
-        points: [...path], alpha: drawing.globalAlpha });
+        points: [...path], alpha: drawing.globalAlpha, order: drawOrder++ });
     },
-    stroke() { strokes.push({ color: drawing.strokeStyle, width: drawing.lineWidth, scaleX: drawing.scaleX, points: [...path] }); },
+    stroke() { strokes.push({ color: drawing.strokeStyle, width: drawing.lineWidth,
+      scaleX: drawing.scaleX, originX: drawing.offsetX, originY: drawing.offsetY,
+      points: [...path], order: drawOrder++ }); },
   }, {
     get(target, key) {
       if (key in target) return target[key];
@@ -53,7 +83,7 @@ function recordingCanvas() {
     set(_target, key, value) { drawing[key] = value; return true; },
   });
   const canvas = { width: 960, height: 540, getContext: () => context };
-  return { canvas, fills, strokes };
+  return { canvas, fills, strokes, rects, images, rotations, labels };
 }
 
 function recordingRenderer(reducedMotion = false) {
@@ -99,6 +129,543 @@ function kicker(type, kickTick, facing = 1, kind = 'hero') {
   return { ...fighter(kind, 0, 0, facing), kickType: type, kickTick,
     y: type === 'air' ? 350 : 430, grounded: type !== 'air' };
 }
+
+function mouth(strokes, outline) {
+  return strokes.find(({ color, width, points }) => color === outline && width === 2.8
+    && points[1]?.kind === 'bezier');
+}
+
+function mouthCurve(stroke) {
+  assert.ok(stroke, 'a result or punch expression has a readable mouth');
+  return stroke.points[1].cy1 - stroke.points[0][1];
+}
+
+function renderResult(fighters, meta = {}, state = {}) {
+  const recording = recordingRenderer();
+  recording.renderer.render({ tick: 40,
+    arena: { theme: 'land', groundY: 430, platforms: [], hazards: [] },
+    fighters, ...state }, meta);
+  return recording;
+}
+
+test('a decided duel smiles for the victor and frowns with KO eyes for the loser', () => {
+  const hero = { ...fighter('hero', 0, 0), id: 'hero', team: 0 };
+  const opponent = { ...fighter('grunt', 0, 0, -1), id: 'opponent', x: 600, hp: 0, team: 1 };
+  const { fills, strokes } = renderResult([hero, opponent], { mode: 'duel' },
+    { status: 'finished', winner: 'hero' });
+  assert.ok(mouthCurve(mouth(strokes, SHADOW_WANDERER.p1.eye)) > 0,
+    'the shadow-faced victor keeps a readable bright smile');
+  assert.ok(mouthCurve(mouth(strokes, '#663f41')) < 0, 'loser gets a downturned mouth');
+  assert.ok(fills.filter(({ color }) => color === SHADOW_WANDERER.p1.eye).length >= 2,
+    'the winner retains both luminous eyes below the hat');
+  assert.equal(strokes.filter(({ color, width, points }) => color === '#663f41'
+    && width === 2.2 && points.length === 2).length, 4,
+  'the fallen fighter retains both crossed-out eyes');
+  assert.ok(fills.some(({ color }) => color === '#8dbec1'), 'the loss has a single tear');
+});
+
+test('campaign results affect the hero while a living opponent keeps a neutral face', () => {
+  const hero = { ...fighter('hero', 0, 0), id: 'hero', team: 0 };
+  const enemy = { ...fighter('grunt', 0, 0), id: 'enemy', team: 1, x: 600 };
+  for (const phase of ['cleared', 'completed']) {
+    const { strokes } = renderResult([hero, enemy], { mode: 'campaign', campaignPhase: phase });
+    assert.ok(mouthCurve(mouth(strokes, SHADOW_WANDERER.p1.eye)) > 0,
+      `${phase} makes the hero happy despite the shaded face`);
+    assert.equal(mouth(strokes, '#663f41'), undefined, 'a surviving enemy does not celebrate');
+  }
+  const failed = renderResult([hero, enemy], { mode: 'campaign', campaignPhase: 'failed' });
+  assert.ok(mouthCurve(mouth(failed.strokes, SHADOW_WANDERER.p1.eye)) < 0,
+    'retry screen makes the hero sad');
+  assert.equal(mouth(failed.strokes, '#663f41'), undefined);
+  assert.ok(failed.fills.some(({ color }) => color === '#8dbec1'), 'failure has a visible tear');
+});
+
+test('all combo punch stages show effort; KO overrides victory and effort', () => {
+  for (const stage of [1, 2, 3]) {
+    const combatant = { ...fighter('hero', stage, 3), id: 'hero', team: 0 };
+    const { fills, strokes } = renderResult([combatant], { mode: 'campaign', campaignPhase: 'playing' });
+    assert.equal(mouthCurve(mouth(strokes, SHADOW_WANDERER.p1.eye)), 0,
+      `combo ${stage} clenches a flat effort mouth throughout the attack`);
+    assert.ok(fills.some(({ color }) => color === '#fff6e5'), 'clenched teeth sharpen the punch effort');
+  }
+  const resting = renderResult([{ ...fighter('hero', 0, 0), id: 'hero', team: 0 }],
+    { mode: 'campaign', campaignPhase: 'playing' });
+  assert.equal(mouth(resting.strokes, SHADOW_WANDERER.p1.eye), undefined,
+    'resting restores the neutral face');
+  assert.ok(!resting.fills.some(({ color }) => color === '#fff6e5'));
+
+  const knockedOut = { ...fighter('hero', 3, 9), id: 'hero', team: 0, hp: 0 };
+  const { fills, strokes } = renderResult([knockedOut],
+    { mode: 'campaign', campaignPhase: 'cleared' });
+  assert.ok(mouthCurve(mouth(strokes, SHADOW_WANDERER.p1.eye)) < 0,
+    'KO is sad even during a victory overlay');
+  assert.equal(strokes.filter(({ color, width, points }) =>
+    color === SHADOW_WANDERER.p1.eye && width === 2.2 && points.length === 2).length, 2,
+  'two pale KO eye slashes remain readable against the dark face');
+  assert.equal(strokes.filter(({ color, width, points }) =>
+    color === SHADOW_WANDERER.p1.eyeAccent && width === 2.2 && points.length === 2).length, 2,
+  'the crossed eyes retain the warm shadow-glow accents');
+  assert.ok(!fills.some(({ color }) => color === '#fff6e5'), 'KO never shows an effort grimace');
+});
+
+test('the cool-coloured second player celebrates without borrowing P1 red highlights', () => {
+  const red = { ...fighter('hero', 0, 0), id: 'p1', team: 0, x: 330, hp: 0 };
+  const blue = { ...fighter('hero', 0, 0, -1), id: 'p2', team: 1, x: 630 };
+  const { fills, strokes } = renderResult([red, blue], { mode: 'duel' },
+    { status: 'finished', winner: 'p2' });
+  assert.ok(mouthCurve(mouth(strokes, SHADOW_WANDERER.p2.eye)) > 0,
+    'P2 shows a blue-white smile when victorious');
+  assert.ok(mouthCurve(mouth(strokes, SHADOW_WANDERER.p1.eye)) < 0,
+    'the defeated P1 still looks sad');
+  assert.ok(fills.some(({ color, scaleX }) => color === SHADOW_WANDERER.p2.eye
+    && scaleX === -1), 'the winner has mirrored luminous eyes');
+});
+
+test('boss and reduced-motion settings preserve readable facial expressions', () => {
+  const boss = { ...fighter('boss', 2, 15, -1), id: 'boss', x: 650 };
+  const normal = renderFighters([boss]);
+  const reduced = renderFighters([boss], { reducedMotion: true });
+  for (const { strokes } of [normal, reduced]) {
+    const expression = mouth(strokes, '#482d34');
+    assert.equal(mouthCurve(expression), 0);
+    assert.equal(expression.scaleX, -1.28, 'the enlarged boss expression mirrors with the head');
+  }
+});
+
+function scrollingState(playerX, extras = {}) {
+  return { tick: 40,
+    arena: { theme: 'land', width: 1920, groundY: 430, platforms: [], hazards: [] },
+    fighters: [{ ...fighter('hero', 0, 0), id: 'hero', team: 0,
+      x: playerX, height: 88, width: 29 }], ...extras };
+}
+
+function corpseRecord(id = 'enemy', extras = {}) {
+  return { id, kind: 'grunt', team: 1, facing: 1, width: 29, height: 88,
+    x: 620, y: 430, koX: 620, koY: 430,
+    bornTick: 40, settleTick: 67, expireTick: 247, ...extras };
+}
+
+function heroHead(fills) {
+  return fills.find(({ color, points }) => color === SHADOW_WANDERER.head
+    && points.some((point) => point.kind === 'arc' && point.radius === 22));
+}
+
+function capeShape(fills, color = SHADOW_WANDERER.p1.capeEdge) {
+  const cape = fills.find((fill) => fill.color === color);
+  assert.ok(cape, 'the wanderer has an outlined cape');
+  assert.equal(cape.points[1]?.kind, 'bezier');
+  return {
+    cape,
+    tailX: cape.points[1].x - cape.points[0][0],
+    tailY: cape.points[1].y - cape.points[0][1],
+  };
+}
+
+test('only human heroes wear the ragged dark conical hat, red scarf and trailing cloak', () => {
+  const kinds = ['grunt', 'runner', 'guard', 'brute', 'boss'];
+  const campaign = renderResult([
+    { ...fighter('hero', 0, 0), id: 'hero', team: 0, x: 140 },
+    ...kinds.map((kind, index) => ({ ...fighter(kind, 0, 0), id: kind,
+      team: 1, x: 290 + index * 120 })),
+  ], { mode: 'campaign' });
+  assert.equal(campaign.fills.filter(({ color }) => color === SHADOW_WANDERER.p1.capeEdge).length, 1);
+  assert.equal(campaign.fills.filter(({ color }) => color === SHADOW_WANDERER.p1.cape).length, 1);
+  assert.ok(campaign.fills.some(({ color }) => color === SHADOW_WANDERER.p1.scarf),
+    'a scarlet scarf distinguishes the reference-inspired shadow wanderer');
+  const hatOutline = campaign.fills.find(({ color }) => color === SHADOW_WANDERER.hatOutline);
+  const crown = campaign.fills.find(({ color }) => color === SHADOW_WANDERER.hatCrown);
+  assert.ok(hatOutline && crown, 'one dark hat is exclusive to the human hero');
+  assert.equal(campaign.fills.filter(({ color }) => color === SHADOW_WANDERER.hatOutline).length, 1,
+    'the dark conical hat never appears on ordinary enemies or the Boss');
+  assert.ok(hatOutline.points.filter(Array.isArray).length >= 8,
+    'uneven notches keep the brim from reading as the old smooth straw disk');
+  const head = heroHead(campaign.fills).points.find((point) => point.kind === 'arc');
+  assert.ok(hatOutline.points.filter(Array.isArray).every(([, y]) => y < head.y - 7),
+    'the wide dark brim remains above the eyes and emotional mouth');
+  assert.ok(campaign.strokes.some(({ color }) => color === SHADOW_WANDERER.hatWeave),
+    'restrained cool-toned hat texture remains readable');
+  assert.ok(campaign.strokes.some(({ color }) => color === SHADOW_WANDERER.hatRim),
+    'the hat separates from the dark silhouette with a cool rim light');
+  assert.ok(campaign.strokes.some(({ color, width }) =>
+    color === SHADOW_WANDERER.hatRim && width === 1.05),
+  'a hairline cool accent also makes the slender torso distinct from dark backdrops');
+  assert.ok(!campaign.fills.some(({ color }) => color === '#e2c487' || color === '#d8b47d'),
+    'the old pale straw hat does not return');
+  assert.ok(campaign.fills.some(({ color }) => color === '#663f41')
+    && campaign.fills.some(({ color }) => color === '#482d34'),
+  'ordinary enemies and the Boss keep their former head palettes');
+  const duel = renderResult([
+    { ...fighter('hero', 0, 0, 1), id: 'p1', team: 0, x: 330 },
+    { ...fighter('hero', 0, 0, -1), id: 'p2', team: 1, x: 630 },
+  ], { mode: 'duel' });
+  assert.equal(duel.fills.filter(({ color }) => color === SHADOW_WANDERER.hatOutline).length, 2);
+  assert.ok(duel.fills.some(({ color }) => color === SHADOW_WANDERER.p1.scarf),
+    'P1 remains scarlet');
+  assert.ok(duel.fills.some(({ color }) => color === SHADOW_WANDERER.p2.scarf),
+    'P2 uses a cool cyan scarf rather than merging with P1');
+  for (const palette of [SHADOW_WANDERER.p1, SHADOW_WANDERER.p2]) {
+    assert.ok(duel.fills.filter(({ color }) => color === palette.eye).length >= 2,
+      'both teams retain a pair of bright eyes');
+    assert.ok(duel.fills.some(({ color }) => color === palette.eyeAccent),
+      'each eye keeps a team-coloured glow against the dark face');
+  }
+  assert.equal(capeShape(duel.fills).cape.scaleX, 1);
+  assert.equal(capeShape(duel.fills, SHADOW_WANDERER.p2.capeEdge).cape.scaleX, -1,
+    'the P2 cloak mirrors the player while keeping a distinct blue palette');
+  assert.equal(duel.fills.filter(({ color }) => color === SHADOW_WANDERER.p2.cape).length, 1,
+    'P2 receives its own cool inner cloak panel');
+  assert.deepEqual(duel.fills.filter(({ color }) => color === SHADOW_WANDERER.hatOutline)
+    .map(({ scaleX }) => scaleX), [1, -1], 'the irregular hat also mirrors with each facing');
+});
+
+test('cape trails actual travel, lifts on ascent, and settles without flutter under reduced motion', () => {
+  const base = { ...fighter('hero', 0, 0), id: 'hero', team: 0, vx: 0, vy: 0 };
+  const idle = capeShape(renderFighters([base]).fills);
+  const forward = capeShape(renderFighters([{ ...base, vx: 5 }]).fills);
+  const backward = capeShape(renderFighters([{ ...base, vx: -5 }]).fills);
+  const mirrored = capeShape(renderFighters([{ ...base, facing: -1, vx: -5 }]).fills);
+  const ascending = capeShape(renderFighters([{
+    ...base, vx: 5, vy: -8, y: 350, grounded: false,
+  }]).fills);
+  const descending = capeShape(renderFighters([{
+    ...base, vx: 5, vy: 8, y: 350, grounded: false,
+  }]).fills);
+  assert.ok(forward.tailX < idle.tailX - 8, 'forward momentum pulls the hem behind');
+  assert.ok(backward.tailX > idle.tailX + 8, 'backward travel reverses the tail');
+  assert.ok(Math.abs(mirrored.tailX - forward.tailX) < .01,
+    'equal forward speed uses the same local cape geometry for either facing');
+  assert.equal(mirrored.cape.scaleX, -1, 'the whole costume mirrors with facing');
+  assert.ok(ascending.tailY < forward.tailY - 4, 'jumping lifts the hem without detaching it');
+  assert.ok(ascending.tailY < descending.tailY - 4,
+    'the cloak hangs back down while the fighter descends');
+  const stillCalm = capeShape(renderFighters([base], { reducedMotion: true }).fills);
+  const movingCalm = capeShape(renderFighters([{
+    ...base, vx: 5, vy: -8, y: 350, grounded: false,
+  }], { reducedMotion: true }).fills);
+  assert.equal(movingCalm.tailX, stillCalm.tailX,
+    'reduced motion does not sweep the cape with travel speed');
+  assert.equal(movingCalm.tailY, stillCalm.tailY,
+    'reduced motion does not add an airborne flutter or lift');
+  const atTick = (fighterAtTick, tick, reducedMotion) => {
+    const recording = recordingRenderer(reducedMotion);
+    renderFrame(recording.renderer, [fighterAtTick], tick);
+    return capeShape(recording.fills);
+  };
+  assert.notEqual(atTick({ ...base, vx: 5 }, 46, false).tailX, forward.tailX,
+    'moving cloth subtly changes shape across authoritative simulation ticks');
+  const laterCalm = atTick({ ...base, vx: 5 }, 46, true);
+  assert.deepEqual([laterCalm.tailX, laterCalm.tailY],
+    [stillCalm.tailX, stillCalm.tailY],
+    'reduced-motion cloth stays static relative to the shoulders across ticks');
+});
+
+test('KO tips the dark hat and red cloak while the tomato lands over the scarf and crown', () => {
+  withClock((advance) => {
+    const recording = recordingRenderer();
+    const hero = { ...fighter('hero', 0, 0), id: 'hero', team: 0 };
+    renderFrame(recording.renderer, [hero], 39);
+    recording.renderer.effect({ id: '40:wanderer-ko', type: 'ko', target: 'hero',
+      x: hero.x, y: hero.y - 40 });
+    advance(600);
+    const before = recording.fills.length;
+    renderFrame(recording.renderer, [{ ...hero, hp: 0 }], 40);
+    const frame = recording.fills.slice(before);
+    const cape = capeShape(frame).cape;
+    const head = heroHead(frame);
+    const hat = frame.find(({ color }) => color === SHADOW_WANDERER.hatCrown);
+    const scarf = frame.find(({ color }) => color === SHADOW_WANDERER.p1.scarf);
+    const stain = frame.find(({ color }) => color === '#b14938');
+    assert.ok(head && hat && scarf && stain,
+      'KO retains the large shadow head, costume and visible splat');
+    assert.ok(cape.order < head.order && head.order < hat.order && hat.order < stain.order,
+      'cloth stays behind the stick figure and the splat paints over the hat');
+    assert.ok(scarf.order < stain.order, 'the impact remains visible above the red scarf');
+    assert.ok(recording.rotations.some(({ angle, originX }) =>
+      Math.abs(angle + Math.PI * .46) < .001 && originX === hero.x),
+    'the existing KO body transform rotates hat and cape together');
+  });
+});
+
+test('campaign camera follows within 1920px, keeps the hero visible, and leaves HUD fixed', () => {
+  withClock((advance) => {
+    const { renderer, fills, labels } = recordingRenderer();
+    const meta = { mode: 'campaign', theme: 'land', level: 43 };
+    renderer.render(scrollingState(90), meta);
+    assert.equal(heroHead(fills)?.originX, 90, 'left origin shows the first world segment');
+    fills.length = 0;
+    advance(16);
+    renderer.render(scrollingState(1200, { tick: 41 }), meta);
+    const firstFollow = heroHead(fills)?.originX;
+    assert.ok(firstFollow > 480 && firstFollow <= 800,
+      'the camera eases after a large move but does not let the player leave the frame');
+    for (let tick = 42; tick < 72; tick++) {
+      advance(16);
+      fills.length = 0;
+      renderer.render(scrollingState(1200, { tick }), meta);
+    }
+    assert.ok(Math.abs(heroHead(fills).originX - 480) < 4, 'the player settles near viewport centre');
+    assert.equal(labels.at(-1)?.originX, 0, 'scene label is screen-anchored, not in world space');
+
+    const reduced = recordingRenderer(true);
+    reduced.renderer.render(scrollingState(1200), meta);
+    assert.equal(heroHead(reduced.fills)?.originX, 480,
+      'reduced motion follows immediately without camera easing');
+    reduced.fills.length = 0;
+    reduced.renderer.render(scrollingState(1900, { tick: 41 }), meta);
+    assert.equal(heroHead(reduced.fills)?.originX, 940, 'right camera edge clamps to 960');
+
+    const duel = recordingRenderer();
+    duel.renderer.render({ ...scrollingState(1200), arena: { theme: 'land', groundY: 430, width: 960 } },
+      { mode: 'duel', theme: 'land' });
+    assert.equal(heroHead(duel.fills)?.originX, 1200,
+      'online duel has no scrolling camera and retains its 960px world');
+  });
+});
+
+test('the first-stage photo remains original on the left and mirrors at the second panel', () => {
+  const previousImage = globalThis.Image;
+  const hadImage = Object.hasOwn(globalThis, 'Image');
+  class ReadyImage {
+    constructor() { this.complete = true; this.naturalWidth = 1600; this.src = ''; }
+  }
+  globalThis.Image = ReadyImage;
+  try {
+    const recording = recordingRenderer(true);
+    recording.renderer.render({ ...scrollingState(120),
+      arena: { theme: 'forest', width: 1920, groundY: 430, platforms: [], hazards: [] } },
+    { mode: 'campaign', theme: 'forest', level: 1 });
+    assert.equal(recording.images.length, 2);
+    assert.deepEqual(recording.images.map(({ args }) => args),
+      [[0, 0, 960, 540], [0, 0, 960, 540]], 'each photo panel keeps its original aspect ratio');
+    assert.equal(recording.images[0].originX, 0);
+    assert.equal(recording.images[0].scaleX, 1, 'the first stage uses the supplied photo unflipped');
+    assert.equal(recording.images[1].originX, 1920);
+    assert.equal(recording.images[1].scaleX, -1, 'the right panel mirrors around the seam');
+  } finally {
+    if (hadImage) globalThis.Image = previousImage;
+    else delete globalThis.Image;
+  }
+});
+
+test('all four illustrated themes and their ground extend into the second world panel', () => {
+  for (const theme of ['forest', 'city', 'ocean', 'land']) {
+    const recording = recordingRenderer(true);
+    recording.renderer.render({ ...scrollingState(1300),
+      arena: { theme, width: 1920, groundY: 430, platforms: [], hazards: [] } },
+    { mode: 'campaign', theme, level: 0 });
+    const ground = recording.rects.filter(({ y, w, h }) => y === 430 && w === 960 && h === 110);
+    assert.equal(ground.length, 2, `${theme} ground has two continuous viewport-width panels`);
+    assert.ok(ground.some(({ scaleX }) => scaleX === -1), `${theme} ground reaches the right panel`);
+    assert.ok(recording.rects.some(({ y, w, h, scaleX }) => y === 0 && w === 960
+      && h === 540 && scaleX === -1), `${theme} sky reaches the right panel`);
+  }
+});
+
+test('stairs, floating tread and rotating wooden plank use the collision pose at motionTick', () => {
+  const floating = { x: 1180, y: 290, w: 120, h: 12,
+    motion: 'float', baseY: 290, amplitude: 20, period: 100 };
+  const rotating = { x: 1370, y: 300, w: 160, h: 12, type: 'log',
+    motion: 'rotate', baseX: 1450, baseY: 300, baseAngle: 0, amplitude: .2, period: 100 };
+  const stair = { x: 1570, y: 345, w: 50, h: 12,
+    kind: 'stair', stairDirection: 'up' };
+  const meta = { mode: 'campaign', theme: 'land', level: 43 };
+  const state = scrollingState(1350, { motionTick: 25,
+    arena: { theme: 'land', width: 1920, groundY: 430,
+      platforms: [floating, rotating, stair], hazards: [] } });
+  const recording = recordingRenderer(true);
+  recording.renderer.render(state, meta);
+  const pose = platformPose(rotating, state.motionTick);
+  const plank = recording.rotations.find(({ angle }) => Math.abs(angle - pose.angle) < 1e-9);
+  assert.ok(plank, 'wooden plank rotates through the shared collision angle');
+  assert.equal(plank.originX, pose.centerX - (1350 - 480));
+  assert.equal(plank.originY, pose.centerY);
+  assert.ok(recording.rects.some(({ color, x, y, w }) => color === '#c99866'
+    && x === -pose.width / 2 && y === 0 && w === pose.width),
+  'wooden top edge remains exactly on the walkable collision surface');
+  const floatingY = platformPose(floating, state.motionTick).centerY;
+  const floatingTop = recording.rects.find(({ color, originY, w }) => color === '#cc9b6c'
+    && originY === floatingY && w === floating.w);
+  assert.ok(floatingTop, 'floating platform appears at its simulated vertical position');
+  assert.ok(recording.rects.some(({ color }) => color === 'rgba(20,39,39,.24)'),
+    'stair risers distinguish adjacent walkable treads');
+  recording.rects.length = 0;
+  recording.renderer.render({ ...state, tick: 41 }, meta);
+  assert.ok(recording.rects.some(({ color, originY, w }) => color === '#cc9b6c'
+    && originY === floatingY && w === floating.w), 'hitstop freezes the platform pose');
+});
+
+test('spear telegraph, projectile and landing effects stay at their world positions', () => {
+  const recording = recordingRenderer(true);
+  const enemy = { ...fighter('grunt', 0, 0, -1), id: 'enemy', team: 1,
+    x: 1510, height: 88, width: 29, spearWindup: 12, spearAimX: 1410, spearAimY: 340 };
+  const state = scrollingState(1440, { fighters: [
+    { ...fighter('hero', 0, 0), id: 'hero', team: 0, x: 1440, height: 88, width: 29 }, enemy],
+  projectiles: [{ id: 'one', kind: 'spear', team: 1, x: 1510, y: 330, vx: -15, vy: -1 }] });
+  const meta = { mode: 'campaign', theme: 'land', level: 43 };
+  recording.renderer.render(state, meta);
+  assert.ok(recording.strokes.some(({ color, width }) => color === '#ffca92' && width === 2.8),
+    'an enemy draws a held spear and a warning direction before throwing');
+  const shaft = recording.strokes.find(({ color, width }) => color === '#d79a70' && width === 3.5);
+  assert.equal(shaft?.originX, 550, 'the airborne spear is translated by the camera');
+  assert.ok(!recording.strokes.some(({ color, width }) => color === '#d79a70' && width === 3.2),
+    'reduced motion keeps the spear but drops its flight trail');
+
+  for (const type of ['spear-windup', 'spear-throw', 'spear-impact']) {
+    recording.renderer.effect({ id: `spear-${type}`, type, x: 1510, y: 330,
+      vx: -15, vy: -1, facing: -1 });
+    recording.renderer.effect({ id: `spear-${type}`, type, x: 1510, y: 330 });
+  }
+  recording.strokes.length = 0;
+  recording.renderer.render({ ...state, tick: 41 }, meta);
+  for (const color of ['#fff1c9', '#dffff0', '#fff4ce']) {
+    const ring = recording.strokes.filter(({ color: strokeColor, points }) => strokeColor === color
+      && points.some((point) => point.kind === 'arc' && point.x === 1510));
+    assert.equal(ring.length, 1, `${color} event renders once at the authoritative position`);
+    assert.equal(ring[0].originX + 1510, 550, 'event centre follows the same camera');
+  }
+});
+
+test('enemy spear warning still curves to its locked target even with reduced motion', () => {
+  for (const reducedMotion of [false, true]) {
+    const recording = recordingRenderer(reducedMotion);
+    const enemy = { ...fighter('grunt', 0, 0), id: 'enemy', team: 1,
+      x: 1370, y: 438, height: 88, width: 29, spearWindup: 10,
+      spearAimX: 1700, spearAimY: 385 };
+    recording.renderer.render(scrollingState(1370, { fighters: [enemy] }),
+      { mode: 'campaign', theme: 'forest', level: 13 });
+    const preview = recording.strokes.find(({ color, points }) => color === '#ffca92'
+      && points.length >= 8 && points.every((point) => Array.isArray(point)));
+    assert.ok(preview, 'the enemy still gives a readable parabolic warning');
+    const first = preview.points[0];
+    const last = preview.points.at(-1);
+    const highest = Math.min(...preview.points.map((point) => point[1]));
+    assert.ok(highest < first[1] - 20, 'the warning rises above its release point');
+    assert.ok(last[1] > highest + 20, 'the warning descends toward the target');
+    assert.ok(Math.abs(last[0] - enemy.spearAimX) < 0.01);
+    assert.ok(Math.abs(last[1] - enemy.spearAimY) < 0.01);
+  }
+});
+
+test('manual spear aim follows chosen angle and camera while keeping an endpoint cue in both motion settings', () => {
+  for (const reducedMotion of [false, true]) {
+    const recording = recordingRenderer(reducedMotion);
+    const hero = { ...fighter('hero', 0, 0), id: 'hero', team: 0,
+      x: 1370, y: 438, height: 88, width: 29, spearAiming: true,
+      spearAimAngle: 8, spearWindup: 0 };
+    recording.renderer.render(scrollingState(1370, { fighters: [hero] }),
+      { mode: 'campaign', theme: 'forest', level: 13 });
+    const origin = spearOrigin(hero);
+    const flight = spearAimedFlight(1, hero.spearAimAngle);
+    const preview = recording.strokes.find(({ color, points }) => color === '#b4f7da'
+      && points.length > 10 && points[0]?.[0] === origin.x);
+    assert.ok(preview, 'pressing I draws a complete reference arc before any windup');
+    assert.equal(preview.originX, -(1370 - 480), 'the arc uses the same world-camera translation');
+    assert.deepEqual(preview.points[0], [origin.x, origin.y]);
+    assert.deepEqual(preview.points[1], Object.values(spearTrajectoryPoint(origin.x, origin.y, flight, 1)),
+      'the first preview step uses the projectile’s actual discrete velocity');
+    assert.ok(Math.min(...preview.points.map((point) => point[1])) < origin.y - 4);
+    assert.ok(Math.abs(preview.points.at(-1)[1] - (430 - 7)) < 1e-9,
+      'the reference arc stops where its centre meets the ground');
+    assert.ok(recording.strokes.some(({ color, points }) => color === '#b4f7da'
+      && points.some((point) => point.kind === 'arc'
+        && Math.abs(point.x - preview.points.at(-1)[0]) < 1e-9)),
+    'an on-screen ground endpoint has an explicit reticle');
+    assert.ok(recording.labels.some(({ value }) => value === '仰角 8°'));
+    assert.ok(recording.labels.some(({ value }) => value === '参考落点'));
+    assert.ok(recording.strokes.some(({ color, width, points }) => color === SHADOW_WANDERER.limbCore
+      && width === 4.4 && points.at(-1)?.[1] < -60),
+    'the hero holds the spear up during manual aiming');
+  }
+});
+
+test('committed spear warning uses the locked facing and angle, and marks a distant landing as offscreen', () => {
+  const recording = recordingRenderer(true);
+  const hero = { ...fighter('hero', 0, 0, 1), id: 'hero', team: 0,
+    x: 1370, y: 438, height: 88, width: 29,
+    spearAiming: false, spearWindup: 10, spearAimAngle: 42, spearLaunchFacing: -1 };
+  recording.renderer.render(scrollingState(1370, { fighters: [hero] }),
+    { mode: 'campaign', theme: 'forest', level: 13 });
+  const origin = spearOrigin(hero, -1);
+  const flight = spearAimedFlight(-1, 42);
+  const preview = recording.strokes.find(({ color, points }) => color === '#b4f7da'
+    && points.length > 10 && points[0]?.[0] === origin.x);
+  assert.ok(preview, 'the chosen path remains visible while the locked throw winds up');
+  assert.deepEqual(preview.points[1], Object.values(spearTrajectoryPoint(origin.x, origin.y, flight, 1)));
+  assert.ok(preview.points[1][0] < origin.x, 'the locked facing wins over a later pose change');
+  assert.ok(recording.labels.some(({ value }) => value === '锁定 42°'));
+  assert.ok(recording.labels.some(({ value }) => value === '参考落点在画面外'));
+});
+
+test('a steep throw from a high platform previews its sky exit rather than a false landing', () => {
+  const recording = recordingRenderer(true);
+  const hero = { ...fighter('hero', 0, 0), id: 'hero', team: 0,
+    x: 400, y: 190, height: 88, width: 29, spearAiming: true,
+    spearAimAngle: 72, spearWindup: 0 };
+  recording.renderer.render(scrollingState(400, { fighters: [hero] }),
+    { mode: 'campaign', theme: 'forest', level: 13 });
+  const origin = spearOrigin(hero);
+  const preview = recording.strokes.find(({ color, points }) => color === '#b4f7da'
+    && points.length > 10 && points[0]?.[0] === origin.x);
+  assert.ok(preview);
+  assert.ok(Math.abs(preview.points.at(-1)[1] + 80) < 1e-9);
+  assert.ok(recording.labels.some(({ value }) => value === '飞出场地'));
+});
+
+test('a horizontal floating tread renders at its shared collision pose behind the camera', () => {
+  const drift = { x: 1300, y: 330, w: 112, h: 12, type: 'stone',
+    motion: 'float', axis: 'x', baseX: 1300, baseY: 330,
+    period: 120, amplitude: 24, phase: 0 };
+  const recording = recordingRenderer(true);
+  const state = scrollingState(1370, { arena: { theme: 'land', width: 1920,
+    groundY: 430, platforms: [drift], hazards: [] }, motionTick: 0 });
+  const meta = { mode: 'campaign', theme: 'land', level: 0 };
+  const platformTop = () => recording.rects.find(({ w, h }) => w === drift.w && h === 6);
+  recording.renderer.render(state, meta);
+  const first = platformTop();
+  assert.ok(first);
+  assert.equal(first.originX + first.scaleX * (-drift.w / 2),
+    platformPose(drift, 0).left - 890, 'the visible plank starts at its simulated world edge');
+  recording.rects.length = 0;
+  recording.renderer.render({ ...state, tick: 41, motionTick: 30 }, meta);
+  const right = platformTop();
+  assert.ok(right);
+  assert.equal(right.originX - first.originX, 24,
+    'the rendered tread shifts exactly as its walkable surface does');
+});
+
+test('world-space warning, KO tomato and light wave survive crossing the old 960px boundary', () => {
+  withClock(() => {
+    const recording = recordingRenderer(true);
+    const hero = { ...fighter('hero', 0, 0), id: 'hero', team: 0, x: 1450, height: 88 };
+    const enemy = { ...fighter('grunt', 0, 0), id: 'enemy', team: 1, x: 1500, height: 84 };
+    const state = { ...scrollingState(1450),
+      fighters: [hero, enemy], fallingObject: { kind: 'hail', phase: 'warning',
+        x: 1500, y: -20, impactY: 325, radius: 8, ticksUntilImpact: 20 } };
+    const meta = { mode: 'campaign', theme: 'land', level: 44 };
+    recording.renderer.render(state, meta);
+    const warning = recording.strokes.find(({ color, points }) => color === '#d4fff4'
+      && points.some((point) => point.kind === 'arc' && point.x === 1500));
+    assert.equal(warning?.originX + 1500, 540, 'falling warning is not clamped to screen x=960');
+
+    recording.renderer.effect({ id: 'right-side-ko', type: 'ko', target: enemy.id,
+      x: 1500, y: enemy.y - enemy.height * .45 });
+    recording.renderer.effect({ id: 'right-side-wave', type: 'special-wave',
+      x: 1450, y: 350, radius: 1920 });
+    recording.fills.length = 0;
+    recording.strokes.length = 0;
+    recording.rects.length = 0;
+    recording.renderer.render({ ...state, tick: 41,
+      fighters: [hero, { ...enemy, hp: 0 }] }, meta);
+    const tomato = recording.fills.find(({ color }) => color === '#702d2a');
+    assert.ok(tomato && tomato.originX > 500 && tomato.originX < 560,
+      'KO echo keeps its world position above the fallen enemy');
+    const wave = recording.strokes.find(({ color, points }) => color === '#dffff8'
+      && points.some((point) => point.kind === 'arc' && point.x === 1450));
+    assert.equal(wave?.originX + 1450, 490, 'light wave expands from the hero in world space');
+    assert.ok(recording.rects.some(({ x, w, originX }) => x === 960 && w === 960
+      && originX === -960), 'instant wave flash covers the current viewport');
+  });
+});
 
 test('regular and boss punch wind appears only during each real damage window', () => {
   for (const { kind, stage, from, to } of ATTACK_WINDOWS) {
@@ -157,7 +724,7 @@ test('the boss keeps a slim stick-figure body but stands visibly taller and wide
   const hero = { ...fighter('hero', 0, 0), id: 'hero', x: 260, height: 88 };
   const boss = { ...fighter('boss', 0, 0, -1), id: 'boss', x: 650, height: 136 };
   const { fills, strokes } = renderFighters([hero, boss]);
-  const heroHead = fills.find(({ color, points }) => color === '#173b3b'
+  const heroHead = fills.find(({ color, points }) => color === SHADOW_WANDERER.head
     && points.some((point) => point.kind === 'arc' && point.radius === 22));
   const bossHead = fills.find(({ color, points }) => color === '#482d34'
     && points.some((point) => point.kind === 'arc' && point.radius === 22));
@@ -368,9 +935,9 @@ test('reduced motion keeps both kick impact cues but removes jump-kick flourish'
 
 test('the head is much wider than every slim body stroke', () => {
   const { fills, strokes } = renderFighters([{ ...fighter('hero', 0, 0), id: 'hero' }]);
-  const head = fills.find(({ color, points }) => color === '#173b3b'
+  const head = fills.find(({ color, points }) => color === SHADOW_WANDERER.head
     && points.some((point) => point.kind === 'arc' && point.radius === 22));
-  const torso = strokes.find(({ color, width }) => color === '#173b3b' && width === 7.8);
+  const torso = strokes.find(({ color, width }) => color === SHADOW_WANDERER.head && width === 7.8);
   assert.ok(head, 'the oversized head has a 22-pixel outer radius');
   assert.ok(torso, 'the body retains a slim outline');
   assert.ok(44 / torso.width > 5, 'head diameter dominates body thickness');
@@ -398,6 +965,108 @@ test('each KO gets its own falling rotten tomato, even if the next wave replaces
     assert.ok(fills.some(({ color }) => color === '#4f7850'), 'rotten calyx remains on the splat');
     assert.ok(fills.filter(({ color }) => color === '#a83f33').length >= 4,
       'the tomato breaks into visible pulp and droplets');
+  });
+});
+
+test('tomato accelerates into the head, compresses at impact, then leaves a brief stain', () => {
+  withClock((advance) => {
+    const { renderer, fills, strokes } = recordingRenderer();
+    const hero = { ...fighter('hero', 0, 0), id: 'hero', team: 0, height: 88 };
+    renderFrame(renderer, [hero], 39);
+    renderer.effect({ id: '40:tomato-phases', type: 'ko', target: hero.id,
+      x: hero.x, y: hero.y - hero.height * .45 });
+    const defeated = { ...hero, hp: 0 };
+    const tomatoY = (tick) => {
+      fills.length = 0;
+      strokes.length = 0;
+      renderFrame(renderer, [defeated], tick);
+      return fills.find(({ color }) => color === '#d6533d')?.originY;
+    };
+    const startY = tomatoY(40);
+    advance(60);
+    const earlyY = tomatoY(41);
+    advance(60);
+    const laterY = tomatoY(42);
+    assert.ok(laterY - earlyY > earlyY - startY,
+      'the falling tomato gains speed instead of descending at a fixed rate');
+    advance(60);
+    tomatoY(43);
+    advance(65);
+    tomatoY(44);
+    assert.ok(fills.some(({ color, scaleX }) => color === '#702d2a' && scaleX > 1.5),
+      'the peel visibly spreads sideways as it hits the crown');
+    assert.equal(strokes.filter(({ color, points }) => color === '#b4513b'
+      && points.some((point) => point.kind === 'bezier')).length, 2,
+    'two restrained juice ribbons burst away from the impact');
+    assert.equal(fills.filter(({ color }) => color === '#8f3a30').length, 3,
+      'three uneven pulp fragments separate from the peel');
+
+    advance(100);
+    tomatoY(45);
+    assert.ok(fills.some(({ color }) => color === '#e4b27c'),
+      'seeds and pulp remain stuck above the eyes after the peel splits');
+    advance(355);
+    tomatoY(46);
+    assert.ok(fills.some(({ color }) => color === '#a83f33'),
+      'the head stain remains visible while the result overlay appears');
+    assert.ok(!fills.some(({ color }) => color === '#8f3a30'),
+      'flying fragments finish quickly instead of filling the result screen');
+    advance(400);
+    tomatoY(47);
+    assert.ok(!fills.some(({ color }) => color === '#e4b27c'),
+      'the temporary mess fully clears after its fixed lifetime');
+  });
+});
+
+test('reduced motion keeps a readable splat without flying peel or juice arcs', () => {
+  withClock((advance) => {
+    const normal = recordingRenderer();
+    const reduced = recordingRenderer(true);
+    const hero = { ...fighter('hero', 0, 0), id: 'hero', team: 0, height: 88 };
+    for (const recording of [normal, reduced]) {
+      renderFrame(recording.renderer, [hero], 39);
+      recording.renderer.effect({ id: `40:tomato-${recording === reduced}`, type: 'ko',
+        target: hero.id, x: hero.x, y: hero.y - hero.height * .45 });
+      recording.fills.length = 0;
+      recording.strokes.length = 0;
+    }
+    advance(190);
+    for (const recording of [normal, reduced]) {
+      renderFrame(recording.renderer, [{ ...hero, hp: 0 }], 40);
+    }
+    assert.ok(reduced.fills.some(({ color }) => color === '#e4b27c'),
+      'reduced motion shows the final head splat as soon as the sound lands');
+    assert.equal(reduced.fills.filter(({ color }) => color === '#8f3a30').length, 0);
+    assert.equal(reduced.strokes.filter(({ color }) => color === '#b4513b').length, 0);
+    assert.equal(normal.fills.filter(({ color }) => color === '#8f3a30').length, 3);
+    assert.ok(normal.fills.length > reduced.fills.length,
+      'normal mode can splatter, while the calmer mode retains just the impact');
+  });
+});
+
+test('two world-space KOs produce distinct bounded splashes after the 960px seam', () => {
+  withClock((advance) => {
+    const { renderer, fills } = recordingRenderer();
+    const hero = { ...fighter('hero', 0, 0), id: 'hero', team: 0, x: 1450, height: 88 };
+    const enemy = { ...fighter('grunt', 0, 0, -1), id: 'enemy', team: 1, x: 1510, height: 88 };
+    const state = scrollingState(1450, { fighters: [hero, enemy] });
+    const meta = { mode: 'campaign', theme: 'land', level: 43 };
+    renderer.render({ ...state, tick: 39 }, meta);
+    for (const combatant of [hero, enemy]) {
+      const event = { id: `40:ko-${combatant.id}`, type: 'ko', target: combatant.id,
+        x: combatant.x, y: combatant.y - combatant.height * .45 };
+      renderer.effect(event);
+      renderer.effect({ ...event });
+    }
+    advance(230);
+    fills.length = 0;
+    renderer.render({ ...state, tick: 40,
+      fighters: [{ ...hero, hp: 0 }, { ...enemy, hp: 0 }] }, meta);
+    const pulp = fills.filter(({ color }) => color === '#8f3a30');
+    assert.equal(pulp.length, 6, 'each distinct KO produces exactly three pulp fragments');
+    assert.ok(pulp.some(({ originX }) => originX > 460 && originX < 520));
+    assert.ok(pulp.some(({ originX }) => originX > 520 && originX < 600),
+      'the other head splashes separately on the right side of the scrolling world');
   });
 });
 
@@ -432,10 +1101,10 @@ test('an airborne KO uses the current impact height, not the previous drawn fram
     renderFrame(renderer, [{ ...airborne, y: 330, hp: 0 }], 40);
     const tomato = fills.find(({ color }) => color === '#d6533d');
     assert.ok(tomato);
-    // At the start of the drop, the red body is 131px above the head's crown.
+    // At the start of the drop, the red body is 131px above the raised hat impact crown.
     // The previous y=200 frame would put this tomato 130px too high.
-    assert.ok(tomato.originY > 80 && tomato.originY < 110,
-      `tomato follows the new foot y=330, actual origin ${tomato.originY}`);
+    assert.ok(tomato.originY > 64 && tomato.originY < 96,
+      `tomato follows the new foot y=330 and catches the hat, actual origin ${tomato.originY}`);
   });
 });
 
@@ -465,5 +1134,280 @@ test('a KO keeps its motion setting when the system preference changes mid-splat
       assert.equal(pulp, startReduced ? 4 : 10,
         'a change after impact cannot make the result overlay outrun the KO animation');
     }
+  });
+});
+
+test('campaign corpse settles by simulation tick, remains for three seconds after settling, but the tomato still expires at 1.08s', () => {
+  withClock((advance) => {
+    const recording = recordingRenderer();
+    const { renderer, fills } = recording;
+    const hero = { ...fighter('hero', 0, 0), id: 'hero', team: 0, x: 170, height: 88 };
+    const alive = { ...fighter('grunt', 0, 0), id: 'enemy', team: 1, x: 600, y: 310,
+      height: 88, width: 29 };
+    const corpse = corpseRecord('enemy', { x: 660, y: 430, koX: 600, koY: 310 });
+    const meta = { mode: 'campaign', theme: 'land', level: 17 };
+    const state = scrollingState(170, { fighters: [hero, { ...alive, hp: 0 }], corpses: [corpse] });
+    const head = () => fills.find(({ color, points }) => color === '#663f41'
+      && points.some((point) => point.kind === 'arc' && point.radius === 22));
+    renderer.render({ ...state, tick: 39, motionTick: 39,
+      fighters: [hero, alive], corpses: [] }, meta);
+    renderer.effect({ id: '40:corpse-ko', type: 'ko', target: 'enemy',
+      x: alive.x, y: alive.y - alive.height * .45 });
+
+    fills.length = 0;
+    renderer.render({ ...state, tick: 40, motionTick: 40 }, meta);
+    assert.equal(head()?.originX, 600, 'the corpse begins at the KO world-space position');
+    assert.equal(head()?.originY, 310, 'an aerial KO does not jump to the ground at birth');
+    assert.equal(fills.filter(({ color, points }) => color === '#663f41'
+      && points.some((point) => point.kind === 'arc' && point.radius === 22)).length, 1,
+    'a dead enemy still in fighters is not painted on top of its corpse');
+
+    fills.length = 0;
+    renderer.render({ ...state, tick: 54, motionTick: 54 }, meta);
+    assert.ok(head().originX > 600 && head().originX < 660, 'motionTick moves toward the landing x');
+    assert.ok(head().originY > 310 && head().originY < 430, 'motionTick lowers an airborne KO');
+
+    advance(1140);
+    fills.length = 0;
+    renderer.render({ ...state, tick: 110, motionTick: 110 }, meta);
+    assert.equal(head()?.originX, 660, 'the corpse has reached the current support position');
+    assert.ok(!fills.some(({ color }) => color === '#e4b27c' || color === '#702d2a'),
+      'the tomato stain ends at its original 1.08-second lifetime');
+    assert.ok(head(), 'the body persists independently of the expired tomato');
+
+    fills.length = 0;
+    renderer.render({ ...state, tick: 241, motionTick: 241 }, meta);
+    assert.ok(head()?.alpha > .45 && head()?.alpha < .55,
+      'the last 12 effective ticks only lightly fade the corpse');
+    fills.length = 0;
+    renderer.render({ ...state, tick: 247, motionTick: 247 }, meta);
+    assert.equal(head(), undefined, 'the corpse disappears at settleTick + 180 ticks');
+    fills.length = 0;
+    renderer.render({ ...state, tick: 248, motionTick: 248, corpses: [] }, meta);
+    assert.equal(head(), undefined, 'a stale dead fighter cannot reappear after corpse expiry');
+  });
+});
+
+test('a removed campaign enemy stays as one corpse across waves and aftermath gives the hero a smile', () => {
+  withClock(() => {
+    const recording = recordingRenderer();
+    const { renderer, fills, strokes } = recording;
+    const hero = { ...fighter('hero', 0, 0), id: 'hero', team: 0, x: 170, height: 88 };
+    const oldEnemy = { ...fighter('grunt', 0, 0), id: 'enemy-old', team: 1, x: 620,
+      height: 88 };
+    const newEnemy = { ...oldEnemy, id: 'enemy-next', x: 800 };
+    const corpse = corpseRecord(oldEnemy.id, { bornTick: 40, settleTick: 67, expireTick: 247 });
+    const meta = { mode: 'campaign', theme: 'land', level: 17 };
+    const state = scrollingState(170, { fighters: [hero, oldEnemy], motionTick: 39, corpses: [] });
+    renderer.render({ ...state, tick: 39 }, meta);
+    renderer.effect({ id: '40:old-ko', type: 'ko', target: oldEnemy.id,
+      x: 620, y: 430 - oldEnemy.height * .45 });
+
+    fills.length = 0;
+    renderer.render({ ...state, tick: 68, motionTick: 68,
+      fighters: [hero, newEnemy], corpses: [corpse] }, meta);
+    assert.equal(fills.filter(({ color, points }) => color === '#663f41'
+      && points.some((point) => point.kind === 'arc' && point.radius === 22)).length, 2,
+    'one old corpse and the new-wave enemy coexist without duplicate KO echoes');
+
+    fills.length = 0;
+    strokes.length = 0;
+    renderer.render({ ...state, tick: 69, motionTick: 69,
+      fighters: [hero], corpses: [corpse] }, { ...meta, campaignPhase: 'aftermath' });
+    assert.equal(fills.filter(({ color, points }) => color === '#663f41'
+      && points.some((point) => point.kind === 'arc' && point.radius === 22)).length, 1,
+    'the final enemy can remain visible while the player is still in the arena');
+    assert.ok(mouthCurve(mouth(strokes, SHADOW_WANDERER.p1.eye)) > 0,
+      'the living hero celebrates during the movable aftermath window');
+  });
+});
+
+test('a settled corpse follows the current simulated support pose instead of its KO-time platform position', () => {
+  withClock(() => {
+    const recording = recordingRenderer(true);
+    const { renderer, fills } = recording;
+    const meta = { mode: 'campaign', theme: 'land', level: 43 };
+    const state = scrollingState(1400, { tick: 68, motionTick: 68,
+      corpses: [corpseRecord('platform-enemy', { x: 1500, y: 320, koX: 1480, koY: 320 })] });
+    const head = () => fills.find(({ color, points }) => color === '#663f41'
+      && points.some((point) => point.kind === 'arc' && point.radius === 22));
+    renderer.render(state, meta);
+    const first = { x: head().originX, y: head().originY };
+    fills.length = 0;
+    renderer.render({ ...state, tick: 69, motionTick: 69,
+      corpses: [{ ...state.corpses[0], x: 1522, y: 334 }] }, meta);
+    assert.equal(head()?.originX - first.x, 22, 'horizontal support drift carries the corpse in world space');
+    assert.equal(head()?.originY - first.y, 14, 'vertical support drift carries the corpse on its ledge');
+  });
+});
+
+test('stepping over a campaign corpse scatters one bounded set of cartoon bones and never resurrects the fighter', () => {
+  withClock((advance) => {
+    const recording = recordingRenderer();
+    const { renderer, strokes, fills } = recording;
+    const hero = { ...fighter('hero', 0, 0), id: 'hero', team: 0, x: 170, height: 88 };
+    const dead = { ...fighter('grunt', 0, 0), id: 'enemy', team: 1, x: 620, hp: 0 };
+    const corpse = corpseRecord();
+    const meta = { mode: 'campaign', theme: 'land', level: 17 };
+    const state = scrollingState(170, { tick: 68, motionTick: 68,
+      fighters: [hero, dead], corpses: [corpse] });
+    renderer.render(state, meta);
+    const event = { id: '68:bones', type: 'bones-scatter', target: 'enemy',
+      x: 620, y: 430, kind: 'grunt', facing: 1, width: 29, height: 88 };
+    renderer.effect(event);
+    renderer.effect({ ...event });
+    renderer.effect({ ...event, id: '68:bones-replayed' });
+
+    fills.length = 0;
+    strokes.length = 0;
+    renderer.render({ ...state, tick: 69, motionTick: 69 }, meta);
+    const pieces = () => strokes.filter(({ color, width }) => color === '#663f41'
+      && Math.abs(width - 6.2) < 1e-9);
+    assert.equal(pieces().length, 5, 'one head and five detached thin-limb/torso pieces');
+    assert.ok(fills.some(({ color, points }) => color === '#663f41'
+      && points.some((point) => point.kind === 'ellipse' && point.rx === 22)),
+    'the oversized cartoon head remains readable after the body comes apart');
+    assert.ok(!fills.some(({ color, points }) => color === '#663f41'
+      && points.some((point) => point.kind === 'arc' && point.radius === 22)),
+    'the intact corpse is suppressed even if an older snapshot still includes it');
+    const before = pieces().map(({ originX }) => originX);
+
+    advance(310);
+    fills.length = 0;
+    strokes.length = 0;
+    renderer.render({ ...state, tick: 87, motionTick: 87, corpses: [] }, meta);
+    assert.equal(pieces().length, 5);
+    assert.ok(pieces().some(({ originX }, index) => Math.abs(originX - before[index]) > .2),
+      'normal motion spreads the pieces in short arcs');
+
+    advance(320);
+    fills.length = 0;
+    strokes.length = 0;
+    renderer.render({ ...state, tick: 106, motionTick: 106, corpses: [] }, meta);
+    assert.equal(pieces().length, 0, 'bone pieces clear after about 0.6 seconds');
+    assert.ok(!fills.some(({ color, points }) => color === '#663f41'
+      && points.some((point) => point.kind === 'arc' && point.radius === 22)),
+    'a dead fighter in the snapshot cannot come back when the scatter ends');
+  });
+});
+
+test('an early scatter keeps the tomato stain on the detached head only until the original KO lifetime', () => {
+  withClock((advance) => {
+    const recording = recordingRenderer();
+    const { renderer, fills } = recording;
+    const hero = { ...fighter('hero', 0, 0), id: 'hero', team: 0, x: 170, height: 88 };
+    const enemy = { ...fighter('grunt', 0, 0), id: 'enemy', team: 1, x: 620,
+      height: 88, width: 29 };
+    const meta = { mode: 'campaign', theme: 'land', level: 17 };
+    const state = scrollingState(170, { motionTick: 39, fighters: [hero, enemy], corpses: [] });
+    renderer.render({ ...state, tick: 39 }, meta);
+    renderer.effect({ id: '40:ko-before-scatter', type: 'ko', target: 'enemy',
+      x: enemy.x, y: enemy.y - enemy.height * .45 });
+    advance(500);
+    renderer.render({ ...state, tick: 68, motionTick: 68,
+      fighters: [hero], corpses: [corpseRecord()] }, meta);
+    renderer.effect({ id: '68:bones-after-tomato', type: 'bones-scatter', target: 'enemy',
+      x: 620, y: 430, kind: 'grunt', facing: 1, width: 29, height: 88 });
+
+    advance(300);
+    fills.length = 0;
+    renderer.render({ ...state, tick: 86, motionTick: 86,
+      fighters: [hero], corpses: [] }, meta);
+    assert.ok(fills.some(({ color }) => color === '#e4b27c'),
+      'seeds and stain remain on the detached head while the 1.08s tomato is active');
+
+    advance(290);
+    fills.length = 0;
+    renderer.render({ ...state, tick: 103, motionTick: 103,
+      fighters: [hero], corpses: [] }, meta);
+    assert.ok(fills.some(({ color, points }) => color === '#663f41'
+      && points.some((point) => point.kind === 'ellipse' && point.rx === 22)),
+    'the bone head is still present near the end of its own short scatter');
+    assert.ok(!fills.some(({ color }) => color === '#e4b27c'),
+      'the original tomato ends at 1.08s even while bones continue to fade');
+  });
+});
+
+test('boss bones share the campaign camera, scatter inward at a world edge, and reduced motion stays static', () => {
+  withClock((advance) => {
+    const normal = recordingRenderer();
+    const calm = recordingRenderer(true);
+    const meta = { mode: 'campaign', theme: 'land', level: 30 };
+    const state = scrollingState(1450, { corpses: [], motionTick: 40 });
+    const event = { id: '40:boss-bones', type: 'bones-scatter', target: 'boss-30',
+      x: 1510, y: 430, kind: 'boss', facing: 1, width: 44, height: 136 };
+    for (const recording of [normal, calm]) {
+      recording.renderer.render(state, meta);
+      recording.renderer.effect(event);
+      recording.fills.length = 0;
+      recording.strokes.length = 0;
+      recording.renderer.render({ ...state, tick: 41, motionTick: 41 }, meta);
+    }
+    const bossHead = (recording) => recording.fills.find(({ color, points }) => color === '#482d34'
+      && points.some((point) => point.kind === 'ellipse' && Math.abs(point.rx - 22 * 1.28) < .01));
+    assert.ok(bossHead(normal)?.originX > 400 && bossHead(normal)?.originX < 460,
+      'world x=1510 becomes an on-screen boss skull at the shared camera offset');
+    assert.equal(bossHead(normal)?.originX, bossHead(calm)?.originX);
+    const normalX = normal.strokes.filter(({ color }) => color === '#482d34').map(({ originX }) => originX);
+    const calmX = calm.strokes.filter(({ color }) => color === '#482d34').map(({ originX }) => originX);
+
+    advance(310);
+    for (const recording of [normal, calm]) {
+      recording.fills.length = 0;
+      recording.strokes.length = 0;
+      recording.renderer.render({ ...state, tick: 59, motionTick: 59 }, meta);
+    }
+    assert.ok(normal.strokes.filter(({ color }) => color === '#482d34')
+      .some(({ originX }, index) => Math.abs(originX - normalX[index]) > .2),
+    'normal motion sends the thin fragments outward');
+    assert.deepEqual(calm.strokes.filter(({ color }) => color === '#482d34')
+      .map(({ originX }) => originX), calmX,
+    'reduced motion keeps the bone pile fixed without camera shake');
+
+    const edge = recordingRenderer(true);
+    const edgeState = scrollingState(170, { corpses: [], motionTick: 40 });
+    edge.renderer.render(edgeState, meta);
+    edge.renderer.effect({ ...event, id: 'edge-bones', target: 'edge-boss', x: 22 });
+    edge.fills.length = 0;
+    edge.renderer.render({ ...edgeState, tick: 41, motionTick: 41 }, meta);
+    assert.ok(bossHead(edge)?.originX > 22 && bossHead(edge)?.originX < 220,
+      'a boss at the left world edge breaks toward the arena, not out of view');
+
+    const farEdge = recordingRenderer(true);
+    const farState = scrollingState(1750, { corpses: [], motionTick: 40 });
+    farEdge.renderer.render(farState, meta);
+    farEdge.renderer.effect({ ...event, id: 'far-edge-bones', target: 'far-boss',
+      x: 1898, facing: -1 });
+    farEdge.fills.length = 0;
+    farEdge.renderer.render({ ...farState, tick: 41, motionTick: 41 }, meta);
+    assert.ok(bossHead(farEdge)?.originX > 700 && bossHead(farEdge)?.originX < 960,
+      'a boss at the right world edge also breaks inward under the camera');
+  });
+});
+
+test('PvP ignores campaign corpse and bones fields but retains its KO tomato and defeated fighter', () => {
+  withClock(() => {
+    const recording = recordingRenderer();
+    const { renderer, fills, strokes } = recording;
+    const hero = { ...fighter('hero', 0, 0), id: 'p1', team: 0, x: 350, height: 88 };
+    const enemy = { ...fighter('grunt', 0, 0), id: 'p2', team: 1, x: 600, height: 88 };
+    const meta = { mode: 'duel', theme: 'city' };
+    const state = { tick: 39, arena: { theme: 'city', groundY: 430, width: 960 },
+      fighters: [hero, enemy] };
+    renderer.render(state, meta);
+    renderer.effect({ id: '40:duel-ko', type: 'ko', target: 'p2',
+      x: 600, y: 430 - enemy.height * .45 });
+    renderer.effect({ id: '40:untrusted-bones', type: 'bones-scatter', target: 'p2',
+      x: 600, y: 430, kind: 'grunt', facing: 1 });
+    fills.length = 0;
+    strokes.length = 0;
+    renderer.render({ ...state, tick: 40, motionTick: 40,
+      fighters: [hero, { ...enemy, hp: 0 }], corpses: [corpseRecord('p2')] }, meta);
+    assert.ok(fills.some(({ color }) => color === '#702d2a'), 'the duel still drops its tomato');
+    assert.equal(fills.filter(({ color, points }) => color === '#663f41'
+      && points.some((point) => point.kind === 'arc' && point.radius === 22)).length, 1,
+    'the loser remains a whole stick fighter in PvP');
+    assert.ok(!strokes.some(({ color, width }) => color === '#663f41'
+      && Math.abs(width - 6.2) < 1e-9), 'campaign bones never appear in PvP');
   });
 });

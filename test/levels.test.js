@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { LEVELS, checkpointFor, getLevel } from '../shared/levels.js';
+import { CAMPAIGN_WORLD_WIDTH, LEVELS, checkpointFor, getLevel } from '../shared/levels.js';
 
 const MILESTONE_BOSSES = [
   { number: 10, name: '雾林巨拳', originalWaves: 3, maxHp: 162, damageScale: 0.91 },
@@ -55,4 +55,101 @@ test('every even stage has one sparse, deterministic theme-specific falling-haza
       warningTicks: 40, radius: 8, damageFraction: 0.1, seed: level.number,
     });
   }
+});
+
+test('all 56 campaign arenas span 1920px with bounded, connected walkable stairs', () => {
+  assert.equal(CAMPAIGN_WORLD_WIDTH, 1920);
+  assert.equal(LEVELS.length, 56);
+  for (const level of LEVELS) {
+    assert.equal(level.arena.width, CAMPAIGN_WORLD_WIDTH);
+    assert.equal(level.platforms, level.arena.platforms);
+    assert.ok(level.platforms.some((platform) => platform.x > 1600), `level ${level.number} uses the far end`);
+    for (const item of [...level.platforms, ...level.hazards]) {
+      assert.ok(item.x >= 0 && item.x + item.w <= CAMPAIGN_WORLD_WIDTH, `level ${level.number} x bounds`);
+      assert.ok(item.y >= 0 && item.y + item.h <= 540, `level ${level.number} y bounds`);
+      assert.ok(item.w > 0 && item.h > 0);
+    }
+
+    const groups = new Map();
+    for (const step of level.platforms.filter((platform) => platform.kind === 'stair')) {
+      assert.ok(['west', 'east'].includes(step.stairGroup));
+      assert.ok(['up', 'down'].includes(step.stairDirection));
+      if (!groups.has(step.stairGroup)) groups.set(step.stairGroup, []);
+      groups.get(step.stairGroup).push(step);
+    }
+    assert.ok(groups.has('west'));
+    assert.equal(groups.has('east'), level.stage >= 6);
+    for (const [group, unsorted] of groups) {
+      const steps = unsorted.sort((a, b) => a.stairIndex - b.stairIndex);
+      const direction = group === 'west' ? 'up' : 'down';
+      const last = steps.at(-1);
+      assert.equal(steps[0].stairIndex, 0);
+      assert.ok(steps.every((step) => step.stairDirection === direction && step.w === 50));
+      for (let index = 1; index < steps.length; index++) {
+        assert.equal(steps[index].stairIndex, index);
+        assert.equal(steps[index].x, steps[index - 1].x + steps[index - 1].w);
+        assert.equal(steps[index].y - steps[index - 1].y, direction === 'up' ? -12 : 12);
+      }
+      assert.equal(direction === 'up' ? steps[0].y : last.y, level.groundY - 12);
+      assert.ok(level.platforms.some((platform) => platform.kind !== 'stair'
+        && platform.y === (direction === 'up' ? last.y : steps[0].y)
+        && (direction === 'up' ? platform.x === last.x + last.w
+          : platform.x + platform.w === steps[0].x)), `level ${level.number} ${group} landing`);
+    }
+  }
+});
+
+test('platform challenge grows through the chapter without changing waves or falling hazards', () => {
+  const expected = [
+    [1, 3, 0, 0], [4, 4, 0, 0], [5, 4, 1, 0], [6, 7, 1, 0],
+    [8, 8, 1, 1], [9, 9, 1, 1], [11, 9, 2, 1], [12, 10, 2, 1],
+    [13, 11, 2, 2], [14, 11, 2, 2],
+  ];
+  for (let chapter = 0; chapter < 4; chapter++) {
+    let previousScore = -1;
+    for (let stage = 1; stage <= 14; stage++) {
+      const level = LEVELS[chapter * 14 + stage - 1];
+      const stairCount = level.platforms.filter((platform) => platform.kind === 'stair').length;
+      const floating = level.platforms.filter((platform) => platform.motion === 'float');
+      const rotating = level.platforms.filter((platform) => platform.motion === 'rotate');
+      assert.deepEqual(floating.map((platform) => platform.axis).sort(),
+        stage >= 11 ? ['x', 'y'] : stage >= 5 ? ['y'] : [],
+        `level ${level.number} introduces sideways drift only in the later stages`);
+      const score = stairCount + floating.length * 2 + rotating.length * 2;
+      assert.ok(score >= previousScore, `level ${level.number} must not lose platform complexity`);
+      previousScore = score;
+      const tier = expected.find(([position]) => position === stage);
+      if (tier) assert.deepEqual([stairCount, floating.length, rotating.length], tier.slice(1));
+      if (stage === 1) assert.equal(level.hazards.length, 0);
+
+      for (const platform of [...floating, ...rotating]) {
+        assert.equal(platform.baseY, platform.y);
+        assert.equal(platform.phase, 0);
+        assert.ok(Number.isInteger(platform.period) && platform.period > 0);
+        assert.ok(platform.amplitude > 0);
+        if (platform.motion === 'rotate') {
+          assert.equal(platform.baseX, platform.x + platform.w / 2);
+          assert.equal(platform.type, 'log');
+          assert.equal(platform.baseAngle, 0);
+          assert.equal(platform.angle, 0);
+          assert.ok(platform.amplitude <= 0.2, `level ${level.number} bar remains standable`);
+        } else {
+          assert.equal(platform.baseX, platform.x);
+          assert.equal(platform.angle, undefined);
+          if (platform.axis === 'x') {
+            assert.equal(platform.amplitude, 20 + (stage - 11) * 4,
+              `level ${level.number} horizontal travel grows by stage`);
+            assert.equal(platform.period, 205 - stage * 2);
+            assert.ok(platform.x - platform.amplitude >= 0);
+            assert.ok(platform.x + platform.w + platform.amplitude <= CAMPAIGN_WORLD_WIDTH);
+          } else {
+            assert.equal(platform.axis, 'y');
+            assert.ok(platform.amplitude <= 24, `level ${level.number} vertical float stays reachable`);
+          }
+        }
+      }
+    }
+  }
+  assert.equal(LEVELS.flatMap((level) => level.platforms)
+    .filter((platform) => platform.motion === 'float' && platform.axis === 'x').length, 16);
 });

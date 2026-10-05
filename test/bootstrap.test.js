@@ -36,7 +36,7 @@ class FakeNode {
   }
 
   fire(type, details = {}) {
-    const event = { preventDefault() {}, pointerId: 0, ...details };
+    const event = { type, preventDefault() {}, pointerId: 0, ...details };
     for (const callback of this.listeners.get(type) ?? []) callback(event);
     return event;
   }
@@ -61,10 +61,15 @@ const fakeCanvasContext = new Proxy({
 test('browser controller boots, switches modes, starts a fight and renders a frame', async () => {
   const page = readFileSync(new URL('../public/index.html', import.meta.url), 'utf8');
   const ids = [...page.matchAll(/id="([^"]+)"/g)].map((match) => match[1]);
+  const aimControlsMarkup = page.match(/<div id="spear-aim-controls"[\s\S]*?<\/div>/)?.[0] ?? '';
+  assert.match(aimControlsMarkup, /<span id="spear-angle"/, 'touch aiming shows its own angle readout');
   const elements = new Map(ids.map((id) => [id, new FakeNode(id)]));
   elements.get('duel-theme').value = 'city';
-  const buttons = ['left', 'right', 'attack', 'kick', 'jump', 'dodge', 'special'].map((key) => {
-    const node = key === 'special' ? elements.get('special-button') : new FakeNode();
+  const touchIds = { special: 'special-button', spear: 'spear-button', aimUp: 'aim-up-button',
+    aimDown: 'aim-down-button', aimCancel: 'aim-cancel-button' };
+  const buttons = ['left', 'right', 'attack', 'kick', 'jump', 'dodge', 'special', 'spear',
+    'aimUp', 'aimDown', 'aimCancel'].map((key) => {
+    const node = touchIds[key] ? elements.get(touchIds[key]) : new FakeNode();
     node.dataset.key = key;
     return node;
   });
@@ -83,8 +88,10 @@ test('browser controller boots, switches modes, starts a fight and renders a fra
     }
   };
   let latestCampaignView;
+  let activeCampaign;
   const originalCampaignStep = CampaignSession.prototype.step;
   CampaignSession.prototype.step = function captureCampaignInput(input) {
+    activeCampaign = this;
     campaignInputs.push({ ...input });
     latestCampaignView = originalCampaignStep.call(this, input);
     return latestCampaignView;
@@ -161,6 +168,9 @@ test('browser controller boots, switches modes, starts a fight and renders a fra
     assert.equal(elements.get('duel-panel').hidden, true);
     assert.equal(elements.get('stage-title').textContent, '林缘试招');
     assert.equal(elements.get('special-button').hidden, true, 'the first room cannot use the wave');
+    assert.equal(elements.get('spear-button').hidden, false, 'campaign shows the spear action');
+    assert.equal(elements.get('spear-button').disabled, true, 'pre-fight overlay keeps the action inactive');
+    assert.match(elements.get('spear-status').textContent, /不限次数/);
 
     elements.get('duel-button').fire('click');
     assert.equal(elements.get('campaign-panel').hidden, true);
@@ -184,8 +194,162 @@ test('browser controller boots, switches modes, starts a fight and renders a fra
       document.fire('keydown', { code, repeat: false });
       document.fire('keyup', { code });
     };
+    const campaignHero = () => latestCampaignView.combat.fighters.find((fighter) => fighter.id === 'hero');
     advanceFrame(35);
+    assert.equal(elements.get('spear-button').disabled, false, 'a player can aim from the first fight without a KO');
+    assert.equal(elements.get('spear-button').attributes.get('aria-label'), '进入投矛瞄准，不限次数');
     assert.match(elements.get('player-health-text').textContent, /100 \/ 100/);
+
+    tapKey('KeyI');
+    assert.equal(advanceFrame()[0].spear, true);
+    assert.equal(campaignHero().spearAiming, true, 'first I press should preview an arc, not throw');
+    assert.equal(campaignHero().spearWindup, 0);
+    assert.equal(elements.get('spear-button').textContent, '发射');
+    assert.equal(elements.get('spear-aim-controls').hidden, false);
+    assert.equal(elements.get('spear-angle').textContent,
+      `仰角 ${Math.round(campaignHero().spearAimAngle)}°`);
+    const startingAngle = campaignHero().spearAimAngle;
+    document.fire('keydown', { code: 'ArrowUp', repeat: false });
+    advanceFrame();
+    document.fire('keyup', { code: 'ArrowUp' });
+    assert.ok(campaignHero().spearAimAngle > startingAngle, 'up raises the throwing angle');
+    assert.equal(elements.get('spear-angle').textContent,
+      `仰角 ${Math.round(campaignHero().spearAimAngle)}°`, 'keyboard adjustments refresh the touch readout');
+    const raisedAngle = campaignHero().spearAimAngle;
+    const canvas = elements.get('game-canvas');
+    canvas.fire('pointerdown', { pointerId: 77, clientY: 180 });
+    canvas.fire('pointermove', { pointerId: 77, clientY: 140 });
+    canvas.fire('pointerup', { pointerId: 77, clientY: 140 });
+    const dragged = advanceFrame();
+    assert.ok(dragged[0].aimAngle > raisedAngle, 'stage drag sends a finite angle to the simulation');
+    assert.ok(campaignHero().spearAimAngle > raisedAngle, 'dragging upwards raises the angle');
+    assert.equal(elements.get('spear-angle').textContent,
+      `仰角 ${Math.round(campaignHero().spearAimAngle)}°`, 'drag adjustments refresh the touch readout');
+    const beforeDown = campaignHero().spearAimAngle;
+    const aimDown = elements.get('aim-down-button');
+    aimDown.fire('pointerdown', { pointerId: 78 });
+    aimDown.fire('pointerup', { pointerId: 78 });
+    advanceFrame();
+    assert.ok(campaignHero().spearAimAngle < beforeDown, 'a short touch press lowers the angle');
+    assert.equal(elements.get('spear-angle').textContent,
+      `仰角 ${Math.round(campaignHero().spearAimAngle)}°`, 'touch adjustments refresh the angle readout');
+    assert.equal(campaignHero().spearWindup, 0, 'adjusting/releasing the stage does not throw');
+
+    tapKey('KeyI');
+    advanceFrame();
+    assert.equal(campaignHero().spearAiming, false);
+    assert.ok(campaignHero().spearWindup > 0, 'second I press commits a 20-tick windup');
+    assert.equal(elements.get('spear-button').disabled, true);
+    assert.equal(elements.get('spear-aim-controls').hidden, true);
+    for (let index = 0; index < 4; index++) advanceFrame(100);
+    assert.equal(campaignHero().spearWindup, 0, 'the committed throw completes before re-aiming');
+    tapKey('KeyI');
+    advanceFrame();
+    assert.equal(campaignHero().spearAiming, true, 'the unlimited spear can be aimed again');
+    tapKey('Escape');
+    advanceFrame();
+    assert.equal(campaignHero().spearAiming, false, 'Escape cancels without a projectile');
+    const spearTouch = elements.get('spear-button');
+    spearTouch.fire('pointerdown', { pointerId: 79 });
+    spearTouch.fire('pointerup', { pointerId: 79 });
+    advanceFrame();
+    assert.equal(campaignHero().spearAiming, true, 'the touch spear button enters the same aim state');
+    advanceFrame();
+    spearTouch.fire('pointerdown', { pointerId: 79 });
+    spearTouch.fire('pointerup', { pointerId: 79 });
+    advanceFrame();
+    assert.ok(campaignHero().spearWindup > 0, 'touch 发射 explicitly confirms the aimed throw');
+    for (let index = 0; index < 4; index++) advanceFrame(100);
+    spearTouch.fire('pointerdown', { pointerId: 79 });
+    spearTouch.fire('pointerup', { pointerId: 79 });
+    advanceFrame();
+    assert.equal(campaignHero().spearAiming, true, 'touch can aim again without an ammo counter');
+    const cancelTouch = elements.get('aim-cancel-button');
+    cancelTouch.fire('pointerdown', { pointerId: 80 });
+    cancelTouch.fire('pointerup', { pointerId: 80 });
+    advanceFrame();
+    assert.equal(campaignHero().spearAiming, false, 'touch cancel leaves the throw uncommitted');
+
+    for (const [label, cancel] of [
+      ['Escape', () => tapKey('Escape')],
+      ['touch cancel', () => {
+        cancelTouch.fire('pointerdown', { pointerId: 82 });
+        cancelTouch.fire('pointerup', { pointerId: 82 });
+      }],
+    ]) {
+      tapKey('KeyI');
+      tapKey('KeyI');
+      assert.equal(advanceFrame()[0].spear, true);
+      assert.equal(campaignHero().spearAiming, true, `${label}: first rapid I tap enters aim`);
+      cancel();
+      assert.equal(advanceFrame()[0].spear, false, `${label}: cancel wins over the pending second tap`);
+      for (let index = 0; index < 2; index++) {
+        assert.equal(advanceFrame()[0].spear, false, `${label}: no delayed throw or re-aim`);
+      }
+      assert.equal(campaignHero().spearAiming, false, `${label}: aim stays cancelled`);
+      assert.equal(campaignHero().spearWindup, 0, `${label}: no throw is committed`);
+      assert.equal(elements.get('spear-aim-controls').hidden, true);
+    }
+
+    // Casting a charged wave cancels aim and updates the controls in the same
+    // simulation frame, without waiting for the regular HUD refresh interval.
+    activeCampaign.specialEligible = true;
+    activeCampaign.specialCharges = 1;
+    tapKey('KeyI');
+    advanceFrame();
+    assert.equal(campaignHero().spearAiming, true);
+    advanceFrame(100);
+    assert.equal(elements.get('special-button').disabled, false);
+    assert.equal(elements.get('spear-aim-controls').hidden, false);
+    tapKey('KeyL');
+    assert.equal(advanceFrame()[0].special, true);
+    assert.ok(latestCampaignView.events.some((event) => event.type === 'special-wave'));
+    assert.equal(campaignHero().spearAiming, false);
+    assert.equal(elements.get('spear-aim-controls').hidden, true, 'wave hides aim controls immediately');
+    assert.equal(elements.get('spear-button').textContent, '投矛', 'wave restores the spear button immediately');
+    assert.equal(elements.get('spear-button').disabled, false);
+    assert.equal(elements.get('special-button').disabled, true, 'spent wave charge updates immediately');
+    activeCampaign.specialEligible = false;
+    activeCampaign.specialCharges = 0;
+
+    tapKey('KeyI');
+    advanceFrame();
+    window.fire('blur');
+    assert.equal(campaignHero().spearAiming, false, 'losing focus cancels uncommitted aim');
+    document.fire('keydown', { code: 'KeyI', repeat: false });
+    advanceFrame();
+    assert.equal(campaignHero().spearAiming, true, 'holding I first enters aim');
+    for (let index = 0; index < 4; index++) advanceFrame(35);
+    assert.equal(campaignHero().spearAiming, true, 'holding I never confirms the throw');
+    assert.equal(campaignHero().spearWindup, 0);
+    document.fire('keyup', { code: 'KeyI' });
+    tapKey('Escape');
+    advanceFrame();
+    tapKey('KeyI');
+    advanceFrame();
+    assert.equal(campaignHero().spearAiming, true);
+    elements.get('duel-button').fire('click');
+    assert.equal(campaignHero().spearAiming, false, 'switching modes drops an unconfirmed aim');
+    elements.get('campaign-button').fire('click');
+    elements.get('overlay-primary').fire('click');
+
+    tapKey('KeyI');
+    tapKey('KeyI');
+    assert.equal(advanceFrame()[0].spear, true);
+    assert.equal(campaignHero().spearAiming, true, 'the first rapid tap still shows the arc');
+    assert.equal(advanceFrame()[0].spear, false, 'a release tick separates rapid taps');
+    assert.equal(advanceFrame()[0].spear, true, 'the second rapid tap is not merged or lost');
+    assert.ok(campaignHero().spearWindup > 0, 'rapid double-tap can commit once');
+    const committedTicks = campaignHero().spearWindup;
+    elements.get('duel-button').fire('click');
+    assert.equal(campaignHero().spearWindup, committedTicks,
+      'switching away pauses but does not undo an already committed spear');
+    elements.get('campaign-button').fire('click');
+    elements.get('overlay-primary').fire('click');
+    advanceFrame();
+    assert.ok(campaignHero().spearWindup < committedTicks,
+      'the committed windup continues on the next live campaign tick');
+    for (let index = 0; index < 4; index++) advanceFrame(100);
 
     // Both short presses occur between simulation ticks, yet the next tick
     // must see them together and resolve jump + kick as an air kick.
@@ -198,12 +362,12 @@ test('browser controller boots, switches modes, starts a fight and renders a fra
     assert.equal(advanceFrame()[0].jump, false);
     assert.equal(campaignInputs.at(-1).kick, false);
 
-    for (const [code, action] of [['Space', 'jump'], ['KeyJ', 'attack'], ['KeyK', 'kick'], ['KeyL', 'special'], ['ShiftLeft', 'dodge']]) {
+    for (const [code, action] of [['Space', 'jump'], ['KeyJ', 'attack'], ['KeyK', 'kick'], ['KeyL', 'special'], ['KeyI', 'spear'], ['ShiftLeft', 'dodge']]) {
       tapKey(code);
       assert.equal(advanceFrame()[0][action], true, `short ${action} keyboard tap should survive until the next tick`);
       assert.equal(advanceFrame()[0][action], false, `${action} must not automatically repeat`);
     }
-    for (const [index, action] of ['jump', 'attack', 'kick', 'dodge', 'special'].entries()) {
+    for (const [index, action] of ['jump', 'attack', 'kick', 'dodge'].entries()) {
       const button = buttons.find((entry) => entry.dataset.key === action);
       button.fire('pointerdown', { pointerId: 20 + index });
       button.fire('pointerup', { pointerId: 20 + index });
@@ -211,6 +375,9 @@ test('browser controller boots, switches modes, starts a fight and renders a fra
       assert.equal(advanceFrame()[0][action], true, `short ${action} touch tap should survive until the next tick`);
       assert.equal(advanceFrame()[0][action], false, `${action} touch tap must be consumed once`);
     }
+    const unavailableSpecial = buttons.find((entry) => entry.dataset.key === 'special');
+    unavailableSpecial.fire('pointerdown', { pointerId: 81 });
+    assert.equal(advanceFrame()[0].special, false, 'hidden or disabled touch actions never queue');
     tapKey('KeyJ');
     const catchUpSteps = advanceFrame(45);
     assert.ok(catchUpSteps.length > 1, 'a delayed animation frame should simulate multiple ticks');
@@ -244,8 +411,10 @@ test('browser controller boots, switches modes, starts a fight and renders a fra
     document.fire('keyup', { code: 'Space' });
 
     tapKey('KeyL');
+    tapKey('KeyI');
     window.fire('blur');
     assert.equal(advanceFrame()[0].special, false, 'blur drops a queued light wave');
+    assert.equal(campaignInputs.at(-1).spear, false, 'blur drops a queued spear');
 
     document.fire('keydown', { code: 'ShiftLeft', repeat: false });
     latestCampaignView.combat.fighters.find((fighter) => fighter.id === 'hero').hp = 0;
@@ -286,11 +455,22 @@ test('browser controller boots, switches modes, starts a fight and renders a fra
     socket.fire('message', { data: JSON.stringify({ type: 'start', code: '123456', role: 'p1', theme: 'city' }) });
     assert.equal(socket.sent.at(-1).input.kick, false);
     assert.equal('special' in socket.sent.at(-1).input, false);
+    assert.equal('spear' in socket.sent.at(-1).input, false);
+    assert.deepEqual(Object.keys(socket.sent.at(-1).input).sort(),
+      ['attack', 'dodge', 'jump', 'kick', 'left', 'right']);
 
     document.fire('keydown', { code: 'KeyL', repeat: false });
     assert.equal('special' in socket.sent.at(-1).input, false, 'light wave is never sent to the duel server');
     document.fire('keyup', { code: 'KeyL' });
     assert.equal(elements.get('special-button').hidden, true, 'duels do not show the special button');
+    document.fire('keydown', { code: 'KeyI', repeat: false });
+    assert.equal('spear' in socket.sent.at(-1).input, false, 'campaign spears never enter PvP protocol');
+    document.fire('keyup', { code: 'KeyI' });
+    document.fire('keydown', { code: 'ArrowUp', repeat: false });
+    assert.equal('aimUp' in socket.sent.at(-1).input, false, 'campaign aiming never enters PvP');
+    document.fire('keyup', { code: 'ArrowUp' });
+    assert.equal(elements.get('spear-button').hidden, true, 'duels do not show the spear button');
+    assert.equal(elements.get('spear-aim-controls').hidden, true);
 
     document.fire('keydown', { code: 'KeyK', repeat: false });
     assert.equal(socket.sent.at(-1).input.kick, true);
@@ -353,6 +533,39 @@ test('browser controller boots, switches modes, starts a fight and renders a fra
     elements.get('leave-room').fire('click');
     fireTimers(300);
     assert.equal(elements.get('screen-overlay').hidden, true, 'leaving cancels the queued result');
+
+    // A single-enemy room must stay walkable after the real final KO so the
+    // player can pass the fallen enemy before the clear panel takes over.
+    elements.get('campaign-button').fire('click');
+    elements.get('overlay-primary').fire('click'); // retry the earlier failed first room
+    advanceFrame(35);
+    const finisher = activeCampaign.combat.fighters.find((fighter) => fighter.team === 0);
+    const lastEnemy = activeCampaign.combat.fighters.find((fighter) => fighter.team === 1);
+    assert.ok(finisher && lastEnemy);
+    finisher.x = lastEnemy.x - 37;
+    finisher.y = lastEnemy.y;
+    finisher.facing = 1;
+    finisher.attackStage = 1;
+    finisher.attackTick = 4;
+    finisher.hitIds = [];
+    finisher.stun = 0;
+    lastEnemy.hp = 1;
+    lastEnemy.stun = 100;
+    lastEnemy.invulnerable = 0;
+    advanceFrame(35);
+    assert.equal(latestCampaignView.phase, 'aftermath');
+    assert.equal(elements.get('screen-overlay').hidden, true, 'the victory window remains playable');
+    assert.match(elements.get('stage-subtitle').textContent, /走过倒地敌人/);
+    assert.equal(elements.get('opponent-name').textContent, '对手已倒下',
+      'the HUD must not promise another wave during final-KO aftermath');
+    assert.equal(elements.get('spear-button').disabled, true);
+    assert.equal(buttons.find((button) => button.dataset.key === 'attack').disabled, true);
+    assert.equal(buttons.find((button) => button.dataset.key === 'jump').disabled, false);
+    for (let frame = 0; frame < 3; frame++) advanceFrame(100);
+    assert.equal(latestCampaignView.phase, 'aftermath', 'the clear panel cannot mask the KO immediately');
+    for (let frame = 0; frame < 65 && latestCampaignView.phase === 'aftermath'; frame++) advanceFrame(100);
+    assert.equal(latestCampaignView.phase, 'cleared', 'the victory window eventually resolves');
+    assert.equal(elements.get('overlay-title').textContent, '关卡突破');
   } finally {
     CampaignSession.prototype.step = originalCampaignStep;
     for (const [key, value] of Object.entries(previous)) {

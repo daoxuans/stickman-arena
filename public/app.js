@@ -1,4 +1,5 @@
-import { createDuelState, TICK_RATE } from '../shared/combat.js';
+import { cancelSpearAim, createDuelState, SPEAR_MAX_ANGLE, SPEAR_MIN_ANGLE,
+  TICK_RATE } from '../shared/combat.js';
 import { LEVELS, MAX_LEVEL, THEMES, getLevel } from '../shared/levels.js';
 import { CampaignSession } from './campaign.js';
 import { createRenderer } from './render.js';
@@ -13,6 +14,8 @@ const IDS = [
   'room-code', 'room-input', 'create-room', 'join-room', 'copy-room',
   'room-message', 'leave-room', 'rematch', 'sound-toggle', 'toast',
   'special-status', 'special-key-guide', 'special-button',
+  'spear-status', 'spear-key-guide', 'spear-button', 'spear-aim-controls', 'spear-angle',
+  'aim-up-button', 'aim-down-button', 'aim-cancel-button', 'touch-tip',
 ];
 const ui = Object.fromEntries(IDS.map((id) => [id, document.getElementById(id)]));
 for (const id of IDS) {
@@ -35,13 +38,22 @@ let overlaySecondaryAction = null;
 const keyboard = new Set();
 const pointerButtons = new Map();
 const campaignPresses = new Set();
-const campaignActions = new Set(['jump', 'attack', 'kick', 'dodge', 'special']);
+let pendingSpearPresses = 0;
+let spearNeedsReleaseTick = false;
+const campaignActions = new Set([
+  'jump', 'attack', 'kick', 'dodge', 'special', 'spear', 'aimUp', 'aimDown', 'aimCancel',
+]);
 const keyBindings = new Map([
   ['KeyA', 'left'], ['ArrowLeft', 'left'],
   ['KeyD', 'right'], ['ArrowRight', 'right'],
-  ['KeyJ', 'attack'], ['KeyK', 'kick'], ['KeyL', 'special'], ['Space', 'jump'],
+  ['KeyW', 'aimUp'], ['ArrowUp', 'aimUp'],
+  ['KeyS', 'aimDown'], ['ArrowDown', 'aimDown'],
+  ['KeyJ', 'attack'], ['KeyK', 'kick'], ['KeyL', 'special'], ['KeyI', 'spear'], ['Space', 'jump'],
+  ['Escape', 'aimCancel'],
   ['ShiftLeft', 'dodge'], ['ShiftRight', 'dodge'],
 ]);
+let aimDrag = null;
+let pendingAimAngle = null;
 
 const duel = {
   socket: null, connection: null, code: null, role: null, theme: 'city',
@@ -124,6 +136,15 @@ class SoundEffects {
         this.noise(0.18, 0.055, 2300);
         break;
       case 'special-ready': this.tone(520, 880, 0.17, 0.045); break;
+      case 'spear-aim': this.tone(330, 440, 0.12, 0.026); break;
+      case 'spear-windup': this.tone(220, 340, 0.16, 0.028); break;
+      case 'spear-throw':
+        this.tone(520, 170, 0.19, 0.05, 'triangle');
+        this.noise(0.09, 0.032, 2700);
+        break;
+      case 'spear-impact':
+        if (effect.blocked) this.tone(470, 160, 0.09, 0.025);
+        break;
       case 'ko': {
         // KO arrives when the fighter falls. The tomato lands on the head ~180 ms later.
         this.tone(125, 75, 0.11, 0.025, 'sine');
@@ -134,6 +155,12 @@ class SoundEffects {
         this.pendingKOs.add(timer);
         break;
       }
+      case 'bones-scatter':
+        // A brief dry rattle distinguishes the playful skeleton gag from the wet tomato.
+        this.tone(560, 230, 0.1, 0.035, 'triangle');
+        this.tone(790, 350, 0.075, 0.018, 'sine');
+        this.noise(0.06, 0.025, 2400);
+        break;
       case 'jump': this.tone(260, 410, 0.11, 0.035); break;
       case 'kick':
         this.tone(240, 105, 0.12, 0.035);
@@ -215,22 +242,47 @@ function currentInput() {
     left: held.has('left'), right: held.has('right'),
     attack: held.has('attack'), kick: held.has('kick'),
     jump: held.has('jump'), dodge: held.has('dodge'),
-    special: held.has('special'),
+    special: held.has('special'), spear: held.has('spear'),
+    aimUp: held.has('aimUp'), aimDown: held.has('aimDown'),
+    aimCancel: held.has('aimCancel'),
   };
 }
 
 function queueCampaignPress(button) {
-  if (mode === 'campaign' && !campaignPaused && campaignView.phase === 'playing'
-    && campaignActions.has(button)) campaignPresses.add(button);
+  if (mode === 'campaign' && !campaignPaused
+    && (campaignView.phase === 'playing' || (campaignView.phase === 'aftermath' && button === 'jump'))
+    && campaignActions.has(button)) {
+    // Keep distinct I taps even when both land between two simulation frames.
+    if (button === 'spear') pendingSpearPresses = Math.min(2, pendingSpearPresses + 1);
+    else {
+      // A cancellation must also discard a second I tap still waiting behind
+      // the release tick, otherwise it can silently start a new aim afterward.
+      if (['aimCancel', 'jump', 'attack', 'kick', 'dodge'].includes(button)) pendingSpearPresses = 0;
+      campaignPresses.add(button);
+    }
+  }
 }
 
 function campaignInput() {
   const input = currentInput();
+  // Spear is a command, not a held action. A real release tick separates two
+  // queued taps so combat sees two edges without a long hold auto-confirming.
+  input.spear = false;
   // Combat skips control sampling for the entire hitstop tick, including 1 -> 0.
   // Keep short presses until the following tick can actually consume them.
   if (campaignView.combat?.hitstop > 0) return input;
   for (const button of campaignPresses) input[button] = true;
   campaignPresses.clear();
+  if (spearNeedsReleaseTick) spearNeedsReleaseTick = false;
+  else if (pendingSpearPresses > 0) {
+    pendingSpearPresses--;
+    input.spear = true;
+    spearNeedsReleaseTick = true;
+  }
+  if (Number.isFinite(pendingAimAngle)) {
+    input.aimAngle = pendingAimAngle;
+    pendingAimAngle = null;
+  }
   return input;
 }
 
@@ -239,8 +291,10 @@ function sendInput(force = false) {
   const now = performance.now();
   if (!force && now - duel.lastInputAt < 48) return;
   duel.lastInputAt = now;
-  const input = currentInput();
-  delete input.special; // A campaign-only power is never part of the PvP protocol.
+  const held = currentInput();
+  // Send only the six authorized PvP controls; new campaign aim fields cannot leak.
+  const input = Object.fromEntries(['left', 'right', 'jump', 'attack', 'kick', 'dodge']
+    .map((button) => [button, held[button]]));
   duel.socket.send(JSON.stringify({ type: 'input', seq: duel.inputSeq++, input }));
 }
 
@@ -264,6 +318,7 @@ document.addEventListener('keyup', (event) => {
 });
 for (const button of document.querySelectorAll('[data-key]')) {
   button.addEventListener('pointerdown', (event) => {
+    if (button.disabled || button.hidden) return;
     event.preventDefault();
     button.setPointerCapture(event.pointerId);
     pointerButtons.set(event.pointerId, button.dataset.key);
@@ -280,21 +335,73 @@ for (const button of document.querySelectorAll('[data-key]')) {
   button.addEventListener('pointercancel', release);
   button.addEventListener('lostpointercapture', release);
 }
-function releaseInput() {
+const aftermathActionButtons = [...document.querySelectorAll('[data-key]')]
+  .filter((button) => ['attack', 'kick', 'dodge'].includes(button.dataset.key));
+
+// Dragging the battlefield only adjusts the elevation. Releasing a finger never
+// fires a spear: the explicit second I press / 发射 button remains the commit.
+ui['game-canvas'].addEventListener('pointerdown', (event) => {
+  const hero = campaignView.combat?.fighters.find((fighter) => fighter.team === 0);
+  if (mode !== 'campaign' || campaignPaused || campaignView.phase !== 'playing'
+      || !hero?.spearAiming || aimDrag) return;
+  event.preventDefault();
+  ui['game-canvas'].setPointerCapture(event.pointerId);
+  aimDrag = { pointerId: event.pointerId, startY: event.clientY,
+    startAngle: Number.isFinite(pendingAimAngle) ? pendingAimAngle : hero.spearAimAngle };
+  ui['game-canvas'].classList.add('is-aim-dragging');
+});
+ui['game-canvas'].addEventListener('pointermove', (event) => {
+  if (!aimDrag || aimDrag.pointerId !== event.pointerId) return;
+  const hero = campaignView.combat?.fighters.find((fighter) => fighter.team === 0);
+  if (!hero?.spearAiming || !Number.isFinite(event.clientY)) return;
+  event.preventDefault();
+  pendingAimAngle = Math.max(SPEAR_MIN_ANGLE, Math.min(SPEAR_MAX_ANGLE,
+    aimDrag.startAngle + (aimDrag.startY - event.clientY) * 0.22));
+});
+function endAimDrag(event) {
+  if (!aimDrag || aimDrag.pointerId !== event.pointerId) return;
+  aimDrag = null;
+  if (event.type === 'pointercancel') pendingAimAngle = null;
+  ui['game-canvas'].classList.remove('is-aim-dragging');
+}
+for (const type of ['pointerup', 'pointercancel', 'lostpointercapture']) {
+  ui['game-canvas'].addEventListener(type, endAimDrag);
+}
+
+function releaseInput(cancelAim = false) {
   keyboard.clear();
   pointerButtons.clear();
   campaignPresses.clear();
+  pendingSpearPresses = 0;
+  spearNeedsReleaseTick = false;
   for (const button of document.querySelectorAll('[data-key]')) button.classList.remove('is-pressed');
+  aimDrag = null;
+  pendingAimAngle = null;
+  ui['game-canvas'].classList.remove('is-aim-dragging');
+  if (cancelAim && mode === 'campaign') {
+    const hero = campaignView.combat?.fighters.find((fighter) => fighter.team === 0);
+    if (hero?.spearAiming) cancelSpearAim(hero);
+    // A blur/mode change can happen between ticks. Clear the sampled I edge so
+    // the first fresh press after returning is not mistaken for a held key.
+    if (hero?.prevInput) hero.prevInput.spear = false;
+    updateCampaignHud();
+  }
   sendInput(true);
 }
-window.addEventListener('blur', releaseInput);
-document.addEventListener('visibilitychange', () => { if (document.hidden) releaseInput(); });
+window.addEventListener('blur', () => releaseInput(true));
+document.addEventListener('visibilitychange', () => { if (document.hidden) releaseInput(true); });
 
 function health(fill, label, fighter) {
   const value = fighter ? Math.max(0, Math.ceil(fighter.hp)) : 0;
   const max = fighter?.maxHp ?? 100;
   fill.style.width = `${Math.max(0, Math.min(100, value / max * 100))}%`;
   label.textContent = `${value} / ${max}`;
+}
+
+function updateAimAngle(hero) {
+  if (!hero?.spearAiming) return;
+  const label = `仰角 ${Math.round(hero.spearAimAngle)}°`;
+  if (ui['spear-angle'].textContent !== label) ui['spear-angle'].textContent = label;
 }
 
 function drawMap() {
@@ -332,18 +439,56 @@ function updateCampaignHud() {
   ui['theme-label'].textContent = `${level.themeName} · 第 ${level.chapter} 章`;
   ui['stage-label'].textContent = `关卡 ${String(level.number).padStart(2, '0')} / ${MAX_LEVEL}`;
   ui['stage-title'].textContent = level.name;
-  ui['stage-subtitle'].textContent = `${level.isBoss ? '首领之战 · ' : ''}第 ${level.stage} 关 · 第 ${waveNumber}/${waveCount} 波 · ${level.enemyCount} 名对手`;
+  ui['stage-subtitle'].textContent = campaignView.phase === 'aftermath'
+    ? '对手已倒下 · 退开再走过倒地敌人，片刻后结算'
+    : `${level.isBoss ? '首领之战 · ' : ''}第 ${level.stage} 关 · 第 ${waveNumber}/${waveCount} 波 · ${level.enemyCount} 名对手`;
   ui['player-name'].textContent = '火柴斗士';
-  ui['opponent-name'].textContent = opponent?.name ?? (campaignView.phase === 'cleared' ? '本关已清除' : '等待下一波');
+  ui['opponent-name'].textContent = opponent?.name ?? (campaignView.phase === 'aftermath'
+    ? '对手已倒下' : ['cleared', 'completed'].includes(campaignView.phase) ? '本关已清除' : '等待下一波');
   health(ui['player-health'], ui['player-health-text'], hero);
   health(ui['opponent-health'], ui['opponent-health-text'], opponent);
   ui['match-clock'].textContent = `${waveNumber} / ${waveCount}`;
-  ui['session-status'].textContent = '单人闯关 · 本机存档';
+  ui['session-status'].textContent = campaignView.phase === 'aftermath'
+    ? '胜利收尾 · 可继续走动' : '单人闯关 · 本机存档';
   ui['checkpoint-label'].textContent = `存档点：第 ${String(progress.checkpointLevel).padStart(2, '0')} 关`;
   ui['progress-label'].textContent = `当前进度 ${String(progress.currentLevel).padStart(2, '0')} / ${MAX_LEVEL} · 失败 ${progress.deaths} 次`;
   ui['special-status'].hidden = !specialEligible;
   ui['special-key-guide'].hidden = !specialEligible;
   ui['special-button'].hidden = !specialEligible;
+  ui['spear-status'].hidden = false;
+  ui['spear-key-guide'].hidden = false;
+  ui['spear-button'].hidden = false;
+  const active = campaignView.phase === 'playing' && !campaignPaused && hero?.hp > 0;
+  const aiming = active && hero.spearAiming === true;
+  const winding = active && hero.spearWindup > 0;
+  const busy = hero && (hero.stun > 0 || hero.attackStage > 0 || hero.kickType
+    || hero.dodgeTicks > 0);
+  const spearText = campaignView.phase === 'aftermath'
+    ? '胜利收尾 · 退开再走过倒地敌人，落稳后约 3 秒结算'
+    : aiming
+    ? '瞄准中 · ↑↓ / W S 或上下拖动调角，再按 I 发射，Esc 取消'
+    : winding ? '投矛蓄势中 · 被击中会打断'
+      : busy ? '投矛不限次数 · 出招结束后按 I 瞄准'
+        : '投矛不限次数 · 按 I 瞄准，再按 I 发射';
+  if (ui['spear-status'].textContent !== spearText) ui['spear-status'].textContent = spearText;
+  ui['spear-status'].classList.toggle('is-ready', active && !busy && !winding);
+  ui['spear-status'].classList.toggle('is-aiming', aiming);
+  ui['spear-button'].textContent = aiming ? '发射' : winding ? '蓄势中' : '投矛';
+  ui['spear-button'].disabled = !active || winding || (!aiming && Boolean(busy));
+  ui['spear-button'].setAttribute('aria-label', aiming
+    ? `确认发射投矛，当前仰角 ${Math.round(hero.spearAimAngle)} 度`
+    : winding ? '投矛蓄势中' : '进入投矛瞄准，不限次数');
+  ui['spear-aim-controls'].hidden = !aiming;
+  if (aiming) updateAimAngle(hero);
+  for (const id of ['aim-up-button', 'aim-down-button', 'aim-cancel-button']) ui[id].disabled = !aiming;
+  ui['game-canvas'].classList.toggle('is-aiming', aiming);
+  ui['touch-tip'].textContent = campaignView.phase === 'aftermath'
+    ? '左右走动 · 退开再走过倒地敌人可触发散骨'
+    : aiming
+    ? '上下拖动画面或按「抬高/压低」调角 · 点「发射」确认，战斗不会暂停'
+    : winding ? '投矛蓄势中 · 被击中会打断'
+      : '空中按「踢腿」释放跳踢大招 · 投矛先瞄准、再发射';
+  for (const button of aftermathActionButtons) button.disabled = campaignView.phase === 'aftermath';
   if (specialEligible) {
     const needed = 2 - (specialKills % 2);
     const specialText = specialCharges > 0
@@ -399,10 +544,16 @@ function campaignOverlay() {
         hideOverlay();
       },
     });
+  } else if (phase === 'aftermath') {
+    showOverlay({
+      title: '胜利收尾',
+      body: '敌人已经倒下。退开后，从同一层走过倒地敌人可触发散骨；落稳后约 3 秒自动结算，本段不会再受到机关伤害。',
+      primary: '继续走动', onPrimary: () => { resumeCampaign(); hideOverlay(); },
+    });
   } else {
     showOverlay({
       title: level.number === 1 && progress.cleared.length === 0 ? '准备开战' : '继续征程',
-      body: `第 ${level.number} / ${MAX_LEVEL} 关 · ${level.themeName}「${level.name}」。A/D 移动，J 攻击，空格跳跃，Shift 闪避。${campaignView.specialEligible ? '每击倒两名敌人可按 L 释放一次无敌光波。' : ''}`,
+      body: `第 ${level.number} / ${MAX_LEVEL} 关 · ${level.themeName}「${level.name}」。A/D 移动，J 攻击，空格跳跃，Shift 闪避。按 I 预览投矛弧线，↑↓ 调角，再按 I 确认发射；Esc 取消。${campaignView.specialEligible ? '每击倒两名敌人可按 L 释放一次无敌光波。' : ''}`,
       primary: '开始挑战',
       onPrimary: () => { resumeCampaign(); hideOverlay(); },
     });
@@ -412,19 +563,25 @@ function campaignOverlay() {
 function resumeCampaign() {
   cancelResultOverlay();
   sound.cancelPendingKOs();
-  releaseInput();
+  releaseInput(true);
   accumulator = 0;
   campaignPaused = false;
+  updateCampaignHud();
 }
 
 function consumeEvents(events) {
   for (const effect of events ?? []) {
     renderer.effect(effect);
     sound.play(effect);
+    if (mode === 'campaign' && ['spear-aim-cancel', 'special-wave', 'wave'].includes(effect.type)) {
+      pendingSpearPresses = 0;
+    }
     if (mode === 'campaign' && effect.type === 'special-ready') {
       notify(`光波已充能 ${effect.charges} 次，按 L 或点击光波发动`);
       updateCampaignHud();
     }
+    if (mode === 'campaign' && ['spear-aim', 'spear-aim-cancel', 'spear-windup', 'spear-throw', 'special-wave', 'wave']
+      .includes(effect.type)) updateCampaignHud();
   }
 }
 
@@ -451,6 +608,15 @@ function updateDuelHud() {
   ui['special-key-guide'].hidden = true;
   ui['special-button'].hidden = true;
   ui['special-button'].disabled = true;
+  for (const button of aftermathActionButtons) button.disabled = false;
+  ui['touch-tip'].textContent = '空中按「踢腿」释放跳踢大招';
+  ui['spear-status'].hidden = true;
+  ui['spear-key-guide'].hidden = true;
+  ui['spear-button'].hidden = true;
+  ui['spear-button'].disabled = true;
+  ui['spear-aim-controls'].hidden = true;
+  for (const id of ['aim-up-button', 'aim-down-button', 'aim-cancel-button']) ui[id].disabled = true;
+  ui['game-canvas'].classList.remove('is-aiming', 'is-aim-dragging');
   ui['room-code'].textContent = duel.code ?? '—— —— ——';
   ui['copy-room'].disabled = !duel.code;
   ui['leave-room'].hidden = !duel.code;
@@ -706,7 +872,7 @@ function switchMode(next) {
   cancelResultOverlay();
   sound.cancelPendingKOs();
   if (mode === 'duel' && duel.code) leaveRoom();
-  releaseInput();
+  releaseInput(true);
   mode = next;
   ui['campaign-panel'].hidden = next !== 'campaign';
   ui['duel-panel'].hidden = next !== 'duel';
@@ -771,17 +937,21 @@ function duelPresentation(now) {
 function frame(now) {
   const elapsed = Math.min(100, Math.max(0, now - lastFrameAt));
   lastFrameAt = now;
-  if (mode === 'campaign' && !campaignPaused && campaignView.phase === 'playing') {
+  if (mode === 'campaign' && !campaignPaused
+      && (campaignView.phase === 'playing' || campaignView.phase === 'aftermath')) {
     accumulator += elapsed;
     let steps = 0;
     while (accumulator >= 1000 / TICK_RATE && steps < 5) {
+      const previousPhase = campaignView.phase;
       campaignView = campaign.step(campaignInput());
       consumeEvents(campaignView.events);
+      if (campaignView.phase !== previousPhase) updateCampaignHud();
+      updateAimAngle(campaignView.combat?.fighters.find((fighter) => fighter.team === 0));
       accumulator -= 1000 / TICK_RATE;
       steps++;
-      if (campaignView.phase !== 'playing') {
+      if (campaignView.phase !== 'playing' && campaignView.phase !== 'aftermath') {
         campaignPaused = true;
-        releaseInput();
+        releaseInput(true);
         drawMap();
         updateCampaignHud();
         const settledView = campaignView;
@@ -804,6 +974,7 @@ function frame(now) {
   renderer.render(view, {
     theme: mode === 'campaign' ? stage.theme : duel.theme,
     mode, level: stage?.number, time: now / 1000,
+    campaignPhase: mode === 'campaign' ? campaignView.phase : undefined,
   });
   if (now - lastHudAt > 80) {
     if (mode === 'campaign') updateCampaignHud();

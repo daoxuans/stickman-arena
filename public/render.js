@@ -1,14 +1,43 @@
-import { attackOf, kickOf } from '../shared/combat.js';
+import { attackOf, kickOf, TICK_RATE, SPEAR_GRAVITY, SPEAR_MAX_ANGLE, SPEAR_MIN_ANGLE,
+  SPEAR_WINDUP_TICKS, spearAimedFlight, spearFlight, spearOrigin,
+  spearTrajectoryPoint } from '../shared/combat.js';
+import { platformPose } from '../shared/platforms.js';
 
-// All world coordinates are in a fixed 960 × 540 arena. The canvas backing
-// store is scaled for high-density screens; combat state remains unscaled.
+// The viewport is 960 × 540, while campaign world coordinates may span 1920px.
+// The canvas backing store is scaled for high-density screens only.
 const W = 960;
 const H = 540;
 const TAU = Math.PI * 2;
 const HEAD_RADIUS = 22;
+const SPEAR_PREVIEW_TICKS = 94;
+const SPEAR_RADIUS = 7;
 const TOMATO_DROP_MS = 180;
 const TOMATO_LIFE_MS = 1080;
 const TOMATO_FALL_MS = 270;
+const TOMATO_CRUSH_MS = 125;
+const TOMATO_SPLASH_MS = 470;
+const TOMATO_DROP_TICKS = Math.round(TOMATO_DROP_MS * TICK_RATE / 1000);
+const CORPSE_FADE_TICKS = 12;
+const BONES_SCATTER_MS = 620;
+const BONE_PARTS = [
+  { kind: 'head', along: 85, lift: 16, tilt: 0 },
+  { kind: 'torso', along: 56, lift: 12, length: 38, tilt: -.1 },
+  { kind: 'arm', along: 64, lift: 24, length: 25, tilt: -.42 },
+  { kind: 'arm', along: 55, lift: 2, length: 26, tilt: .44 },
+  { kind: 'leg', along: 30, lift: 17, length: 29, tilt: -.32 },
+  { kind: 'leg', along: 20, lift: 3, length: 28, tilt: .38 },
+];
+const WANDERER_PALETTES = [
+  { capeEdge: '#632029', cape: '#c73642', fold: '#ef6b68',
+    scarf: '#b62236', scarfLight: '#eb4a4e', eye: '#fff9f2', eyeAccent: '#ff555a' },
+  { capeEdge: '#14394b', cape: '#23758b', fold: '#78b8c5',
+    scarf: '#287f98', scarfLight: '#54bfd2', eye: '#e9feff', eyeAccent: '#7be8f1' },
+];
+const WANDERER_FACE = '#08151b';
+const WANDERER_HAT = {
+  shadow: '#081219', crown: '#1c2932', facet: '#293640',
+  weave: '#567e8d', rim: '#4db2bd',
+};
 
 const THEMES = {
   forest: {
@@ -158,6 +187,22 @@ function cloud(ctx, x, y, scale, color) {
   ellipse(ctx, x - 25 * scale, y + 5 * scale, 38 * scale, 8 * scale, color);
   ellipse(ctx, x + 29 * scale, y + 4 * scale, 42 * scale, 8 * scale, color);
   ctx.restore();
+}
+
+function drawTiledWorld(ctx, worldWidth, drawSegment) {
+  // Alternate original and mirrored 960px panels: a photo never gets stretched
+  // twice as wide, and the illustrated horizons meet at their shared edge.
+  for (let tile = 0; tile < Math.ceil(worldWidth / W); tile++) {
+    if (tile === 0) {
+      drawSegment();
+      continue;
+    }
+    ctx.save();
+    ctx.translate((tile + (tile % 2 ? 1 : 0)) * W, 0);
+    if (tile % 2) ctx.scale(-1, 1);
+    drawSegment();
+    ctx.restore();
+  }
 }
 
 function drawForest(ctx, tick, groundY, seed) {
@@ -314,7 +359,7 @@ function drawLand(ctx, tick, groundY, seed) {
   }
 }
 
-function drawPhotoBackdrop(ctx, image, theme, groundY, opacity) {
+function drawPhotoBackdrop(ctx, image, theme, groundY, opacity, worldWidth) {
   const colors = {
     forest: ['rgba(8,30,27,.17)', 'rgba(8,30,27,.47)'],
     city: ['rgba(15,27,37,.16)', 'rgba(13,29,34,.46)'],
@@ -323,12 +368,12 @@ function drawPhotoBackdrop(ctx, image, theme, groundY, opacity) {
   }[theme];
   ctx.save();
   ctx.globalAlpha = opacity;
-  ctx.drawImage(image, 0, 0, W, H);
+  drawTiledWorld(ctx, worldWidth, () => ctx.drawImage(image, 0, 0, W, H));
   const veil = ctx.createLinearGradient(0, 0, 0, groundY);
   veil.addColorStop(0, colors[0]);
   veil.addColorStop(1, colors[1]);
   ctx.fillStyle = veil;
-  ctx.fillRect(0, 0, W, groundY);
+  ctx.fillRect(0, 0, worldWidth, groundY);
   ctx.restore();
 }
 
@@ -406,20 +451,53 @@ function drawGround(ctx, theme, groundY, tick, seed, photoGrassland = false) {
   }
 }
 
-function drawPlatforms(ctx, platforms, theme) {
+function drawPlatforms(ctx, platforms, theme, motionTick) {
   const style = THEMES[theme];
   for (const platform of platforms || []) {
-    const x = number(platform.x);
-    const y = number(platform.y);
-    const w = Math.max(0, number(platform.w));
-    const h = Math.max(6, number(platform.h, 14));
+    const pose = platformPose(platform, motionTick);
+    const w = pose.width;
+    const h = Math.max(6, pose.height || 14);
     if (!w) continue;
+    ctx.save();
+    ctx.translate(pose.centerX, pose.centerY);
+    if (pose.angle) ctx.rotate(pose.angle);
+    const x = -w / 2;
+    const y = 0;
+    if (platform.motion === 'rotate') {
+      // The top edge is y=0 in exactly the same rotated frame as platformPose.
+      // Clear wooden end grain and a small pivot make the moving plank legible.
+      ctx.fillStyle = 'rgba(12,33,34,.23)';
+      ctx.fillRect(x + 5, y + 9, w, h);
+      ctx.fillStyle = '#684b37';
+      ctx.fillRect(x, y + 2, w, h);
+      ctx.fillStyle = '#c99866';
+      ctx.fillRect(x, y, w, 5);
+      ctx.fillStyle = '#8b6545';
+      ctx.fillRect(x + 2, y + 6, 5, h - 5);
+      ctx.fillRect(x + w - 7, y + 6, 5, h - 5);
+      line(ctx, [[x + 13, y + 8], [x + w - 13, y + 8]], '#a87a50', 1.4);
+      ellipse(ctx, 0, y + h * .65, 3.2, 3.2, '#e4be87');
+      ctx.restore();
+      continue;
+    }
+    if (platform.motion === 'float') {
+      ellipse(ctx, 0, y + h + 12, w * .36, 3, 'rgba(218,244,215,.18)');
+      line(ctx, [[x + 12, y + h + 4], [x + w - 12, y + h + 4]],
+        'rgba(215,243,220,.42)', 1.5);
+    }
     ctx.fillStyle = 'rgba(12,33,34,.18)';
     ctx.fillRect(x + 5, y + 8, w, h);
     ctx.fillStyle = style.platform;
     ctx.fillRect(x, y + 3, w, h);
     ctx.fillStyle = style.platformTop;
     ctx.fillRect(x, y, w, 6);
+    if (platform.kind === 'stair') {
+      // Each 50px tread is an independent top surface, with an exposed riser.
+      ctx.fillStyle = 'rgba(20,39,39,.24)';
+      ctx.fillRect(x + (platform.stairDirection === 'down' ? 1 : w - 6), y + 6, 5, h - 3);
+      ctx.fillStyle = 'rgba(255,236,196,.25)';
+      ctx.fillRect(x + 4, y + 1, Math.max(0, w - 8), 2);
+    }
     if (theme === 'forest') {
       for (let i = 0; i < w; i += 27) line(ctx, [[x + i + 9, y + 10], [x + i + 15, y + h - 1]], 'rgba(31,54,42,.27)', 1.5);
     } else if (theme === 'city') {
@@ -432,6 +510,7 @@ function drawPlatforms(ctx, platforms, theme) {
       polygon(ctx, [[x + w * .2, y + 6], [x + w * .31, y + h], [x + w * .38, y + 6]], 'rgba(66,49,46,.15)');
       line(ctx, [[x + w * .57, y + 7], [x + w * .48, y + h - 2]], 'rgba(245,207,151,.25)', 2);
     }
+    ctx.restore();
   }
 }
 
@@ -550,9 +629,9 @@ function fallingColors(kind) {
   }
 }
 
-function drawFallingWarning(ctx, falling, tick, reducedMotion) {
+function drawFallingWarning(ctx, falling, tick, reducedMotion, worldWidth) {
   if (!falling || (falling.phase !== 'warning' && falling.phase !== 'falling')) return;
-  const x = clamp(number(falling.x), 12, W - 12);
+  const x = clamp(number(falling.x), 12, worldWidth - 12);
   const y = clamp(number(falling.impactY), 18, H - 12);
   const colors = fallingColors(falling.kind);
   const warningTicks = Math.max(1, number(falling.warningTicks, 40));
@@ -609,6 +688,190 @@ function drawFallingObject(ctx, falling, tick, reducedMotion) {
   ctx.restore();
 }
 
+function drawSpear(ctx, projectile, reducedMotion) {
+  if (projectile?.kind !== 'spear') return;
+  const x = number(projectile.x);
+  const y = number(projectile.y);
+  const angle = Math.atan2(number(projectile.vy), number(projectile.vx, 1));
+  const friendly = projectile.team === 0;
+  const tip = friendly ? '#e5fff1' : '#fff0c6';
+  const shaft = friendly ? '#7dd2bd' : '#d79a70';
+  ctx.save();
+  ctx.translate(x, y);
+  ctx.rotate(angle);
+  if (!reducedMotion) {
+    ctx.globalAlpha = .56;
+    line(ctx, [[-49, 0], [-28, 0]], shaft, 3.2);
+    line(ctx, [[-39, -5], [-25, -2]], tip, 1.6);
+    ctx.globalAlpha = 1;
+  }
+  line(ctx, [[-23, 0], [13, 0]], '#473e3c', 6.5);
+  line(ctx, [[-22, -1], [13, -1]], shaft, 3.5);
+  polygon(ctx, [[11, -7], [26, 0], [11, 7], [15, 0]], tip);
+  line(ctx, [[-22, -6], [-22, 6]], tip, 2.6);
+  ctx.restore();
+}
+
+function aimedSpearPreview(origin, flight, groundY, worldWidth) {
+  const points = [[origin.x, origin.y]];
+  const ground = groundY - SPEAR_RADIUS;
+  let previous = origin;
+  // The projectile advances in whole combat ticks. Sampling the same flight
+  // makes the guide agree with its launch velocity and discrete gravity.
+  for (let tick = 1; tick <= SPEAR_PREVIEW_TICKS; tick++) {
+    const next = spearTrajectoryPoint(origin.x, origin.y, flight, tick);
+    let fraction = 1;
+    let stop = null;
+    if (next.x > worldWidth && previous.x <= worldWidth) {
+      fraction = (worldWidth - previous.x) / (next.x - previous.x);
+      stop = 'edge';
+    } else if (next.x < 0 && previous.x >= 0) {
+      fraction = (0 - previous.x) / (next.x - previous.x);
+      stop = 'edge';
+    }
+    if (next.y >= ground && next.y > previous.y && previous.y < ground) {
+      const groundFraction = (ground - previous.y) / (next.y - previous.y);
+      if (groundFraction <= fraction) {
+        fraction = groundFraction;
+        stop = 'ground';
+      }
+    }
+    // The combat engine removes a spear that leaves the sky bounds, too.
+    if (next.y < -80 && previous.y >= -80) {
+      const skyFraction = (-80 - previous.y) / (next.y - previous.y);
+      if (skyFraction <= fraction) {
+        fraction = skyFraction;
+        stop = 'edge';
+      }
+    }
+    const point = stop ? {
+      x: previous.x + (next.x - previous.x) * fraction,
+      y: previous.y + (next.y - previous.y) * fraction,
+    } : next;
+    points.push([point.x, point.y]);
+    if (stop) return { points, endpoint: point, stop };
+    previous = next;
+  }
+  return { points, endpoint: previous, stop: 'limit' };
+}
+
+function drawAimedSpearMarker(ctx, preview, cameraX, tick, reducedMotion, color) {
+  const { endpoint, stop } = preview;
+  const markerX = clamp(endpoint.x, cameraX + 25, cameraX + W - 25);
+  const markerY = clamp(endpoint.y, 108, H - 25);
+  const outsideView = Math.abs(endpoint.x - markerX) > .01;
+  const markerRadius = 8 + (reducedMotion ? 0 : Math.sin(tick * .18) * 1.2);
+  ctx.save();
+  ctx.beginPath();
+  if (outsideView) {
+    const direction = endpoint.x > markerX ? 1 : -1;
+    ctx.moveTo(markerX - direction * 8, markerY - 7);
+    ctx.lineTo(markerX, markerY);
+    ctx.lineTo(markerX - direction * 8, markerY + 7);
+  } else {
+    ctx.arc(markerX, markerY, markerRadius, 0, TAU);
+  }
+  ctx.strokeStyle = 'rgba(12, 25, 27, .88)';
+  ctx.lineWidth = 4.4;
+  ctx.stroke();
+  ctx.strokeStyle = color;
+  ctx.lineWidth = 2.2;
+  ctx.stroke();
+  const label = stop === 'edge' ? '飞出场地' : outsideView ? '参考落点在画面外' : '参考落点';
+  const labelWidth = outsideView ? 128 : 78;
+  const labelX = clamp(markerX, cameraX + labelWidth / 2 + 8,
+    cameraX + W - labelWidth / 2 - 8);
+  const labelY = markerY > 145 ? markerY - 29 : markerY + 26;
+  ctx.fillStyle = 'rgba(12, 25, 27, .84)';
+  ctx.fillRect(labelX - labelWidth / 2, labelY - 11, labelWidth, 21);
+  ctx.fillStyle = '#effff4';
+  ctx.font = '700 12px "Microsoft YaHei UI", sans-serif';
+  ctx.textAlign = 'center';
+  ctx.fillText(label, labelX, labelY + 4);
+  ctx.restore();
+}
+
+function drawSpearWindup(ctx, fighter, tick, reducedMotion, groundY, cameraX, worldWidth) {
+  const windup = number(fighter?.spearWindup);
+  const aiming = fighter?.team === 0 && fighter?.spearAiming === true;
+  if (number(fighter?.hp, 100) <= 0 || (!aiming && windup <= 0)) return;
+  const committed = fighter.team === 0 && windup > 0
+    && (fighter.spearLaunchFacing === -1 || fighter.spearLaunchFacing === 1);
+  const chosenFlight = aiming || committed;
+  const facing = number(committed ? fighter.spearLaunchFacing : fighter.facing, 1) < 0 ? -1 : 1;
+  const origin = spearOrigin({
+    ...fighter,
+    x: number(fighter.x), y: number(fighter.y),
+    width: number(fighter.width, fighter.kind === 'boss' ? 44 : 29),
+    height: number(fighter.height, fighter.kind === 'boss' ? 136 : 88),
+  }, facing);
+  const { x, y } = origin;
+  const aimAngle = clamp(number(fighter.spearAimAngle, 42), SPEAR_MIN_ANGLE, SPEAR_MAX_ANGLE);
+  const flight = chosenFlight
+    ? spearAimedFlight(facing, aimAngle)
+    : spearFlight(x, y, number(fighter.spearAimX, x + facing * 120),
+      number(fighter.spearAimY, y));
+  const preview = chosenFlight ? aimedSpearPreview(origin, flight, groundY, worldWidth) : null;
+  const angle = Math.atan2(flight.vy + SPEAR_GRAVITY, flight.vx || facing);
+  const charge = aiming ? 0 : clamp(1 - windup / SPEAR_WINDUP_TICKS, 0, 1);
+  const color = fighter.team === 0 ? '#b4f7da' : '#ffca92';
+  ctx.save();
+  ctx.globalAlpha = aiming ? .78 : .26 + charge * .3;
+  if (!reducedMotion && !committed) ctx.setLineDash([6, 7]);
+  ctx.beginPath();
+  if (preview) {
+    preview.points.forEach(([pointX, pointY], index) => {
+      if (index === 0) ctx.moveTo(pointX, pointY);
+      else ctx.lineTo(pointX, pointY);
+    });
+  } else {
+    // Enemy warnings keep their previously locked target and shared solver.
+    const segments = reducedMotion ? 7 : 15;
+    for (let index = 0; index <= segments; index++) {
+      const point = spearTrajectoryPoint(x, y, flight, flight.ticks * index / segments);
+      if (index === 0) ctx.moveTo(point.x, point.y);
+      else ctx.lineTo(point.x, point.y);
+    }
+  }
+  if (chosenFlight) {
+    // A dark keyline keeps the guide readable over both photos and painted sky.
+    ctx.strokeStyle = 'rgba(12, 25, 27, .88)';
+    ctx.lineWidth = 5.2;
+    ctx.stroke();
+  }
+  ctx.strokeStyle = color;
+  ctx.lineWidth = chosenFlight ? (reducedMotion ? 2.5 : 2.3) : reducedMotion ? 2.2 : 1.8;
+  ctx.stroke();
+  ctx.restore();
+  if (chosenFlight) {
+    drawAimedSpearMarker(ctx, preview, cameraX, tick, reducedMotion, color);
+    const label = aiming ? `仰角 ${Math.round(aimAngle)}°` : `锁定 ${Math.round(aimAngle)}°`;
+    const labelWidth = 88;
+    const labelX = clamp(x - labelWidth / 2, cameraX + 8, cameraX + W - labelWidth - 8);
+    const labelY = clamp(y - 49, 104, H - 35);
+    ctx.save();
+    ctx.fillStyle = 'rgba(12, 25, 27, .84)';
+    ctx.fillRect(labelX, labelY, labelWidth, 24);
+    ctx.fillStyle = '#effff4';
+    ctx.font = '700 12px "Microsoft YaHei UI", sans-serif';
+    ctx.textAlign = 'center';
+    ctx.fillText(label, labelX + labelWidth / 2, labelY + 16);
+    ctx.restore();
+  }
+  ctx.save();
+  ctx.translate(x, y);
+  ctx.rotate(angle);
+  line(ctx, [[-27, 0], [11, 0]], '#54443c', 5.6);
+  line(ctx, [[-25, -1], [12, -1]], color, 2.8);
+  polygon(ctx, [[11, -6], [23, 0], [11, 6]], '#fff1d5');
+  ctx.restore();
+  ctx.beginPath();
+  ctx.arc(x, y, 11 + (reducedMotion ? 0 : Math.sin(tick * .23) * 1.8), 0, TAU);
+  ctx.strokeStyle = color;
+  ctx.lineWidth = 1.8 + charge;
+  ctx.stroke();
+}
+
 function bone(ctx, joints, outline, core, width = 8) {
   line(ctx, joints, outline, width + 3);
   line(ctx, joints, core, width);
@@ -629,51 +892,121 @@ function drawWholeTomato(ctx, x, y, tilt) {
   ctx.restore();
 }
 
-function drawTomatoOnHead(ctx, head, knockout, time, reducedMotion) {
+function drawTomatoOnHead(ctx, head, knockout, time, reducedMotion, crownLift = 0) {
   const elapsed = Math.max(0, time - knockout.born);
   if (elapsed >= TOMATO_LIFE_MS) return;
   const [x, y] = head;
-  const crown = y - HEAD_RADIUS;
+  // A wanderer's broad hat catches the tomato above the scalp; every other
+  // fighter keeps the existing bare-head impact point.
+  const crown = y - HEAD_RADIUS - crownLift;
   if (elapsed < TOMATO_DROP_MS) {
-    const fall = reducedMotion ? 1 : (elapsed / TOMATO_DROP_MS) ** 2;
-    drawWholeTomato(ctx, x, crown - 16 - (1 - fall) * 115, -.16 + fall * .19);
+    const fall = reducedMotion ? 1 : (elapsed / TOMATO_DROP_MS) ** 2.3;
+    const tomatoY = crown - 16 - (1 - fall) * 115;
+    if (!reducedMotion) {
+      ctx.save();
+      ctx.globalAlpha *= .15 + fall * .2;
+      ellipse(ctx, x, crown + 1, 7 + 11 * fall, 2.5, '#613b36');
+      if (fall > .32) {
+        line(ctx, [[x - 8, tomatoY - 19], [x - 10, tomatoY - 34]], '#ed9b74', 1.8);
+        line(ctx, [[x + 7, tomatoY - 14], [x + 7, tomatoY - 25]], '#b4513b', 2.2);
+      }
+      ctx.restore();
+    }
+    drawWholeTomato(ctx, x, tomatoY, -.16 + fall * .19);
     return;
   }
 
   const age = elapsed - TOMATO_DROP_MS;
-  const fade = clamp((TOMATO_LIFE_MS - elapsed) / 280, 0, 1);
-  const spread = 1 + .13 * clamp(age / 85, 0, 1);
+  const fade = clamp((TOMATO_LIFE_MS - elapsed) / 300, 0, 1);
   ctx.save();
   ctx.globalAlpha *= fade;
-  ellipse(ctx, x, crown + 1, 25 * spread, 7, '#702d2a');
-  ellipse(ctx, x - 2, crown - 3, 23 * spread, 7.5, '#d6533d');
-  polygon(ctx, [[x - 24, crown - 1], [x - 31, crown - 4], [x - 26, crown + 5],
-    [x - 15, crown + 3], [x + 11, crown + 4], [x + 28, crown + 7],
-    [x + 26, crown - 2], [x + 16, crown - 5]], '#a83f33');
-  // A little pulp and a torn leaf stay stuck to the oversized head as it falls.
-  ellipse(ctx, x - 10, y - 10, 6, 4.5, '#a83f33', -.35);
-  ellipse(ctx, x + 11, y - 14, 5, 3.5, '#d6533d', .42);
-  line(ctx, [[x + 12, y - 12], [x + 14, y - 4]], '#a83f33', 2.4);
-  polygon(ctx, [[x - 6, crown - 9], [x + 2, crown - 14], [x + 5, crown - 7],
-    [x + 15, crown - 10], [x + 8, crown - 3], [x - 4, crown - 5]], '#4f7850');
+  // Keep the impact locked to the sound cue at 180ms. The peel flattens first,
+  // rebounds once, then gives way to a small stain that follows the KO head.
+  if (!reducedMotion && age < TOMATO_CRUSH_MS + 35) {
+    const crush = clamp(age / 65, 0, 1);
+    const rebound = age > 65 ? Math.sin(clamp((age - 65) / 60, 0, 1) * Math.PI) : 0;
+    ctx.save();
+    ctx.globalAlpha *= 1 - clamp((age - TOMATO_CRUSH_MS + 10) / 45, 0, 1);
+    ctx.translate(x, crown - 16 + 14 * crush - 2 * rebound);
+    ctx.scale(1 + .64 * crush - .11 * rebound, 1 - .63 * crush + .13 * rebound);
+    drawWholeTomato(ctx, 0, 0, .03 + crush * .08);
+    ctx.restore();
+  }
+  const stain = reducedMotion ? 1 : clamp((age - 28) / 95, 0, 1);
+  if (stain > 0) {
+    ctx.save();
+    ctx.globalAlpha *= stain;
+    ctx.beginPath();
+    ctx.moveTo(x - 29, crown + 1);
+    ctx.bezierCurveTo(x - 34, crown - 8, x - 16, crown - 8, x - 9, crown - 5);
+    ctx.bezierCurveTo(x + 5, crown - 12, x + 20, crown - 7, x + 29, crown + 2);
+    ctx.bezierCurveTo(x + 18, crown + 9, x - 19, crown + 9, x - 29, crown + 1);
+    ctx.fillStyle = '#702d2a';
+    ctx.fill();
+    ellipse(ctx, x - 2, crown - 2, 24, 6.5, '#b14938');
+    polygon(ctx, [[x - 28, crown + 1], [x - 33, crown - 2], [x - 26, crown + 7],
+      [x - 15, crown + 4], [x + 12, crown + 5], [x + 30, crown + 6],
+      [x + 23, crown - 3], [x + 14, crown - 5]], '#a83f33');
+    // Uneven pulp, seeds and torn calyx stay above the eyes and away from the mouth.
+    ellipse(ctx, x - 11, crown + 10, 6, 4, '#a83f33', -.35);
+    ellipse(ctx, x + 12, crown + 7, 5, 3.5, '#d6533d', .42);
+    line(ctx, [[x + 15, crown + 10], [x + 16, crown + 17]], '#a83f33', 2.3);
+    for (const [sx, sy] of [[-16, -4], [-1, -7], [10, -3]]) {
+      ellipse(ctx, x + sx, crown + sy, 1.6, 1, '#e4b27c', -.25);
+    }
+    polygon(ctx, [[x - 8, crown - 7], [x + 1, crown - 14], [x + 5, crown - 7],
+      [x + 15, crown - 10], [x + 9, crown - 3], [x - 5, crown - 4]], '#4f7850');
+    ctx.restore();
+  }
   ctx.restore();
 }
 
 function drawTomatoBurst(ctx, knockout, time, reducedMotion) {
   const age = time - knockout.born - TOMATO_DROP_MS;
-  if (age < 0 || age > 520) return;
+  if (age < 0 || age > TOMATO_SPLASH_MS) return;
   const seconds = reducedMotion ? 0 : age / 1000;
-  const count = reducedMotion ? 3 : 11;
+  const count = reducedMotion ? 3 : 12;
   ctx.save();
-  ctx.globalAlpha *= 1 - age / 520;
+  ctx.globalAlpha *= 1 - age / TOMATO_SPLASH_MS;
+  if (!reducedMotion && age < 290) {
+    ctx.save();
+    ctx.globalAlpha *= .72 * (1 - age / 290);
+    const reach = 20 + 32 * clamp(age / 180, 0, 1);
+    for (const side of [-1, 1]) {
+      ctx.beginPath();
+      ctx.moveTo(knockout.impactX + side * 6, knockout.impactY);
+      ctx.bezierCurveTo(knockout.impactX + side * 19, knockout.impactY - 13,
+        knockout.impactX + side * (reach - 7), knockout.impactY - 30,
+        knockout.impactX + side * reach, knockout.impactY - 17);
+      ctx.strokeStyle = '#b4513b';
+      ctx.lineWidth = 2.6;
+      ctx.lineCap = 'round';
+      ctx.stroke();
+    }
+    ctx.restore();
+  }
   for (let i = 0; i < count; i++) {
     const spread = i - (count - 1) / 2;
-    const velocityX = spread * (reducedMotion ? 9 : 34);
-    const velocityY = -90 - (i % 3) * 32;
-    const px = knockout.impactX + spread * 2 + velocityX * seconds;
-    const py = knockout.impactY - 2 + velocityY * seconds + 260 * seconds * seconds;
-    ellipse(ctx, px, py, i % 3 === 0 ? 4.2 : 2.8, i % 3 === 0 ? 3.2 : 2.6,
+    const jitter = hash(i * 17 + knockout.seed) - .5;
+    const velocityX = spread * 28 + jitter * 24;
+    const velocityY = -115 - hash(i * 11 + knockout.seed) * 80;
+    const px = knockout.impactX + spread * 1.7 + velocityX * seconds;
+    const py = knockout.impactY - 2 + velocityY * seconds + 620 * seconds * seconds;
+    ellipse(ctx, px, py, i % 3 === 0 ? 4 : 2.5, i % 3 === 0 ? 3.1 : 2.3,
       i % 4 === 0 ? '#d6533d' : '#a83f33');
+  }
+  if (!reducedMotion && age < 410) {
+    for (let i = 0; i < 3; i++) {
+      const side = i - 1;
+      const px = knockout.impactX + side * (8 + 112 * seconds);
+      const py = knockout.impactY - (130 + i * 19) * seconds + 540 * seconds * seconds;
+      ctx.save();
+      ctx.translate(px, py);
+      ctx.rotate(side * seconds * 3.6);
+      polygon(ctx, [[-5, -3], [3, -5], [6, 0], [2, 4], [-6, 3]], '#8f3a30');
+      ellipse(ctx, 0, -1, 2.8, 1.6, '#d76b4c');
+      ctx.restore();
+    }
   }
   ctx.restore();
 }
@@ -834,7 +1167,262 @@ function drawKickEnergy(ctx, foot, kick, kickTick, active, airborne, index, redu
   ctx.restore();
 }
 
-function drawFighter(ctx, fighter, index, groundY, tick, reducedMotion = false, knockout = null, time = 0) {
+function expressionFor(fighter, state, meta) {
+  if (number(fighter.hp, 100) <= 0) return 'sad';
+  if (state.status === 'finished' && state.winner != null) {
+    return state.winner === fighter.id ? 'happy' : 'sad';
+  }
+  if (meta.mode === 'campaign' && fighter.team === 0) {
+    if (meta.campaignPhase === 'failed') return 'sad';
+    if (['aftermath', 'cleared', 'completed'].includes(meta.campaignPhase)) return 'happy';
+  }
+  return number(fighter.attackStage) > 0 ? 'effort' : 'neutral';
+}
+
+function curvedMouth(ctx, x, y, edgeY, middleY, color) {
+  ctx.beginPath();
+  ctx.moveTo(x - 9, y + edgeY);
+  ctx.bezierCurveTo(x - 4, y + middleY, x + 4, y + middleY, x + 9, y + edgeY);
+  ctx.strokeStyle = color;
+  ctx.lineWidth = 2.8;
+  ctx.lineCap = 'round';
+  ctx.stroke();
+}
+
+function drawFace(ctx, head, expression, outline, accent, defeated, attackStage) {
+  const [x, y] = head;
+  ctx.save();
+  if (expression === 'happy') {
+    for (const eye of [-8, 8]) {
+      ctx.beginPath();
+      ctx.moveTo(x + eye - 4, y - 2);
+      ctx.bezierCurveTo(x + eye - 2, y - 8, x + eye + 2, y - 8, x + eye + 4, y - 2);
+      ctx.strokeStyle = outline;
+      ctx.lineWidth = 2.4;
+      ctx.lineCap = 'round';
+      ctx.stroke();
+    }
+    line(ctx, [[x - 12, y - 12], [x - 4, y - 14]], accent, 2);
+    line(ctx, [[x + 4, y - 14], [x + 12, y - 12]], accent, 2);
+    curvedMouth(ctx, x, y, 7, 14.5, outline);
+    ellipse(ctx, x - 13, y + 4, 2, 1.5, accent);
+    ellipse(ctx, x + 13, y + 4, 2, 1.5, accent);
+  } else if (expression === 'sad') {
+    line(ctx, [[x - 12, y - 12], [x - 5, y - 9]], accent, 2.2);
+    line(ctx, [[x + 5, y - 9], [x + 12, y - 12]], accent, 2.2);
+    if (defeated) {
+      // Keep the familiar KO crosses, but let the mouth tell the losing emotion.
+      for (const eye of [-8, 8]) {
+        line(ctx, [[x + eye - 3, y - 4], [x + eye + 3, y + 2]], outline, 2.2);
+        line(ctx, [[x + eye + 3, y - 4], [x + eye - 3, y + 2]], outline, 2.2);
+      }
+    } else {
+      line(ctx, [[x - 12, y - 3], [x - 5, y + 1]], outline, 2.4);
+      line(ctx, [[x + 5, y + 1], [x + 12, y - 3]], outline, 2.4);
+    }
+    curvedMouth(ctx, x, y, 13, 5, outline);
+    ellipse(ctx, x + 13, y + 6, 1.8, 2.7, '#8dbec1');
+  } else if (expression === 'effort') {
+    const furrow = attackStage >= 2 ? 2 : 0;
+    line(ctx, [[x - 12, y - 12], [x - 3, y - 7 + furrow]], accent, 2.7);
+    line(ctx, [[x + 3, y - 7 + furrow], [x + 12, y - 12]], accent, 2.7);
+    line(ctx, [[x - 12, y - 2], [x - 5, y - 4]], outline, 2.6);
+    line(ctx, [[x + 5, y - 4], [x + 12, y - 2]], outline, 2.6);
+    curvedMouth(ctx, x, y, 8, 8, outline);
+    polygon(ctx, [[x - 8, y + 9], [x + 8, y + 9], [x + 7, y + 14], [x - 7, y + 14]], outline);
+    polygon(ctx, [[x - 6, y + 10], [x + 6, y + 10], [x + 5, y + 12], [x - 5, y + 12]], '#fff6e5');
+    line(ctx, [[x, y + 10], [x, y + 13]], outline, 1.2);
+  } else {
+    line(ctx, [[x + 2, y - 1], [x + 11, y - 3]], accent, 3);
+    line(ctx, [[x - 10, y - 14], [x + 7, y - 16]], accent, 3);
+  }
+  ctx.restore();
+}
+
+function drawWandererCape(ctx, shoulder, fighter, facing, tick, reducedMotion, defeated, palette) {
+  // A single fixed-step pose drives both layers of cloth. Running pulls the
+  // red silhouette opposite travel, jumping lifts it, and existing friction
+  // settles it; no new physics or network state is needed.
+  const calm = reducedMotion || defeated;
+  const localVelocity = calm ? 0 : clamp(number(fighter.vx) * facing, -8, 8);
+  const airflow = calm ? 0 : clamp(Math.abs(number(fighter.vx)) / 5.4, 0, 1);
+  const flutter = calm ? 0 : Math.sin(tick * .32) * airflow * 3.2;
+  const ripple = calm ? 0 : Math.sin(tick * .32 + 1.6) * airflow * 2.4;
+  const lift = calm || fighter.grounded !== false ? 0
+    : clamp(4 - number(fighter.vy) * .75, 0, 13);
+  const topX = shoulder[0] - 5;
+  const topY = shoulder[1] + 3;
+  const tailX = topX - 30 - localVelocity * 2.7 + flutter;
+  const hemY = topY + 52 - lift + ripple;
+
+  // A torn, asymmetric hem reads like the reference without widening hitboxes
+  // or swallowing the legs. Limbs and attacks paint in front of this layer.
+  ctx.beginPath();
+  ctx.moveTo(topX - 5, topY);
+  ctx.bezierCurveTo(topX - 19 - localVelocity * .3, topY + 11,
+    tailX - 18, hemY - 24, tailX - 11, hemY - 7);
+  ctx.lineTo(tailX - 2, hemY - 12 + flutter * .2);
+  ctx.lineTo(tailX + 6, hemY - 2);
+  ctx.lineTo(tailX + 12, hemY - 9);
+  ctx.bezierCurveTo(tailX + 13, hemY - 21, topX + 9, topY + 20,
+    topX + 7, topY + 2);
+  ctx.closePath();
+  ctx.fillStyle = palette.capeEdge;
+  ctx.fill();
+
+  ctx.beginPath();
+  ctx.moveTo(topX - 3, topY + 3);
+  ctx.bezierCurveTo(topX - 15 - localVelocity * .25, topY + 17,
+    tailX - 8, hemY - 22, tailX - 5, hemY - 9);
+  ctx.lineTo(tailX + 3, hemY - 12);
+  ctx.lineTo(tailX + 8, hemY - 8);
+  ctx.bezierCurveTo(tailX + 6, hemY - 23,
+    topX + 3, topY + 21, topX + 4, topY + 4);
+  ctx.closePath();
+  ctx.fillStyle = palette.cape;
+  ctx.fill();
+  line(ctx, [[topX + 1, topY + 8], [topX - 6, topY + 26],
+    [tailX + 2, hemY - 17]], palette.fold, 1.4);
+
+  // The scarf's loose ribbon is lighter and shorter than the cape. Its tip
+  // follows the same airflow so it never floats independently when idle.
+  const ribbonX = tailX - 11 - airflow * 6;
+  const ribbonY = topY + 6 - lift * .35 + flutter * .8;
+  ctx.beginPath();
+  ctx.moveTo(topX + 4, topY + 1);
+  ctx.bezierCurveTo(topX - 8, topY - 9, ribbonX + 16, ribbonY - 15,
+    ribbonX, ribbonY - 3);
+  ctx.lineTo(ribbonX + 7, ribbonY + 5);
+  ctx.lineTo(ribbonX + 13, ribbonY + 2);
+  ctx.bezierCurveTo(ribbonX + 13, ribbonY - 4, topX - 7, topY + 10,
+    topX + 5, topY + 7);
+  ctx.closePath();
+  ctx.fillStyle = palette.scarf;
+  ctx.fill();
+  line(ctx, [[topX + 1, topY + 2], [topX - 13, topY + 2],
+    [ribbonX + 11, ribbonY - 2]], palette.scarfLight, 1.2);
+}
+
+function drawWandererFace(ctx, head, expression, palette, defeated, attackStage) {
+  const [x, y] = head;
+  // No blur passes: a saturated underlay and crisp pale core make the eyes
+  // shine at a 44px head size, including on a bright photo background.
+  if (defeated) {
+    for (const offset of [-9, 9]) {
+      line(ctx, [[x + offset - 4, y - 5], [x + offset + 3, y + 1]],
+        palette.eye, 2.2);
+      line(ctx, [[x + offset + 3, y - 5], [x + offset - 4, y + 1]],
+        palette.eyeAccent, 2.2);
+    }
+  } else {
+    const outerY = expression === 'sad' ? y - 2 : expression === 'happy' ? y - 7 : y - 9;
+    const innerY = expression === 'sad' ? y - 5 : expression === 'happy' ? y - 8 : y - 5;
+    const eyeDepth = expression === 'effort' ? 3 : 5;
+    for (const side of [-1, 1]) {
+      const outer = x + side * 17;
+      const middle = x + side * 10;
+      const inner = x + side * 3;
+      polygon(ctx, [[outer, outerY], [middle, innerY - 2],
+        [inner, innerY], [middle, innerY + eyeDepth],
+        [outer - side * 2, outerY + eyeDepth - 1]], palette.eyeAccent);
+      polygon(ctx, [[outer - side * 2, outerY + 1], [middle, innerY],
+        [inner + side, innerY + 1], [middle, innerY + eyeDepth - 1]],
+      palette.eye);
+    }
+  }
+  if (expression === 'happy' && !defeated) {
+    line(ctx, [[x - 15, y - 13], [x - 4, y - 15]], palette.scarfLight, 1.5);
+    line(ctx, [[x + 4, y - 15], [x + 15, y - 13]], palette.scarfLight, 1.5);
+    curvedMouth(ctx, x, y, 5, 11, palette.eye);
+  } else if (expression === 'sad' || defeated) {
+    line(ctx, [[x - 14, y - 13], [x - 5, y - 9]], palette.eyeAccent, 1.6);
+    line(ctx, [[x + 5, y - 9], [x + 14, y - 13]], palette.eyeAccent, 1.6);
+    curvedMouth(ctx, x, y, 13, 5, palette.eye);
+    ellipse(ctx, x + 15, y + 7, 1.8, 2.7, '#8dbec1');
+  } else if (expression === 'effort') {
+    const furrow = attackStage >= 2 ? 1 : 0;
+    line(ctx, [[x - 17, y - 13], [x - 5, y - 8 + furrow]], palette.eyeAccent, 2);
+    line(ctx, [[x + 5, y - 8 + furrow], [x + 17, y - 13]], palette.eyeAccent, 2);
+    curvedMouth(ctx, x, y, 8, 8, palette.eye);
+    polygon(ctx, [[x - 7, y + 9], [x + 7, y + 9],
+      [x + 6, y + 12], [x - 6, y + 12]], '#fff6e5');
+    line(ctx, [[x, y + 9], [x, y + 12]], WANDERER_FACE, 1);
+  } else {
+    line(ctx, [[x - 2, y + 10], [x + 6, y + 9]], palette.eye, 1.5);
+  }
+}
+
+function drawWandererScarf(ctx, head, palette) {
+  const [x, y] = head;
+  // A short front wrap sits below the mouth; the separate back ribbon above
+  // supplies movement without concealing eyes or the attack-facing hand.
+  polygon(ctx, [[x - 19, y + 16], [x - 8, y + 17], [x + 6, y + 18],
+    [x + 18, y + 14], [x + 15, y + 22], [x + 3, y + 25],
+    [x - 9, y + 23], [x - 17, y + 21]], palette.scarf);
+  polygon(ctx, [[x - 15, y + 17], [x - 2, y + 20], [x + 13, y + 19],
+    [x + 5, y + 22], [x - 8, y + 21]], palette.scarfLight);
+  polygon(ctx, [[x + 4, y + 22], [x + 13, y + 21],
+    [x + 6, y + 30], [x - 1, y + 28]], palette.scarf);
+}
+
+function drawWandererHat(ctx, head) {
+  const [x, y] = head;
+  // Adapt the supplied ink-black straw hat: a low conical crown, imperfect
+  // chipped edge, faint woven ribs and a cool rim; no baked-in image asset.
+  // The lower edge remains above the eye slits and expression.
+  const brimY = y - 16;
+  ctx.beginPath();
+  ctx.moveTo(x - 44, brimY - 3);
+  ctx.lineTo(x - 36, brimY - 7);
+  ctx.lineTo(x - 34, brimY - 14);
+  ctx.lineTo(x - 28, brimY - 13);
+  ctx.lineTo(x - 14, brimY - 26);
+  ctx.lineTo(x + 2, brimY - 34);
+  ctx.lineTo(x + 6, brimY - 41);
+  ctx.lineTo(x + 9, brimY - 30);
+  ctx.lineTo(x + 28, brimY - 14);
+  ctx.lineTo(x + 42, brimY - 7);
+  ctx.lineTo(x + 39, brimY - 3);
+  ctx.lineTo(x + 45, brimY - 1);
+  ctx.lineTo(x + 33, brimY - 1);
+  ctx.lineTo(x + 29, brimY + 3);
+  ctx.lineTo(x + 16, brimY + 1);
+  ctx.lineTo(x + 13, brimY + 4);
+  ctx.lineTo(x - 3, brimY + 2);
+  ctx.lineTo(x - 23, brimY + 3);
+  ctx.lineTo(x - 30, brimY - 1);
+  ctx.lineTo(x - 38, brimY + 1);
+  ctx.closePath();
+  ctx.fillStyle = WANDERER_HAT.shadow;
+  ctx.fill();
+  polygon(ctx, [[x - 36, brimY - 7], [x + 4, brimY - 34],
+    [x + 28, brimY - 13], [x + 38, brimY - 6],
+    [x + 9, brimY - 4], [x - 31, brimY - 4]], WANDERER_HAT.crown);
+  polygon(ctx, [[x + 5, brimY - 32], [x + 27, brimY - 12],
+    [x + 33, brimY - 6], [x + 12, brimY - 8]], WANDERER_HAT.facet);
+  ctx.save();
+  ctx.globalAlpha *= .58;
+  for (const rib of [-29, -13, 1, 15, 29]) {
+    line(ctx, [[x + 4, brimY - 30], [x + rib, brimY - 6]], WANDERER_HAT.weave, .85);
+  }
+  for (const [height, span] of [[19, 15], [11, 27]]) {
+    ctx.beginPath();
+    ctx.moveTo(x - span, brimY - height);
+    ctx.bezierCurveTo(x - span / 3, brimY - height + 4,
+      x + span / 3, brimY - height + 4, x + span, brimY - height);
+    ctx.strokeStyle = WANDERER_HAT.weave;
+    ctx.lineWidth = .7;
+    ctx.stroke();
+  }
+  ctx.restore();
+  line(ctx, [[x - 40, brimY - 4], [x - 24, brimY - 1],
+    [x - 6, brimY], [x + 13, brimY + 1], [x + 31, brimY - 2],
+    [x + 42, brimY - 3]], WANDERER_HAT.rim, 1.55);
+  line(ctx, [[x - 30, brimY - 9], [x - 10, brimY - 19]], WANDERER_HAT.rim, .9);
+}
+
+function drawFighter(ctx, fighter, index, groundY, tick, reducedMotion = false,
+  knockout = null, time = 0, expression = 'neutral', corpsePose = null) {
   const x = number(fighter.x, index ? 684 : 284);
   const y = number(fighter.y, groundY);
   const vx = number(fighter.vx);
@@ -855,14 +1443,20 @@ function drawFighter(ctx, fighter, index, groundY, tick, reducedMotion = false, 
   const kickActive = Boolean(kick && kickTick >= kick.activeFrom && kickTick <= kick.activeTo);
   const hit = number(fighter.hurtFlash) > 0;
   const boss = fighter.kind === 'boss';
+  const wanderer = fighter.kind === 'hero';
+  const wandererPalette = WANDERER_PALETTES[fighter.team === 1 ? 1 : 0];
   const figureScale = boss ? 1.28 : 1;
   const invulnerable = Boolean(fighter.invulnerable) || dodge;
   const defeated = number(fighter.hp, 100) <= 0;
+  const spearing = (number(fighter.spearWindup) > 0 || fighter.spearAiming === true) && !defeated;
   const bossWindup = boss && attacking
     && attackTick < strike.activeFrom && !defeated;
-  const core = hit ? '#fff9e8' : boss ? '#e6c9b9' : index ? '#f5ddcf' : '#f5ecd7';
-  const outline = boss ? '#482d34' : index ? '#663f41' : '#173b3b';
-  const accent = boss ? '#ef8c72' : index ? '#ec7d6a' : '#f5b66d';
+  const core = hit ? '#fff9e8' : wanderer ? '#35454b'
+    : boss ? '#e6c9b9' : index ? '#f5ddcf' : '#f5ecd7';
+  const outline = wanderer ? WANDERER_FACE
+    : boss ? '#482d34' : index ? '#663f41' : '#173b3b';
+  const accent = wanderer ? wandererPalette.scarfLight
+    : boss ? '#ef8c72' : index ? '#ec7d6a' : '#f5b66d';
 
   const altitude = clamp(groundY - y, 0, 180);
   ellipse(ctx, x, groundY + 6, Math.max(15, (boss ? 34 : 25) - altitude * .05),
@@ -873,13 +1467,13 @@ function drawFighter(ctx, fighter, index, groundY, tick, reducedMotion = false, 
   ctx.scale(facing * figureScale, figureScale);
   if (defeated) {
     const elapsed = knockout ? time - knockout.born : Infinity;
-    const progress = knockout
+    const progress = corpsePose ? corpsePose.fallProgress : knockout
       ? reducedMotion ? Number(elapsed >= TOMATO_DROP_MS)
         : clamp((elapsed - TOMATO_DROP_MS) / TOMATO_FALL_MS, 0, 1)
       : 1;
     const fall = progress * progress * (3 - 2 * progress);
     ctx.translate(0, -6 * fall);
-    ctx.rotate(-Math.PI * .46 * fall);
+    ctx.rotate(-Math.PI * .46 * fall * (corpsePose?.fallDirection ?? 1));
   }
 
   const stride = grounded && !stun ? Math.sin(tick * .29 + index) * clamp(Math.abs(vx) / 3.2, 0, 1) : 0;
@@ -900,6 +1494,9 @@ function drawFighter(ctx, fighter, index, groundY, tick, reducedMotion = false, 
     ctx.restore();
     for (let i = 0; i < 3; i++) line(ctx, [[-28 - i * 12, -45 + i * 12], [-56 - i * 10, -45 + i * 12]], 'rgba(249,226,181,.65)', 2 - i * .3);
   }
+
+  if (wanderer) drawWandererCape(ctx, shoulder, fighter, facing, tick,
+    reducedMotion, defeated, wandererPalette);
 
   const rearElbow = kicking ? [-13 + lean * .5, -65 - bob] : [-13 + lean * .5, -55 - bob];
   const rearHand = kicking ? [-8 + lean * .4, -75 - bob]
@@ -928,6 +1525,15 @@ function drawFighter(ctx, fighter, index, groundY, tick, reducedMotion = false, 
   bone(ctx, [hip, kneeFront, footFront], outline, core, 4.8);
   if (kicking && !defeated) drawKickEnergy(ctx, footFront, kick, kickTick, kickActive, airKick, index, reducedMotion);
   bone(ctx, [hip, shoulder], outline, core, 4.8);
+  if (wanderer) {
+    // A hairline cyan edge separates the inky, still-thin frame from dark
+    // forest/ocean photos without painting it into a broad armored body.
+    ctx.save();
+    ctx.globalAlpha *= hit ? 1 : .72;
+    line(ctx, [[hip[0] + 2, hip[1] - 1], [shoulder[0] + 2, shoulder[1] + 2]],
+      WANDERER_HAT.rim, 1.05);
+    ctx.restore();
+  }
   if (boss && !defeated) {
     // Broader shoulders and a split collar give the boss a powerful silhouette
     // while the torso and limbs remain unmistakably thin stick-figure strokes.
@@ -944,18 +1550,25 @@ function drawFighter(ctx, fighter, index, groundY, tick, reducedMotion = false, 
   ctx.fill();
   ctx.beginPath();
   ctx.arc(head[0], head[1], HEAD_RADIUS - 4, 0, TAU);
-  ctx.fillStyle = core;
+  // Hurt flash brightens the rim and limbs, but the face stays dark enough for
+  // both teams' pale eyes to remain readable for those few impact frames.
+  ctx.fillStyle = wanderer ? hit ? '#314954' : '#15252e' : core;
   ctx.fill();
-  if (defeated) {
-    for (const eye of [-8, 8]) {
-      line(ctx, [[head[0] + eye - 3, head[1] - 4], [head[0] + eye + 3, head[1] + 2]], outline, 2.2);
-      line(ctx, [[head[0] + eye + 3, head[1] - 4], [head[0] + eye - 3, head[1] + 2]], outline, 2.2);
-    }
+  if (wanderer) {
+    ctx.beginPath();
+    ctx.arc(head[0], head[1], HEAD_RADIUS - 1, Math.PI * .52, Math.PI * 1.42);
+    ctx.strokeStyle = WANDERER_HAT.weave;
+    ctx.lineWidth = 1.25;
+    ctx.stroke();
+    drawWandererFace(ctx, head, defeated ? 'sad' : expression,
+      wandererPalette, defeated, attackStage);
+    drawWandererScarf(ctx, head, wandererPalette);
+    drawWandererHat(ctx, head);
   } else {
-    line(ctx, [[head[0] + 2, head[1] - 1], [head[0] + 11, head[1] - 3]], accent, 3);
-    line(ctx, [[head[0] - 10, head[1] - 14], [head[0] + 7, head[1] - 16]], accent, 3);
+    drawFace(ctx, head, defeated ? 'sad' : expression, outline, accent, defeated, attackStage);
   }
-  if (defeated && knockout) drawTomatoOnHead(ctx, head, knockout, time, reducedMotion);
+  if (defeated && knockout) drawTomatoOnHead(ctx, head, knockout, time,
+    reducedMotion, wanderer ? 16 : 0);
 
   const recovery = attacking && attackTick > strike.activeTo
     ? clamp((attackTick - strike.activeTo) / (strike.duration - strike.activeTo), 0, 1) : 0;
@@ -963,12 +1576,22 @@ function drawFighter(ctx, fighter, index, groundY, tick, reducedMotion = false, 
     : recovery ? 50 - 28 * recovery : 12;
   const armHeight = attackStage === 2 ? -4 : attackStage === 3 ? 5 : 0;
   const frontElbow = kicking ? [15 + lean * .3, -64 - bob]
+    : spearing ? [14 + lean * .3, -68 - bob]
     : bossWindup ? [-3 + lean * .5, -72 - bob]
     : attacking ? [12 + reach * .23 + lean * .35, -68 - bob + armHeight * .5] : [15 + lean * .5, -55 - bob];
   const frontHand = kicking ? [20 + lean * .25, -80 - bob]
+    : spearing ? [26 + lean * .2, -65 - bob]
     : bossWindup ? [-12 + lean * .5, -57 - bob]
     : attacking ? [reach, -63 - bob + armHeight] : [22 + lean * .4, -39 - bob];
   bone(ctx, [shoulder, frontElbow, frontHand], outline, core, 4.4);
+  if (wanderer) {
+    ctx.save();
+    ctx.globalAlpha *= hit ? 1 : .64;
+    line(ctx, [[shoulder[0] + 3, shoulder[1] + 2],
+      [frontElbow[0] + 2, frontElbow[1]], [frontHand[0] + 1, frontHand[1]]],
+    WANDERER_HAT.rim, 1);
+    ctx.restore();
+  }
   ellipse(ctx, frontHand[0], frontHand[1], 4.4, 4.4, accent);
   ellipse(ctx, rearHand[0], rearHand[1], 3.8, 3.8, accent);
 
@@ -1012,6 +1635,99 @@ function drawFighter(ctx, fighter, index, groundY, tick, reducedMotion = false, 
   }
 }
 
+function corpseFallDirection(x, facing, kind, worldWidth) {
+  // The head lies behind the feet. At an arena edge, tip inward instead of
+  // leaving a three-second corpse (or its skull) outside the world.
+  const reach = (83 + HEAD_RADIUS) * (kind === 'boss' ? 1.28 : 1);
+  const naturalHeadX = x - facing * reach;
+  return naturalHeadX < 10 || naturalHeadX > worldWidth - 10 ? -1 : 1;
+}
+
+function drawCampaignCorpse(ctx, corpse, knockout, groundY, motionTick, time, worldWidth, reducedMotion) {
+  const born = number(corpse.bornTick, motionTick);
+  const settle = Math.max(born + 1, number(corpse.settleTick, born + 27));
+  const expire = Math.max(settle + 1, number(corpse.expireTick, settle + 180));
+  if (motionTick >= expire) return;
+
+  const restingX = clamp(number(corpse.x), 22, worldWidth - 22);
+  const restingY = number(corpse.y, groundY);
+  const koX = clamp(number(corpse.koX, restingX), 22, worldWidth - 22);
+  const koY = number(corpse.koY, restingY);
+  const dropTick = Math.min(settle, born + TOMATO_DROP_TICKS);
+  const calm = Boolean(knockout?.reducedMotion ?? reducedMotion);
+  const travel = calm ? Number(motionTick >= dropTick)
+    : clamp((motionTick - born) / (settle - born), 0, 1);
+  const smoothTravel = travel * travel * (3 - 2 * travel);
+  const fallProgress = calm ? Number(motionTick >= dropTick)
+    : dropTick === settle ? Number(motionTick >= settle)
+      : clamp((motionTick - dropTick) / (settle - dropTick), 0, 1);
+  const facing = number(corpse.facing, 1) < 0 ? -1 : 1;
+  const pose = {
+    ...corpse,
+    x: koX + (restingX - koX) * smoothTravel,
+    y: koY + (restingY - koY) * smoothTravel,
+    hp: 0, vx: 0, vy: 0, grounded: true, stun: 0,
+    dodgeTicks: 0, attackStage: 0, attackTick: 0,
+    kickType: null, kickTick: 0, hurtFlash: 0, invulnerable: 0,
+    spearAiming: false, spearWindup: 0, specialWaveTicks: 0,
+  };
+  ctx.save();
+  ctx.globalAlpha *= clamp((expire - motionTick) / CORPSE_FADE_TICKS, 0, 1);
+  drawFighter(ctx, pose, 1, restingY, motionTick, calm, knockout, time, 'sad', {
+    fallProgress,
+    fallDirection: corpseFallDirection(restingX, facing, corpse.kind, worldWidth),
+  });
+  ctx.restore();
+}
+
+function drawScatteredBones(ctx, burst, knockout, time, worldWidth, reducedMotion) {
+  const progress = clamp((time - burst.born) / BONES_SCATTER_MS, 0, 1);
+  const calm = burst.reducedMotion || reducedMotion;
+  const scale = burst.kind === 'boss' ? 1.28 : 1;
+  const facing = burst.facing < 0 ? -1 : 1;
+  const fallDirection = corpseFallDirection(burst.x, facing, burst.kind, worldWidth);
+  const axis = -facing * fallDirection;
+  const outline = burst.kind === 'boss' ? '#482d34' : '#663f41';
+  const core = burst.kind === 'boss' ? '#e6c9b9' : '#f5ddcf';
+  const ease = 1 - (1 - progress) ** 2;
+  const alpha = clamp((1 - progress) / .28, 0, 1);
+
+  BONE_PARTS.forEach((part, index) => {
+    const spread = calm ? 0 : (hash(burst.seed + index * 23) - .5) * 46 * ease;
+    const hop = calm ? 0 : (7 + hash(burst.seed + index * 37) * 9) * Math.sin(progress * Math.PI);
+    const x = clamp(burst.x + axis * part.along * scale + spread,
+      22 * scale, worldWidth - 22 * scale);
+    const y = burst.y - part.lift * scale - hop;
+    const turn = calm ? 0 : (hash(burst.seed + index * 41) - .5) * .8 * ease;
+    ctx.save();
+    ctx.globalAlpha *= alpha;
+    ctx.translate(x, y);
+    ctx.rotate(part.tilt * axis + turn);
+    if (part.kind === 'head') {
+      ellipse(ctx, 0, 0, HEAD_RADIUS * scale, 20 * scale, outline);
+      ellipse(ctx, 0, 0, (HEAD_RADIUS - 4) * scale, 16 * scale, core);
+      ellipse(ctx, -6 * scale, -2 * scale, 2.6 * scale, 3 * scale, outline);
+      ellipse(ctx, 6 * scale, -2 * scale, 2.6 * scale, 3 * scale, outline);
+      line(ctx, [[-5 * scale, 8 * scale], [0, 10 * scale], [5 * scale, 8 * scale]],
+        outline, 1.8 * scale);
+      // The tomato's short-lived stain remains attached to the detached head;
+      // scattering must not shorten (or extend) its original 1.08s lifespan.
+      if (knockout) {
+        ctx.save();
+        ctx.scale(scale, scale);
+        drawTomatoOnHead(ctx, [0, 0], knockout, time, calm);
+        ctx.restore();
+      }
+    } else {
+      const length = part.length * scale;
+      bone(ctx, [[-length / 2, 0], [length / 2, 0]], outline, core, 3.2 * scale);
+      ellipse(ctx, -length / 2, 0, 2.3 * scale, 2.3 * scale, core);
+      ellipse(ctx, length / 2, 0, 2.3 * scale, 2.3 * scale, core);
+    }
+    ctx.restore();
+  });
+}
+
 function drawAtmosphere(ctx, theme, tick, level) {
   // A quiet front layer integrates the figures with the background without
   // covering their silhouette or making the collision plane ambiguous.
@@ -1044,9 +1760,15 @@ export function createRenderer(canvas) {
   const recentAnonymous = new Map();
   const photoCache = new Map();
   const knockouts = new Map();
+  const boneBursts = new Map();
+  const scatteredTargets = new Set();
+  const seenCorpseIds = new Set();
   let lastFighters = new Map();
   let lastTick = -1;
   let lastScene = '';
+  let worldWidth = W;
+  let cameraX = 0;
+  let cameraAt = 0;
   let shakeUntil = 0;
   let shakeStrength = 0;
   let pixelRatio = 0;
@@ -1085,7 +1807,8 @@ export function createRenderer(canvas) {
     if (!event || typeof event !== 'object') return;
     reducedMotion = Boolean(motionMedia?.matches);
     const type = String(event.type || '').toLowerCase();
-    if (!['hit', 'dodge', 'land', 'ko', 'kick', 'jump-kick', 'special-wave', 'fall-impact'].includes(type)) return;
+    if (!['hit', 'dodge', 'land', 'ko', 'bones-scatter', 'kick', 'jump-kick', 'special-wave', 'fall-impact',
+      'spear-windup', 'spear-throw', 'spear-impact'].includes(type)) return;
 
     const stamp = now();
     const stableId = event.id ?? event.eventId ?? event.uid;
@@ -1104,7 +1827,7 @@ export function createRenderer(canvas) {
       }
     }
 
-    const x = clamp(number(event.x, W / 2), -50, W + 50);
+    const x = clamp(number(event.x, worldWidth / 2), -50, worldWidth + 50);
     const y = clamp(number(event.y, H / 2), -50, H + 50);
     if (type === 'ko') {
       const target = String(event.target ?? `ko:${stableId ?? `${Math.round(x)}:${Math.round(y)}:${stamp}`}`);
@@ -1118,7 +1841,7 @@ export function createRenderer(canvas) {
           : y + number(previous?.fighter.height ?? event.height, 88) * .45;
       const pose = {
         ...(previous?.fighter ?? {}), id: target, kind: previous?.fighter.kind ?? event.kind ?? 'hero',
-        x: clamp(x, 22, W - 22),
+        x: clamp(x, 22, worldWidth - 22),
         // Off-screen falls get a visible, bounded final gag at the arena edge.
         y: clamp(footY, 80, H + 8), facing,
         hp: 0, vx: 0, vy: 0, grounded: true, stun: 0, dodgeTicks: 0,
@@ -1128,20 +1851,68 @@ export function createRenderer(canvas) {
       knockouts.set(target, {
         target, born: stamp, fighter: pose, index: previous?.index ?? (pose.team === 1 ? 1 : 0),
         reducedMotion,
+        seed: Array.from(target).reduce((seed, character) =>
+          (seed * 31 + character.charCodeAt(0)) % 997, 0),
         impactX: pose.x + facing,
-        impactY: pose.y - (83 + HEAD_RADIUS) * (pose.kind === 'boss' ? 1.28 : 1),
+        impactY: pose.y - (83 + HEAD_RADIUS) * (pose.kind === 'boss' ? 1.28 : 1)
+          - (pose.kind === 'hero' ? 16 : 0),
       });
       if (knockouts.size > 24) knockouts.delete(knockouts.keys().next().value);
       return;
     }
+    if (type === 'bones-scatter') {
+      const target = String(event.target ?? stableId ?? `bones:${Math.round(x)}:${Math.round(y)}`);
+      if (scatteredTargets.has(target)) return;
+      scatteredTargets.add(target);
+      seenCorpseIds.add(target);
+      boneBursts.set(target, {
+        born: stamp, target,
+        // Store world coordinates, not the camera-clamped position above. An
+        // event can arrive before the first frame establishes a 1920px arena.
+        x: number(event.x, x), y: number(event.y, y),
+        kind: event.kind, facing: number(event.facing, 1) < 0 ? -1 : 1,
+        reducedMotion,
+        seed: Array.from(target).reduce((seed, character) =>
+          (seed * 31 + character.charCodeAt(0)) % 997, 0),
+      });
+      if (boneBursts.size > 24) boneBursts.delete(boneBursts.keys().next().value);
+      return;
+    }
     if (type === 'special-wave') {
       rings.push({ x, y, born: stamp, life: reducedMotion ? 290 : 560,
-        radius: clamp(number(event.radius, 960), 160, 1100),
+        radius: clamp(Math.max(number(event.radius, W), worldWidth), 160, worldWidth + 200),
         color: '#dffff8', type });
       if (!reducedMotion) {
         shakeStrength = 3.5;
         shakeUntil = stamp + 120;
       }
+      if (rings.length > 45) rings.splice(0, rings.length - 45);
+      return;
+    }
+    if (type.startsWith('spear-')) {
+      const impact = type === 'spear-impact';
+      const throwSpear = type === 'spear-throw';
+      const count = reducedMotion ? impact ? 4 : 2 : impact ? 14 : throwSpear ? 9 : 5;
+      const palette = impact ? ['#fff4ce', '#efb66e', '#8fe5d3']
+        : throwSpear ? ['#dffff0', '#8fe5d3', '#ffdd9e'] : ['#fff1c9', '#efba80'];
+      const facing = number(event.facing, number(event.vx, 1)) < 0 ? -1 : 1;
+      for (let i = 0; i < count; i++) {
+        const angle = throwSpear
+          ? Math.atan2(number(event.vy), number(event.vx, facing))
+            + (i / Math.max(1, count - 1) - .5) * 1.45
+          : i / count * TAU + hash(i * 17 + x) * .24;
+        const speed = (impact ? 115 : throwSpear ? 90 : 38) * (.55 + hash(i * 7 + y) * .65);
+        particles.push({ x, y, vx: Math.cos(angle) * speed, vy: Math.sin(angle) * speed,
+          size: impact ? 2.4 : 1.8, color: palette[i % palette.length], born: stamp,
+          life: impact ? 310 : throwSpear ? 210 : 180, dust: false });
+      }
+      rings.push({ x, y, born: stamp, life: impact ? 280 : throwSpear ? 200 : 230,
+        radius: impact ? 48 : throwSpear ? 31 : 23, color: palette[0], type, facing });
+      if (impact && !reducedMotion) {
+        shakeStrength = 3.2;
+        shakeUntil = stamp + 130;
+      }
+      if (particles.length > 450) particles.splice(0, particles.length - 450);
       if (rings.length > 45) rings.splice(0, rings.length - 45);
       return;
     }
@@ -1186,7 +1957,7 @@ export function createRenderer(canvas) {
     if (rings.length > 45) rings.splice(0, rings.length - 45);
   }
 
-  function drawEffects(time) {
+  function drawEffects(time, viewportX) {
     for (let i = rings.length - 1; i >= 0; i--) {
       const item = rings[i];
       const progress = (time - item.born) / item.life;
@@ -1199,14 +1970,14 @@ export function createRenderer(canvas) {
         // Damage resolves on the cast tick. A brief whole-arena flash makes
         // that immediate effect legible before the expanding crest arrives.
         ctx.fillStyle = `rgba(148,255,239,${.16 * (1 - clamp(progress / .22, 0, 1))})`;
-        ctx.fillRect(0, 0, W, H);
+        ctx.fillRect(viewportX, 0, W, H);
         const bloom = ctx.createRadialGradient(item.x, item.y, Math.max(0, radius - 35),
           item.x, item.y, radius + 42);
         bloom.addColorStop(0, 'rgba(116,238,227,0)');
         bloom.addColorStop(.55, 'rgba(140,255,241,.44)');
         bloom.addColorStop(1, 'rgba(140,255,241,0)');
         ctx.fillStyle = bloom;
-        ctx.fillRect(0, 0, W, H);
+        ctx.fillRect(viewportX, 0, W, H);
         ctx.beginPath();
         ctx.arc(item.x, item.y, radius, 0, TAU);
         ctx.strokeStyle = '#72e4df';
@@ -1259,24 +2030,54 @@ export function createRenderer(canvas) {
     const level = meta.level;
     const groundY = clamp(number(arena.groundY, 430), 280, 510);
     const tick = number(state.tick);
+    const motionTick = number(state.motionTick, tick);
     const scene = `${meta.mode || ''}:${theme}:${level || ''}`;
-    if (lastTick >= 0 && (tick < lastTick || scene !== lastScene)) {
+    const sceneChanged = lastTick >= 0 && (tick < lastTick || scene !== lastScene);
+    if (sceneChanged) {
       seenIds.clear();
       seenOrder.length = 0;
       recentAnonymous.clear();
       knockouts.clear();
+      boneBursts.clear();
+      scatteredTargets.clear();
+      seenCorpseIds.clear();
       lastFighters.clear();
       particles.length = 0;
       rings.length = 0;
       shakeUntil = 0;
+      cameraX = 0;
+      cameraAt = 0;
     }
+    const firstFrame = lastTick < 0 || sceneChanged;
     lastTick = tick;
     lastScene = scene;
+    worldWidth = Math.max(W, number(arena.width, W));
     scaleCanvas();
 
     const time = now();
+    const fighters = Array.isArray(state.fighters) ? state.fighters : [
+      { x: 295, y: groundY, vx: 0, facing: 1, hp: 100, grounded: true },
+      { x: 675, y: groundY, vx: 0, facing: -1, hp: 100, grounded: true },
+    ];
+    const player = meta.mode === 'campaign'
+      ? fighters.find((fighter) => fighter?.team === 0) ?? fighters[0] : null;
+    const cameraTarget = player ? clamp(number(player.x) - W / 2, 0, worldWidth - W) : 0;
+    if (firstFrame || reducedMotion || worldWidth === W) cameraX = cameraTarget;
+    else {
+      // Ease the viewport, not the authoritative simulation or collision pose.
+      const elapsed = clamp(time - cameraAt, 8, 50);
+      cameraX += (cameraTarget - cameraX) * (1 - Math.exp(-elapsed / 95));
+      if (player) cameraX = clamp(cameraX,
+        clamp(number(player.x) - W + 160, 0, worldWidth - W),
+        clamp(number(player.x) - 160, 0, worldWidth - W));
+      if (Math.abs(cameraTarget - cameraX) < .25) cameraX = cameraTarget;
+    }
+    cameraAt = time;
     for (const [key, knockout] of knockouts) {
       if (time - knockout.born >= TOMATO_LIFE_MS) knockouts.delete(key);
+    }
+    for (const [key, burst] of boneBursts) {
+      if (time - burst.born >= BONES_SCATTER_MS) boneBursts.delete(key);
     }
     let tomatoShake = 0;
     if (!reducedMotion) {
@@ -1294,45 +2095,70 @@ export function createRenderer(canvas) {
     ctx.save();
     ctx.clearRect(0, 0, W, H);
     if (strength) ctx.translate(Math.sin(time * .093) * strength, Math.cos(time * .127) * strength * .65);
+    ctx.save();
+    ctx.translate(-cameraX, 0);
     const photo = loadedPhoto(meta.mode === 'campaign' ? photoForLevel(theme, level) : null);
     const photoOpacity = photo ? reducedMotion ? 1 : clamp((time - photo.readyAt) / 250, 0, 1) : 0;
     if (photoOpacity < 1) {
-      if (theme === 'city') drawCity(ctx, tick, groundY, seed);
-      else if (theme === 'ocean') drawOcean(ctx, tick, groundY, seed);
-      else if (theme === 'land') drawLand(ctx, tick, groundY, seed);
-      else drawForest(ctx, tick, groundY, seed);
+      drawTiledWorld(ctx, worldWidth, () => {
+        if (theme === 'city') drawCity(ctx, tick, groundY, seed);
+        else if (theme === 'ocean') drawOcean(ctx, tick, groundY, seed);
+        else if (theme === 'land') drawLand(ctx, tick, groundY, seed);
+        else drawForest(ctx, tick, groundY, seed);
+      });
     }
-    if (photo) drawPhotoBackdrop(ctx, photo.image, theme, groundY, photoOpacity);
-    drawGround(ctx, theme, groundY, tick, seed, Boolean(photo) && theme === 'land');
-    drawPlatforms(ctx, arena.platforms, theme);
+    if (photo) drawPhotoBackdrop(ctx, photo.image, theme, groundY, photoOpacity, worldWidth);
+    drawTiledWorld(ctx, worldWidth, () => drawGround(ctx, theme, groundY, tick, seed,
+      Boolean(photo) && theme === 'land'));
+    drawPlatforms(ctx, arena.platforms, theme, motionTick);
     drawHazards(ctx, arena.hazards, theme, tick);
-    if (meta.mode === 'campaign') drawFallingWarning(ctx, state.fallingObject, tick, reducedMotion);
+    if (meta.mode === 'campaign') drawFallingWarning(ctx, state.fallingObject, tick, reducedMotion, worldWidth);
 
-    const fighters = Array.isArray(state.fighters) ? state.fighters : [
-      { x: 295, y: groundY, vx: 0, facing: 1, hp: 100, grounded: true },
-      { x: 675, y: groundY, vx: 0, facing: -1, hp: 100, grounded: true },
-    ];
+    if (meta.mode === 'campaign' && Array.isArray(state.corpses)) {
+      for (const corpse of state.corpses) {
+        if (corpse?.id == null || corpse.team !== 1) continue;
+        const id = String(corpse.id);
+        seenCorpseIds.add(id);
+        if (scatteredTargets.has(id)) continue;
+        drawCampaignCorpse(ctx, corpse, knockouts.get(id), groundY,
+          motionTick, time, worldWidth, reducedMotion);
+      }
+      for (const burst of boneBursts.values()) {
+        drawScatteredBones(ctx, burst, knockouts.get(burst.target), time, worldWidth, reducedMotion);
+      }
+    }
+
     const visibleIds = new Set(fighters.map((fighter) => String(fighter?.id)));
     // The next campaign wave can replace a KO'd enemy immediately. Its brief
     // visual echo holds the head in place until the tomato lands and fades.
     for (const knockout of knockouts.values()) {
+      if (meta.mode === 'campaign' && seenCorpseIds.has(knockout.target)) continue;
       if (visibleIds.has(knockout.target)) continue;
       ctx.save();
       ctx.globalAlpha *= .88 * clamp((TOMATO_LIFE_MS - (time - knockout.born)) / 360, 0, 1);
-      drawFighter(ctx, knockout.fighter, knockout.index, groundY, tick, knockout.reducedMotion, knockout, time);
+      drawFighter(ctx, knockout.fighter, knockout.index, groundY, tick, knockout.reducedMotion,
+        knockout, time, 'sad');
       ctx.restore();
     }
     fighters.forEach((fighter, index) => {
       const current = fighter || {};
+      if (meta.mode === 'campaign' && current.team === 1 && number(current.hp, 100) <= 0
+        && seenCorpseIds.has(String(current.id))) return;
       const knockout = number(current.hp, 100) <= 0 ? knockouts.get(String(current.id)) : null;
       drawFighter(ctx, knockout?.fighter ?? current, index, groundY, tick,
-        knockout?.reducedMotion ?? reducedMotion, knockout, time);
+        knockout?.reducedMotion ?? reducedMotion, knockout, time,
+        expressionFor(current, state, meta));
+      if (meta.mode === 'campaign') {
+        drawSpearWindup(ctx, current, tick, reducedMotion, groundY, cameraX, worldWidth);
+      }
     });
+    for (const projectile of state.projectiles || []) drawSpear(ctx, projectile, reducedMotion);
     if (meta.mode === 'campaign') drawFallingObject(ctx, state.fallingObject, tick, reducedMotion);
     for (const knockout of knockouts.values()) drawTomatoBurst(ctx, knockout, time, knockout.reducedMotion);
-    drawEffects(time);
-    drawAtmosphere(ctx, theme, tick, level);
+    drawEffects(time, cameraX);
     ctx.restore();
+    ctx.restore();
+    drawAtmosphere(ctx, theme, tick, level);
     lastFighters = new Map(fighters.map((fighter, index) => fighter?.id == null ? null
       : [String(fighter.id), { fighter: { ...fighter }, index }]).filter(Boolean));
   }
