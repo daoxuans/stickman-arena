@@ -87,6 +87,56 @@ test('browser controller boots, switches modes, starts a fight and renders a fra
       entry.callback();
     }
   };
+  // Observe actual browser-controller music routing without exporting its
+  // private SoundEffects instance or depending on a real audio device.
+  const audio = { contexts: [], starts: [], stops: [], master: null };
+  const parameter = () => ({
+    value: 0,
+    setValueAtTime(value) { this.value = value; },
+    linearRampToValueAtTime(value) { this.value = value; },
+    exponentialRampToValueAtTime(value) { this.value = value; },
+    cancelScheduledValues() {},
+  });
+  const audioNode = () => ({
+    connect(next) { this.to = next; return next; },
+    disconnect() {},
+  });
+  const sourceNode = (oscillator = false) => ({
+    ...audioNode(),
+    start(at) {
+      // Music has a separate gain bus before the existing effects master.
+      const music = oscillator && this.to?.to !== audio.master && this.to?.to?.to === audio.master;
+      audio.starts.push({ music, at });
+      this.music = music;
+    },
+    stop(at) { audio.stops.push({ music: this.music, at }); },
+  });
+  class FakeAudioContext {
+    constructor() {
+      this.state = 'running';
+      this.currentTime = 0;
+      this.sampleRate = 8000;
+      this.destination = audioNode();
+      audio.contexts.push(this);
+    }
+
+    createGain() {
+      const gain = { ...audioNode(), gain: parameter() };
+      audio.master ??= gain;
+      return gain;
+    }
+    createDynamicsCompressor() {
+      return { ...audioNode(), threshold: parameter(), knee: parameter(), ratio: parameter(),
+        attack: parameter(), release: parameter() };
+    }
+    createOscillator() { return { ...sourceNode(true), frequency: parameter() }; }
+    createBuffer(_channels, count) { return { getChannelData: () => new Float32Array(count) }; }
+    createBufferSource() { return sourceNode(); }
+    createBiquadFilter() { return { ...audioNode(), frequency: parameter() }; }
+    resume() { return Promise.resolve(); }
+  }
+  const musicStarts = () => audio.starts.filter((entry) => entry.music).length;
+  const musicStops = () => audio.stops.filter((entry) => entry.music && entry.at === undefined).length;
   let latestCampaignView;
   let activeCampaign;
   const originalCampaignStep = CampaignSession.prototype.step;
@@ -145,6 +195,7 @@ test('browser controller boots, switches modes, starts a fight and renders a fra
     },
   };
   globalThis.window = {
+    AudioContext: FakeAudioContext,
     addEventListener(type, callback) {
       if (!windowListeners.has(type)) windowListeners.set(type, []);
       windowListeners.get(type).push(callback);
@@ -172,6 +223,10 @@ test('browser controller boots, switches modes, starts a fight and renders a fra
     assert.equal(elements.get('spear-button').disabled, true, 'pre-fight overlay keeps the action inactive');
     assert.match(elements.get('spear-status').textContent, /剩余 5\/5/);
     assert.equal(elements.get('spear-guide-remaining').textContent, '5/5');
+    assert.equal(audio.contexts.length, 0, 'opening the page does not start browser audio');
+    document.fire('pointerdown');
+    assert.equal(audio.contexts.length, 1, 'a user gesture unlocks one shared audio context');
+    assert.equal(musicStarts(), 0, 'the start overlay does not autoplay the battle score');
 
     elements.get('duel-button').fire('click');
     assert.equal(elements.get('campaign-panel').hidden, true);
@@ -181,6 +236,9 @@ test('browser controller boots, switches modes, starts a fight and renders a fra
     elements.get('campaign-button').fire('click');
     elements.get('overlay-primary').fire('click');
     assert.equal(elements.get('screen-overlay').hidden, true);
+    assert.ok(musicStarts() > 0, 'starting the campaign begins its quiet theme after the gesture');
+    assert.equal(timers.size, 1, 'one scheduler continues the background theme');
+    assert.ok([...timers.values()][0].delay >= 40 && [...timers.values()][0].delay <= 600);
     assert.ok(frames.length > 0);
     let frameTime = performance.now();
     function advanceFrame(milliseconds = 18) {
@@ -342,8 +400,13 @@ test('browser controller boots, switches modes, starts a fight and renders a fra
 
     tapKey('KeyI');
     advanceFrame();
+    const musicStopsBeforeBlur = musicStops();
     window.fire('blur');
     assert.equal(campaignHero().spearAiming, false, 'losing focus cancels uncommitted aim');
+    assert.ok(musicStops() > musicStopsBeforeBlur, 'losing focus cuts off the campaign score');
+    const musicBeforeFocus = musicStarts();
+    window.fire('focus');
+    assert.ok(musicStarts() > musicBeforeFocus, 'returning focus resumes just the active scene');
     document.fire('keydown', { code: 'KeyI', repeat: false });
     advanceFrame();
     assert.equal(campaignHero().spearAiming, true, 'holding I first enters aim');
@@ -356,10 +419,16 @@ test('browser controller boots, switches modes, starts a fight and renders a fra
     tapKey('KeyI');
     advanceFrame();
     assert.equal(campaignHero().spearAiming, true);
+    const musicStopsBeforeMode = musicStops();
     elements.get('duel-button').fire('click');
     assert.equal(campaignHero().spearAiming, false, 'switching modes drops an unconfirmed aim');
+    assert.ok(musicStops() > musicStopsBeforeMode, 'switching to the duel lobby stops campaign music');
+    const musicInLobby = musicStarts();
+    advanceFrame();
+    assert.equal(musicStarts(), musicInLobby, 'the duel lobby stays silent');
     elements.get('campaign-button').fire('click');
     elements.get('overlay-primary').fire('click');
+    assert.ok(musicStarts() > musicInLobby, 'resuming the campaign restores its theme once');
 
     tapKey('KeyI');
     tapKey('KeyI');
@@ -425,9 +494,14 @@ test('browser controller boots, switches modes, starts a fight and renders a fra
     assert.equal(advanceFrame()[0].kick, false, 'blur must drop queued actions');
     tapKey('ShiftLeft');
     globalThis.document.hidden = true;
+    const musicStopsBeforeHidden = musicStops();
     globalThis.document.fire('visibilitychange');
     assert.equal(advanceFrame()[0].dodge, false, 'hiding the tab must drop queued actions');
+    assert.ok(musicStops() > musicStopsBeforeHidden, 'a hidden tab stops background music');
     globalThis.document.hidden = false;
+    const musicBeforeVisible = musicStarts();
+    globalThis.document.fire('visibilitychange');
+    assert.ok(musicStarts() > musicBeforeVisible, 'a visible, already-unlocked game can resume music');
 
     tapKey('KeyK');
     elements.get('duel-button').fire('click');
@@ -479,8 +553,21 @@ test('browser controller boots, switches modes, starts a fight and renders a fra
     await new Promise((resolve) => setImmediate(resolve));
     const socket = sockets.at(-1);
     assert.equal(socket.url, 'ws://127.0.0.1:3000/ws');
+    const musicBeforeRoom = musicStarts();
     socket.fire('message', { data: JSON.stringify({ type: 'created', code: '123456', role: 'p1', theme: 'city' }) });
+    assert.equal(musicStarts(), musicBeforeRoom, 'waiting for an opponent has no battle score');
     socket.fire('message', { data: JSON.stringify({ type: 'start', code: '123456', role: 'p1', theme: 'city' }) });
+    assert.ok(musicStarts() > musicBeforeRoom, 'server start begins the duel arrangement');
+    const musicStopsBeforeMute = musicStops();
+    elements.get('sound-toggle').fire('click');
+    assert.equal(elements.get('sound-toggle').attributes.get('aria-pressed'), 'false');
+    assert.ok(musicStops() > musicStopsBeforeMute, 'the shared sound switch also mutes music');
+    const musicWhileMuted = musicStarts();
+    document.fire('pointerdown');
+    assert.equal(musicStarts(), musicWhileMuted, 'a gesture cannot restart muted music');
+    elements.get('sound-toggle').fire('click');
+    assert.equal(elements.get('sound-toggle').attributes.get('aria-pressed'), 'true');
+    assert.ok(musicStarts() > musicWhileMuted, 'unmuting an active duel resumes one score');
     assert.equal(socket.sent.at(-1).input.kick, false);
     assert.equal('special' in socket.sent.at(-1).input, false);
     assert.equal('spear' in socket.sent.at(-1).input, false);
@@ -530,14 +617,19 @@ test('browser controller boots, switches modes, starts a fight and renders a fra
     const finish = (reason, events) => socket.fire('message', { data: JSON.stringify({
       type: 'finished', code: '123456', reason, winner: 'p1', state: resultState(events),
     }) });
+    const musicStopsBeforeFinish = musicStops();
     finish('ko', [ko]);
     assert.equal(elements.get('screen-overlay').hidden, true, 'duel KO should show the canvas first');
+    const musicAfterFinish = musicStarts();
+    assert.ok(musicStops() > musicStopsBeforeFinish, 'the finished round cuts off its score');
     fireTimers(180);
     assert.equal(elements.get('screen-overlay').hidden, true);
     fireTimers(650);
     assert.equal(elements.get('overlay-title').textContent, '你赢了！');
+    assert.equal(musicStarts(), musicAfterFinish, 'the result overlay remains silent');
 
     socket.fire('message', { data: JSON.stringify({ type: 'start', code: '123456', role: 'p1', theme: 'city' }) });
+    assert.ok(musicStarts() > musicAfterFinish, 'a new duel round starts a fresh score');
     finish('timeout', []);
     assert.equal(elements.get('overlay-title').textContent, '你赢了！');
     assert.equal(elements.get('screen-overlay').hidden, false, 'timeouts must show the result immediately');

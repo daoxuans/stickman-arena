@@ -31,22 +31,32 @@ function clock() {
         entry.callback();
       }
     },
+    fireNext(advance) {
+      const [id, entry] = pending.entries().next().value ?? [];
+      assert.ok(entry, 'a scheduled audio beat should exist');
+      pending.delete(id);
+      advance?.(entry.delay);
+      entry.callback();
+      return entry.delay;
+    },
   };
 }
 
 function fakeAudio() {
   const stats = { links: [], filters: [], compressors: [], contexts: [], sources: [],
-    starts: [], stops: [], disconnected: [] };
+    starts: [], stops: [], disconnected: [], edges: [], gains: [] };
   let gains = 0;
   const param = () => ({
     value: 0,
-    setValueAtTime(value) { this.value = value; },
-    linearRampToValueAtTime(value) { this.value = value; },
-    exponentialRampToValueAtTime(value) { this.value = value; },
+    events: [],
+    setValueAtTime(value, at) { this.value = value; this.events.push(['set', value, at]); },
+    linearRampToValueAtTime(value, at) { this.value = value; this.events.push(['linear', value, at]); },
+    exponentialRampToValueAtTime(value, at) { this.value = value; this.events.push(['exponential', value, at]); },
+    cancelScheduledValues(at) { this.events.push(['cancel', at]); },
   });
   const node = (name) => ({
     name,
-    connect(next) { stats.links.push(`${name}->${next.name}`); return next; },
+    connect(next) { stats.links.push(`${name}->${next.name}`); stats.edges.push([this, next]); return next; },
     disconnect() { stats.disconnected.push(name); },
   });
   const source = (name) => {
@@ -70,7 +80,11 @@ function fakeAudio() {
     createBuffer(_channels, count) { return { getChannelData: () => new Float32Array(count) }; }
     createBufferSource() { return source('noise'); }
     createOscillator() { return { ...source('oscillator'), frequency: param() }; }
-    createGain() { return { ...node(gains++ === 0 ? 'master' : 'gain'), gain: param() }; }
+    createGain() {
+      const gain = { ...node(gains++ === 0 ? 'master' : 'gain'), gain: param() };
+      stats.gains.push(gain);
+      return gain;
+    }
     createBiquadFilter() {
       const filter = { ...node('filter'), frequency: param() };
       stats.filters.push(filter);
@@ -351,4 +365,250 @@ test('new round cancels delayed wave and victory cues as well as tomatoes', () =
   timer.fire(115);
   timer.fire(180);
   assert.equal(played.length, immediate);
+});
+
+test('four synthesized themes have distinct melodic roots and tempi; a duel adds a faster pulse', () => {
+  const timer = clock();
+  const { stats, FakeAudioContext } = fakeAudio();
+  const SoundEffects = soundClass({ ...timer, AudioContext: FakeAudioContext });
+  const sound = new SoundEffects();
+  sound.unlock();
+  const leads = [];
+  const beatDelays = [];
+  for (const theme of ['forest', 'city', 'ocean', 'land']) {
+    sound.setMusicScene({ mode: 'campaign', theme });
+    assert.equal(sound.musicVoices.size, 2, `${theme} starts with a lead and restrained bass`);
+    leads.push([...sound.musicVoices][0].source.frequency.value);
+    beatDelays.push([...timer.pending.values()][0].delay);
+    assert.equal(timer.pending.size, 1, 'one scheduler serves the music, even after switching themes');
+  }
+  assert.equal(new Set(leads).size, 4, 'each setting uses its own actual melody pitch');
+  assert.equal(new Set(beatDelays).size, 4, 'each setting has a distinct rhythm');
+  const oceanDelay = beatDelays[2];
+  sound.setMusicScene({ mode: 'duel', theme: 'ocean' });
+  assert.ok([...timer.pending.values()][0].delay < oceanDelay, 'the room owner’s ocean theme gets a quicker duel arrangement');
+  assert.equal(sound.musicScene.theme, 'ocean');
+  assert.equal(stats.contexts.length, 1, 'theme switching reuses the same audio context');
+});
+
+test('music needs a user gesture, loops with a single timer and keeps its own small voice budget', () => {
+  const timer = clock();
+  const { stats, FakeAudioContext } = fakeAudio();
+  const SoundEffects = soundClass({ ...timer, AudioContext: FakeAudioContext });
+  const sound = new SoundEffects();
+  sound.setMusicScene({ mode: 'campaign', theme: 'forest' });
+  assert.equal(stats.contexts.length, 0, 'no autoplay context before an explicit gesture');
+  assert.equal(timer.pending.size, 0);
+  sound.unlock();
+  assert.equal(sound.musicRunning, true);
+  assert.equal(timer.pending.size, 1);
+  const originalStarts = stats.starts.length;
+  for (let i = 0; i < 45; i++) {
+    sound.setMusicScene({ mode: 'campaign', theme: 'forest' });
+    assert.equal(timer.pending.size, 1, 'repeated HUD/frame synchronization does not double the loop');
+    timer.fireNext((delay) => { stats.contexts[0].currentTime += delay / 1000; });
+    assert.equal(timer.pending.size, 1);
+    assert.ok(sound.musicVoices.size <= sound.maxMusicVoices);
+  }
+  assert.ok(stats.starts.length > originalStarts + 20, 'a short melody repeats instead of a single sustained note');
+  assert.equal(sound.voices.size, 0, 'the 24 combat-effect voices remain entirely available');
+  assert.ok(stats.edges.some(([from, to]) => from === sound.musicBus && to === sound.output),
+    'music has a separate quiet gain branch feeding the shared compressor');
+  assert.ok(stats.edges.some(([from, to]) => from === sound.output && to === stats.compressors[0]));
+  sound.play({ type: 'hit', heavy: true });
+  assert.equal(sound.voices.size, 3, 'a layered heavy hit is not blocked by music voices');
+  for (let i = 0; i < 30; i++) sound.play({ type: 'hit', heavy: i % 3 === 0 });
+  assert.equal(sound.voices.size, sound.maxVoices, 'effect polyphony remains capped independently');
+  assert.ok(sound.musicVoices.size <= sound.maxMusicVoices);
+});
+
+test('background mix stays well below the impact and ducks briefly when a confirmed hit lands', () => {
+  const timer = clock();
+  const { stats, FakeAudioContext } = fakeAudio();
+  const SoundEffects = soundClass({ ...timer, AudioContext: FakeAudioContext });
+  const sound = new SoundEffects();
+  sound.setMusicScene({ mode: 'campaign', theme: 'city', boss: true });
+  sound.unlock();
+  const musicRawPeaks = [...sound.musicVoices].map((voice) =>
+    Math.max(...voice.gain.gain.events.filter(([type]) => type === 'linear').map(([, value]) => value)));
+  assert.ok(musicRawPeaks.reduce((sum, volume) => sum + volume, 0) * sound.musicLevel < 0.105 / 5,
+    'even the simultaneous lead and bass stay far below one ordinary hit tone');
+  const output = sound.output;
+  const bus = sound.musicBus;
+  const before = bus.gain.events.length;
+  sound.play({ type: 'hit', heavy: false });
+  assert.equal(output.gain.value, 0.64, 'the shared effects master is not ducked');
+  assert.deepEqual(bus.gain.events.slice(before).map(([kind, value]) => [kind, value]), [
+    ['cancel', 0], ['set', sound.musicLevel], ['linear', sound.musicDuckLevel], ['linear', sound.musicLevel],
+  ]);
+  assert.ok(sound.musicDuckLevel < sound.musicLevel / 2, 'an impact lowers only the music branch by more than half');
+  const afterHit = bus.gain.events.length;
+  sound.play({ type: 'hit', special: true });
+  assert.equal(bus.gain.events.length, afterHit, 'individual light-wave target events do not repeatedly duck');
+  sound.play({ type: 'ko' });
+  assert.ok(bus.gain.events.length > afterHit, 'the KO gets clear priority too');
+  assert.equal(stats.compressors.length, 1, 'both branches share the same clipping guard');
+});
+
+test('rapid combo hits hold the current music envelope instead of pumping it up between punches', () => {
+  const timer = clock();
+  const { stats, FakeAudioContext } = fakeAudio();
+  const SoundEffects = soundClass({ ...timer, AudioContext: FakeAudioContext });
+  const sound = new SoundEffects();
+  sound.setMusicScene({ mode: 'campaign', theme: 'forest' });
+  sound.unlock();
+  const gain = sound.musicBus.gain;
+  sound.play({ type: 'hit' });
+  stats.contexts[0].currentTime = 0.15;
+  let before = gain.events.length;
+  sound.play({ type: 'hit' });
+  const heldDuringRecovery = gain.events.slice(before).find(([kind]) => kind === 'set')[1];
+  assert.ok(heldDuringRecovery > sound.musicDuckLevel && heldDuringRecovery < sound.musicLevel,
+    'old AudioParam APIs resume from the interrupted recovery, never jump to full level');
+  stats.contexts[0].currentTime = 0.16;
+  before = gain.events.length;
+  sound.play({ type: 'hit' });
+  const heldDuringNewDip = gain.events.slice(before).find(([kind]) => kind === 'set')[1];
+  assert.ok(heldDuringNewDip < heldDuringRecovery, 'another quick punch continues the dip without a bounce');
+
+  gain.cancelAndHoldAtTime = (at) => { gain.events.push(['hold', at]); };
+  stats.contexts[0].currentTime = 0.18;
+  before = gain.events.length;
+  sound.play({ type: 'hit' });
+  assert.deepEqual(gain.events.slice(before).map(([kind]) => kind), ['hold', 'linear', 'linear'],
+    'modern AudioParam holds the exact instantaneous value rather than reading a stale .value');
+});
+
+test('mute, focus loss and scene changes stop all music tails; restoring resumes only one loop', () => {
+  const timer = clock();
+  const { stats, FakeAudioContext } = fakeAudio();
+  const SoundEffects = soundClass({ ...timer, AudioContext: FakeAudioContext });
+  const sound = new SoundEffects();
+  sound.setMusicScene({ mode: 'campaign', theme: 'land' });
+  sound.unlock();
+  const staleTick = [...timer.pending.values()][0].callback;
+  sound.enabled = false;
+  assert.equal(timer.pending.size, 0);
+  assert.equal(sound.musicVoices.size, 0);
+  assert.equal(sound.output.gain.value, 0);
+  staleTick();
+  assert.equal(timer.pending.size, 0, 'a stale timeout cannot resurrect the muted music');
+  sound.enabled = true;
+  assert.equal(timer.pending.size, 1);
+  sound.setAudible(false);
+  assert.equal(timer.pending.size, 0);
+  assert.equal(sound.musicVoices.size, 0);
+  sound.setAudible(true);
+  assert.equal(timer.pending.size, 1, 'focus return resumes the same scene exactly once');
+  sound.setMusicScene({ mode: 'duel', theme: 'city' });
+  assert.equal(timer.pending.size, 1);
+  assert.equal(sound.musicScene.theme, 'city');
+  sound.setMusicScene(null);
+  assert.equal(timer.pending.size, 0, 'returning to a lobby/finished round is silent');
+  assert.equal(sound.musicVoices.size, 0);
+  assert.ok(stats.disconnected.includes('oscillator') && stats.disconnected.includes('gain'),
+    'stopped notes release their audio-node connections');
+  assert.ok(stats.stops.some(({ time }) => time === undefined), 'tails end at the scene boundary');
+});
+
+test('unsupported or denied browser audio never spins a silent music timer and can retry on another gesture', async () => {
+  const timer = clock();
+  const SoundEffects = soundClass(timer);
+  const unsupported = new SoundEffects();
+  unsupported.setMusicScene({ mode: 'campaign', theme: 'forest' });
+  unsupported.unlock();
+  assert.equal(timer.pending.size, 0);
+  assert.equal(unsupported.musicRunning, false);
+
+  const { stats, FakeAudioContext } = fakeAudio();
+  class SuspendedAudioContext extends FakeAudioContext {
+    constructor() { super(); this.state = 'suspended'; this.allowed = false; this.resumeCalls = 0; }
+    resume() {
+      this.resumeCalls++;
+      if (!this.allowed) return Promise.reject(new Error('autoplay blocked'));
+      this.state = 'running';
+      return Promise.resolve();
+    }
+  }
+  const BlockedSound = soundClass({ ...timer, AudioContext: SuspendedAudioContext });
+  const sound = new BlockedSound();
+  sound.setMusicScene({ mode: 'campaign', theme: 'ocean' });
+  sound.unlock();
+  sound.play({ type: 'hit', heavy: true });
+  assert.equal(sound.voices.size, 3, 'a pending resume can temporarily queue a layered impact');
+  await new Promise(setImmediate);
+  assert.equal(timer.pending.size, 0);
+  assert.equal(sound.musicRunning, false);
+  assert.equal(sound.voices.size, 0, 'a denied resume cleans up the temporarily queued hit too');
+  assert.equal(stats.contexts[0].resumeCalls, 1);
+  for (let i = 0; i < 120; i++) sound.setMusicScene({ mode: 'campaign', theme: 'ocean' });
+  sound.play({ type: 'hit' });
+  assert.equal(stats.contexts[0].resumeCalls, 1,
+    'frame-by-frame scene synchronization must not hot-loop a rejected browser resume');
+  assert.equal(sound.voices.size, 0, 'new effects do not queue into a permanently suspended context');
+  stats.contexts[0].allowed = true;
+  sound.unlock();
+  await new Promise(setImmediate);
+  assert.equal(stats.contexts[0].resumeCalls, 2);
+  assert.equal(sound.musicRunning, true);
+  assert.equal(timer.pending.size, 1);
+});
+
+test('a partial Web Audio API pauses music retries until a scene change or another gesture', () => {
+  const timer = clock();
+  const { stats, FakeAudioContext } = fakeAudio();
+  class PartialAudioContext extends FakeAudioContext {
+    constructor() { super(); this.musicAttempts = 0; }
+    createOscillator() { this.musicAttempts++; throw new Error('oscillators unavailable'); }
+  }
+  const SoundEffects = soundClass({ ...timer, AudioContext: PartialAudioContext });
+  const sound = new SoundEffects();
+  sound.setMusicScene({ mode: 'campaign', theme: 'forest' });
+  sound.unlock();
+  assert.equal(sound.musicRunning, false);
+  assert.equal(sound.musicBlocked, true);
+  assert.equal(timer.pending.size, 0);
+  for (let i = 0; i < 120; i++) sound.setMusicScene({ mode: 'campaign', theme: 'forest' });
+  assert.equal(stats.contexts[0].musicAttempts, 1, 'a broken sound device does not get hammered every frame');
+  sound.setMusicScene({ mode: 'campaign', theme: 'city' });
+  assert.equal(stats.contexts[0].musicAttempts, 2, 'a new theme may retry once');
+  sound.unlock();
+  assert.equal(stats.contexts[0].musicAttempts, 3, 'a new user gesture can retry again');
+  assert.equal(timer.pending.size, 0);
+});
+
+test('an interrupted audio context waits safely, then resumes on a fresh gesture after focus returns', async () => {
+  const timer = clock();
+  const { stats, FakeAudioContext } = fakeAudio();
+  class InterruptedAudioContext extends FakeAudioContext {
+    constructor() { super(); this.allowed = false; this.resumeCalls = 0; }
+    resume() {
+      this.resumeCalls++;
+      if (!this.allowed) return Promise.reject(new Error('gesture required'));
+      this.state = 'running';
+      return Promise.resolve();
+    }
+  }
+  const SoundEffects = soundClass({ ...timer, AudioContext: InterruptedAudioContext });
+  const sound = new SoundEffects();
+  sound.setMusicScene({ mode: 'campaign', theme: 'forest' });
+  sound.unlock();
+  assert.equal(timer.pending.size, 1);
+  sound.setAudible(false);
+  assert.equal(timer.pending.size, 0);
+  stats.contexts[0].state = 'interrupted';
+  sound.setAudible(true);
+  await new Promise(setImmediate);
+  assert.equal(stats.contexts[0].resumeCalls, 1);
+  assert.equal(sound.resumeBlocked, true);
+  assert.equal(timer.pending.size, 0);
+  for (let i = 0; i < 100; i++) sound.setMusicScene({ mode: 'campaign', theme: 'forest' });
+  assert.equal(stats.contexts[0].resumeCalls, 1, 'an interrupted Safari context does not spin on every frame');
+  stats.contexts[0].allowed = true;
+  sound.unlock();
+  await new Promise(setImmediate);
+  assert.equal(stats.contexts[0].resumeCalls, 2);
+  assert.equal(sound.musicRunning, true);
+  assert.equal(timer.pending.size, 1);
+  assert.equal(stats.contexts.length, 1, 'recovery keeps the existing audio context');
 });

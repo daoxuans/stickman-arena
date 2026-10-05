@@ -67,16 +67,41 @@ const MILESTONE_BOSS_SKILLS = Object.freeze([
 ]);
 
 class SoundEffects {
+  static musicScores = Object.freeze({
+    // Eight eighth-notes and a four-bar harmonic turn keep each setting recognizable
+    // without fetching or shipping third-party recordings.
+    forest: { root: 146.83, bpm: 96, melody: [0, 4, 7, 9, 7, 4, 2, null], chords: [0, 5, 3, -2], shape: 'sine' },
+    city: { root: 130.81, bpm: 112, melody: [0, 3, 7, 10, 7, 5, 3, null], chords: [0, 3, -2, 5], shape: 'triangle' },
+    ocean: { root: 110, bpm: 82, melody: [0, 2, 5, 7, 9, 7, 5, null], chords: [0, 5, 2, -3], shape: 'sine' },
+    land: { root: 123.47, bpm: 100, melody: [0, 3, 5, 6, 10, 6, 5, null], chords: [0, -2, 3, -4], shape: 'triangle' },
+  });
+
   constructor() {
     this._enabled = true;
+    this.audible = true;
+    this.unlocked = false;
     this.context = null;
     this.output = null;
     this.resuming = null;
+    this.resumeBlocked = false;
     this.pendingKOs = new Set();
     this.pendingCues = new Set();
     this.cueGeneration = 0;
     this.voices = new Set();
     this.maxVoices = 24;
+    this.musicScene = null;
+    this.musicBus = null;
+    this.musicTimer = null;
+    this.musicGeneration = 0;
+    this.musicRunning = false;
+    this.musicBlocked = false;
+    this.musicVoices = new Set();
+    this.maxMusicVoices = 6;
+    this.musicLevel = 0.28;
+    this.musicDuckLevel = 0.08;
+    this.musicDuckCurve = null;
+    this.musicBeatIndex = 0;
+    this.musicNextAt = 0;
   }
 
   get enabled() { return this._enabled; }
@@ -87,43 +112,231 @@ class SoundEffects {
     this._enabled = next;
     if (!next) this.cancelPendingKOs();
     if (this.output) this.output.gain.value = next ? 0.64 : 0;
+    if (next) this.startMusic();
+  }
+
+  setAudible(value) {
+    const next = Boolean(value);
+    if (next === this.audible) return;
+    this.audible = next;
+    if (!next) this.cancelPendingKOs();
+    else this.startMusic();
+  }
+
+  unlock() {
+    // Only called from a real pointer/key gesture or from the sound button.
+    this.unlocked = true;
+    this.resumeBlocked = false;
+    this.musicBlocked = false;
+    const context = this.getContext();
+    if (context?.state === 'running') this.startMusic();
   }
 
   getContext() {
-    if (!this.enabled) return null;
+    if (!this.enabled || !this.audible) return null;
+    if (this.resumeBlocked && this.context?.state !== 'running') return null;
     const AudioContextType = window.AudioContext || window.webkitAudioContext;
     if (!AudioContextType) return null;
     if (!this.context) {
+      let createdContext;
       try {
-        this.context = new AudioContextType();
-        this.output = this.context.createGain();
-        this.output.gain.value = 0.64;
+        createdContext = new AudioContextType();
+        const output = createdContext.createGain();
+        output.gain.value = 0.64;
         // A shared bus keeps overlapping hits punchy without clipping the output.
-        const compressor = this.context.createDynamicsCompressor?.();
+        const compressor = createdContext.createDynamicsCompressor?.();
         if (compressor) {
           compressor.threshold.value = -18;
           compressor.knee.value = 18;
           compressor.ratio.value = 4;
           compressor.attack.value = 0.004;
           compressor.release.value = 0.16;
-          this.output.connect(compressor).connect(this.context.destination);
+          output.connect(compressor).connect(createdContext.destination);
         } else {
-          this.output.connect(this.context.destination);
+          output.connect(createdContext.destination);
         }
+        this.context = createdContext;
+        this.output = output;
       } catch {
+        try { createdContext?.close?.()?.catch?.(() => {}); } catch { /* Optional cleanup. */ }
         this.context = null;
         this.output = null;
+        this.resumeBlocked = true;
         return null;
       }
     }
-    if (this.context.state === 'suspended' && !this.resuming) {
+    if (['suspended', 'interrupted'].includes(this.context.state) && !this.resuming) {
       try {
         this.resuming = Promise.resolve(this.context.resume())
-          .catch(() => {})
+          .then(() => {
+            if (this.context?.state === 'running') {
+              this.resumeBlocked = false;
+              this.startMusic();
+            } else {
+              this.resumeBlocked = true;
+              this.cancelPendingKOs();
+            }
+          })
+          .catch(() => {
+            this.resumeBlocked = true;
+            this.cancelPendingKOs();
+          })
           .finally(() => { this.resuming = null; });
-      } catch { /* Browser denied playback. */ }
+      } catch {
+        this.resumeBlocked = true;
+        this.cancelPendingKOs();
+        return null;
+      }
     }
+    if (this.resumeBlocked && this.context.state !== 'running') return null;
+    if (this.context.state !== 'running' && !this.resuming) return null;
     return this.context;
+  }
+
+  setMusicScene(scene) {
+    const next = scene && SoundEffects.musicScores[scene.theme]
+      ? { mode: scene.mode === 'duel' ? 'duel' : 'campaign',
+        theme: scene.theme, boss: Boolean(scene.boss) }
+      : null;
+    if (this.musicScene?.mode === next?.mode && this.musicScene?.theme === next?.theme
+      && this.musicScene?.boss === next?.boss) {
+      if (next) this.startMusic();
+      return;
+    }
+    this.stopMusic();
+    this.musicScene = next;
+    this.musicBlocked = false;
+    this.startMusic();
+  }
+
+  stopMusicVoice(voice) {
+    this.musicVoices.delete(voice);
+    try { voice.source.stop(); } catch { /* Already ended or never started. */ }
+    try { voice.source.disconnect(); } catch { /* Already disconnected. */ }
+    try { voice.gain.disconnect(); } catch { /* Already disconnected. */ }
+  }
+
+  stopMusic() {
+    this.musicGeneration++;
+    if (this.musicTimer !== null) window.clearTimeout(this.musicTimer);
+    this.musicTimer = null;
+    this.musicRunning = false;
+    this.musicDuckCurve = null;
+    for (const voice of [...this.musicVoices]) this.stopMusicVoice(voice);
+    if (this.musicBus) {
+      const gain = this.musicBus.gain;
+      gain.cancelScheduledValues?.(this.context?.currentTime ?? 0);
+      gain.value = this.musicLevel;
+    }
+  }
+
+  musicTone(context, frequency, at, seconds, volume, shape) {
+    for (const voice of this.musicVoices) {
+      if (voice.endsAt <= context.currentTime) this.stopMusicVoice(voice);
+    }
+    if (this.musicVoices.size >= this.maxMusicVoices) return;
+    const source = context.createOscillator();
+    const gain = context.createGain();
+    source.type = shape;
+    source.frequency.setValueAtTime(frequency, at);
+    gain.gain.setValueAtTime(0.0001, at);
+    gain.gain.linearRampToValueAtTime(volume, at + Math.min(0.018, seconds * 0.2));
+    gain.gain.exponentialRampToValueAtTime(0.0001, at + seconds);
+    const voice = { source, gain, endsAt: at + seconds + 0.01 };
+    this.musicVoices.add(voice);
+    source.onended = () => {
+      this.musicVoices.delete(voice);
+      try { source.disconnect(); } catch { /* Already disconnected. */ }
+      try { gain.disconnect(); } catch { /* Already disconnected. */ }
+    };
+    source.connect(gain).connect(this.musicBus);
+    source.start(at);
+    source.stop(at + seconds + 0.01);
+  }
+
+  musicBeat(context, at, stepSeconds) {
+    const score = SoundEffects.musicScores[this.musicScene.theme];
+    const beat = this.musicBeatIndex % score.melody.length;
+    const bar = Math.floor(this.musicBeatIndex / score.melody.length);
+    const root = score.root * 2 ** (score.chords[bar % score.chords.length] / 12);
+    const note = score.melody[beat];
+    if (note !== null) this.musicTone(context, root * 2 ** ((note + 12) / 12), at,
+      stepSeconds * 0.79, 0.028, score.shape);
+    if (beat === 0 || beat === 4 || ((this.musicScene.mode === 'duel' || this.musicScene.boss) && beat % 2 === 0)) {
+      this.musicTone(context, root / 2, at, stepSeconds * 0.9, 0.022, 'sine');
+    }
+    if ((this.musicScene.mode === 'duel' || this.musicScene.boss) && (beat === 2 || beat === 6)) {
+      this.musicTone(context, root * 4, at, stepSeconds * 0.16, 0.006, 'sine');
+    }
+    this.musicBeatIndex++;
+  }
+
+  startMusic() {
+    if (this.musicRunning || this.musicBlocked || !this.musicScene
+      || !this.unlocked || !this.enabled || !this.audible) return;
+    const context = this.getContext();
+    // A denied or pending browser resume must never spin a silent JS loop.
+    if (!context || context.state !== 'running') return;
+    try {
+      if (!this.musicBus) {
+        const bus = context.createGain();
+        bus.gain.value = this.musicLevel;
+        bus.connect(this.output);
+        this.musicBus = bus;
+      }
+      this.musicRunning = true;
+      this.musicBeatIndex = 0;
+      this.musicNextAt = context.currentTime + 0.012;
+      const generation = ++this.musicGeneration;
+      const tick = () => {
+        this.musicTimer = null;
+        if (!this.musicRunning || generation !== this.musicGeneration) return;
+        if (!this.enabled || !this.audible || context.state !== 'running') {
+          this.stopMusic();
+          return;
+        }
+        try {
+          const score = SoundEffects.musicScores[this.musicScene.theme];
+          const stepSeconds = 30 / (score.bpm * (this.musicScene.mode === 'duel' ? 1.12 : 1)
+            * (this.musicScene.boss ? 1.07 : 1));
+          const at = Math.max(context.currentTime + 0.012, this.musicNextAt);
+          this.musicBeat(context, at, stepSeconds);
+          this.musicNextAt = at + stepSeconds;
+          // One bounded scheduler, using the audio clock so delayed tabs skip beats instead of bursting.
+          this.musicTimer = window.setTimeout(tick,
+            Math.max(40, Math.min(600, (this.musicNextAt - context.currentTime - 0.06) * 1000)));
+        } catch {
+          this.musicBlocked = true;
+          this.stopMusic(); // A partial Web Audio implementation must not break the game.
+        }
+      };
+      tick();
+    } catch {
+      this.musicBlocked = true;
+      this.stopMusic(); // Music is optional on unsupported devices.
+    }
+  }
+
+  duckMusic() {
+    if (!this.musicRunning || !this.musicBus || !this.context) return;
+    const at = this.context.currentTime;
+    const gain = this.musicBus.gain;
+    const prior = this.musicDuckCurve;
+    const age = Math.max(0, at - (prior?.at ?? at));
+    const heldLevel = !prior || age >= 0.42 ? this.musicLevel
+      : age < 0.02 ? prior.from + (this.musicDuckLevel - prior.from) * age / 0.02
+        : this.musicDuckLevel + (this.musicLevel - this.musicDuckLevel) * (age - 0.02) / 0.4;
+    if (typeof gain.cancelAndHoldAtTime === 'function') {
+      gain.cancelAndHoldAtTime(at);
+    } else {
+      // Older implementations lack hold; reconstruct the current curve instead
+      // of jumping back up to the un-ducked level on every rapid punch.
+      gain.cancelScheduledValues?.(at);
+      gain.setValueAtTime(heldLevel, at);
+    }
+    gain.linearRampToValueAtTime(this.musicDuckLevel, at + 0.02);
+    gain.linearRampToValueAtTime(this.musicLevel, at + 0.42);
+    this.musicDuckCurve = { at, from: heldLevel };
   }
 
   hasVoiceRoom(context, priority) {
@@ -207,6 +420,7 @@ class SoundEffects {
     this.pendingCues.clear();
     // Called by the existing mute/round/mode transitions: no old tail can leak into a new scene.
     for (const voice of [...this.voices]) this.stopVoice(voice);
+    this.stopMusic();
   }
 
   queueCue(delay, callback, pending = this.pendingCues) {
@@ -225,7 +439,9 @@ class SoundEffects {
   }
 
   play(effect) {
-    if (!this.enabled) return;
+    if (!this.enabled || !this.audible) return;
+    if ((effect.type === 'hit' && !effect.special)
+      || ['ko', 'special-wave', 'boss-quake', 'campaign-fail'].includes(effect.type)) this.duckMusic();
     switch (effect.type) {
       case 'hit':
         if (effect.special) break; // The light wave already has its own impact sound.
@@ -348,9 +564,26 @@ class SoundEffects {
   }
 }
 const sound = new SoundEffects();
-const unlockAudio = () => { if (sound.enabled) sound.getContext(); };
-document.addEventListener('pointerdown', unlockAudio, { once: true });
-document.addEventListener('keydown', unlockAudio, { once: true });
+sound.setAudible(!document.hidden);
+function syncMusic() {
+  const campaignPlaying = mode === 'campaign' && !campaignPaused
+    && ['playing', 'aftermath'].includes(campaignView.phase);
+  const duelPlaying = mode === 'duel' && duel.phase === 'playing' && Boolean(duel.code);
+  sound.setMusicScene(campaignPlaying ? {
+    mode, theme: campaignView.level.theme,
+    boss: campaignView.combat?.fighters.some((fighter) => fighter.kind === 'boss' && fighter.hp > 0),
+  } : duelPlaying ? { mode, theme: duel.theme, boss: false } : null);
+}
+const unlockAudio = (event) => {
+  if (!sound.enabled || document.hidden || (event?.type === 'keydown' && event.repeat)) return;
+  // A gesture also restores focus after the browser had suspended background audio.
+  sound.setAudible(true);
+  sound.unlock();
+  syncMusic();
+};
+// Keep these lightweight: a later gesture can recover after a denied browser resume.
+document.addEventListener('pointerdown', unlockAudio);
+document.addEventListener('keydown', unlockAudio);
 
 function notify(message) {
   ui.toast.textContent = message;
@@ -550,8 +783,24 @@ function releaseInput(cancelAim = false) {
   }
   sendInput(true);
 }
-window.addEventListener('blur', () => releaseInput(true));
-document.addEventListener('visibilitychange', () => { if (document.hidden) releaseInput(true); });
+window.addEventListener('blur', () => {
+  releaseInput(true);
+  sound.setAudible(false);
+});
+window.addEventListener('focus', () => {
+  if (document.hidden) return;
+  sound.setAudible(true);
+  syncMusic();
+});
+document.addEventListener('visibilitychange', () => {
+  if (document.hidden) {
+    releaseInput(true);
+    sound.setAudible(false);
+  } else if (typeof document.hasFocus !== 'function' || document.hasFocus()) {
+    sound.setAudible(true);
+    syncMusic();
+  }
+});
 
 function health(fill, label, fighter) {
   const value = fighter ? Math.max(0, Math.ceil(fighter.hp)) : 0;
@@ -742,6 +991,7 @@ function resumeCampaign() {
   accumulator = 0;
   campaignPaused = false;
   updateCampaignHud();
+  syncMusic();
 }
 
 function consumeEvents(events) {
@@ -829,6 +1079,7 @@ function resetDuelRoom() {
   duel.seenEvents.clear();
   previewDuel();
   ui['room-message'].textContent = '创建房间，邀请朋友输入房间码即可对战。';
+  syncMusic();
 }
 
 function leaveRoom() {
@@ -964,6 +1215,7 @@ function handleServerMessage(message) {
     default:
       break;
   }
+  syncMusic();
 }
 
 function ensureSocket() {
@@ -1068,22 +1320,23 @@ function switchMode(next) {
     hideOverlay();
     previewDuel();
   }
+  syncMusic();
 }
 
 ui['campaign-button'].addEventListener('click', () => switchMode('campaign'));
 ui['duel-button'].addEventListener('click', () => switchMode('duel'));
 function updateSoundToggle() {
-  const label = `音效：${sound.enabled ? '开' : '关'}`;
+  const label = `背景音乐与战斗音效：${sound.enabled ? '开' : '关'}`;
   const text = ui['sound-toggle'].querySelector('span');
-  if (text) text.textContent = label;
+  if (text) text.textContent = `声音：${sound.enabled ? '开' : '关'}`;
   ui['sound-toggle'].setAttribute('aria-label', label);
   ui['sound-toggle'].setAttribute('aria-pressed', String(sound.enabled));
+  ui['sound-toggle'].title = label;
 }
 ui['sound-toggle'].addEventListener('click', () => {
   sound.enabled = !sound.enabled;
-  if (!sound.enabled) sound.cancelPendingKOs();
   updateSoundToggle();
-  if (sound.enabled) sound.getContext();
+  if (sound.enabled) unlockAudio();
 });
 
 function duelPresentation(now) {
@@ -1143,6 +1396,8 @@ function frame(now) {
   } else {
     accumulator = 0;
   }
+
+  if (mode === 'campaign') syncMusic();
 
   if (mode === 'duel') sendInput();
   const view = mode === 'campaign'
