@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import {
   TICK_RATE, CORPSE_SETTLE_TICKS, CORPSE_HOLD_TICKS,
   SPEAR_WINDUP_TICKS, SPEARS_PER_LEVEL, SPEAR_GRAVITY, SPEAR_MIN_ANGLE, SPEAR_MAX_ANGLE,
+  ROCK_GRAVITY, BOSS_SUMMON_CAP,
   createFighter,
   createCombatState, createDuelState, stepCombat, aiInput, attackOf, kickOf,
   cancelSpearAim, spearOrigin, spearFlight, spearAimedFlight, spearTrajectoryPoint,
@@ -1818,4 +1819,325 @@ test('PvP KOs never create campaign corpses or a post-fight walk phase', () => {
   assert.equal(duel.status, 'finished');
   assert.equal(duel.corpses.length, 0);
   assert.equal(duel.aftermath, false);
+});
+
+function milestoneDuel(tier, { heroX = 210, bossX = 550, field = arena({ width: 1920 }) } = {}) {
+  const hero = createFighter({ id: 'hero', x: heroX, y: field.groundY });
+  const boss = createFighter({ id: 'boss', x: bossX, y: field.groundY,
+    team: 1, kind: 'boss', bossTier: tier });
+  const state = createCombatState({ arena: field, fighters: [hero, boss] });
+  boss.bossAbilityCooldown = 0;
+  return { state, hero, boss };
+}
+
+test('only milestone boss tiers unlock the new skills in order; a duel cannot forge them', () => {
+  const order = ['rock', 'summon', 'quake', 'volley', 'ward'];
+  const cues = ['boss-rock-windup', 'boss-summon-windup',
+    'boss-quake-windup', 'boss-rock-windup', 'boss-ward-windup'];
+  for (let tier = 0; tier <= 5; tier++) {
+    for (let skillIndex = 0; skillIndex < order.length; skillIndex++) {
+      const { state, boss } = milestoneDuel(tier);
+      stepCombat(state, { boss: { bossSkill: order[skillIndex] } });
+      const allowed = skillIndex < tier && (order[skillIndex] !== 'quake');
+      assert.equal(Boolean(boss.bossCast), allowed,
+        `tier ${tier} may${allowed ? '' : ' not'} begin ${order[skillIndex]}`);
+      assert.equal(state.events.some((entry) => entry.type === cues[skillIndex]), allowed);
+    }
+  }
+  const { state, boss, hero } = milestoneDuel(3, { heroX: 390 });
+  stepCombat(state, { boss: { bossSkill: 'quake' } });
+  assert.equal(boss.bossCast?.type, 'quake', 'the short-range skill requires a nearby target');
+  assert.equal(hero.hp, 100, 'the warning itself cannot damage');
+
+  const duel = createDuelState();
+  duel.fighters[1] = createFighter({ id: 'p2', x: 600, team: 1,
+    kind: 'boss', bossTier: 5 });
+  stepCombat(duel, { p2: { bossSkill: 'rock' } });
+  assert.equal(duel.fighters[1].bossCast, null);
+  assert.equal(duel.projectiles.length, 0);
+  assert.ok(!duel.events.some((entry) => entry.type.startsWith('boss-')));
+  for (const forged of ['constructor', '__proto__']) {
+    const { state: campaign, boss: foe } = milestoneDuel(5);
+    stepCombat(campaign, { boss: { bossSkill: forged } });
+    assert.equal(foe.bossCast, null, `${forged} is not an ability`);
+  }
+});
+
+test('milestone AI chooses its new tier skill, while the chapter boss keeps the old pattern', () => {
+  for (const [tier, heroX, skill] of [
+    [1, 210, 'rock'], [2, 210, 'summon'], [3, 390, 'quake'],
+    [4, 210, 'volley'], [5, 210, 'ward'],
+  ]) {
+    const { state, hero, boss } = milestoneDuel(tier, { heroX });
+    assert.equal(aiInput(boss, hero, state).bossSkill, skill, `tier ${tier}`);
+  }
+  const { state, hero, boss } = milestoneDuel(0);
+  assert.equal(Object.hasOwn(aiInput(boss, hero, state), 'bossSkill'), false);
+});
+
+test('rock windup freezes under hitstop, locks the target and launches a swept parabolic projectile', () => {
+  assert.equal(ROCK_GRAVITY, SPEAR_GRAVITY);
+  const { state, hero, boss } = milestoneDuel(1, { heroX: 245 });
+  stepCombat(state, { boss: { bossSkill: 'rock' } });
+  const cue = state.events.find((entry) => entry.type === 'boss-rock-windup');
+  assert.ok(cue);
+  assert.equal(cue.windupTicks, 32);
+  assert.equal(cue.targetX, 245);
+  assert.equal(boss.bossCast?.ticks, 31);
+  state.hitstop = 3;
+  for (let tick = 0; tick < 3; tick++) {
+    stepCombat(state, { boss: { bossSkill: 'rock' } });
+    assert.equal(boss.bossCast?.ticks, 31);
+  }
+  for (let tick = 1; tick < 32; tick++) stepCombat(state);
+  const launched = state.events.find((entry) => entry.type === 'boss-rock-throw');
+  assert.ok(launched);
+  assert.equal(launched.projectileId, state.projectiles[0].id);
+  assert.equal(boss.bossCast, null);
+  const lockedFlight = spearFlight(launched.x, launched.y, cue.targetX, cue.targetY);
+  assert.ok(Math.abs(launched.vx - lockedFlight.vx) < 1e-9);
+  assert.ok(Math.abs(launched.vy - lockedFlight.vy) < 1e-9);
+  const first = spearTrajectoryPoint(launched.x, launched.y, lockedFlight, 1);
+  assert.ok(Math.abs(state.projectiles[0].x - first.x) < 1e-9);
+  assert.ok(Math.abs(state.projectiles[0].y - first.y) < 1e-9);
+  let impact;
+  for (let tick = 0; tick < 60 && !impact; tick++) {
+    stepCombat(state);
+    impact = state.events.find((entry) => entry.type === 'rock-impact');
+  }
+  assert.equal(impact?.target, hero.id);
+  assert.ok(impact.damage > 0);
+  assert.ok(hero.hp < hero.maxHp);
+  assert.equal(state.events.find((entry) => entry.type === 'hit')?.delivery, 'rock');
+});
+
+test('a moving player can leave a locked rock arc; platform cover and dodge still work', () => {
+  const { state, hero, boss } = milestoneDuel(1, { heroX: 245 });
+  stepCombat(state, { boss: { bossSkill: 'rock' } });
+  const targetX = boss.bossCast.targetX;
+  for (let tick = 1; tick < 32; tick++) stepCombat(state, { hero: { right: true } });
+  const thrown = state.events.find((entry) => entry.type === 'boss-rock-throw');
+  assert.ok(thrown);
+  assert.equal(targetX, 245);
+  assert.ok(hero.x - targetX > 100, 'player moved while the warning target stayed locked');
+
+  for (const defense of ['platform', 'dodge']) {
+    const cover = defense === 'platform'
+      ? [{ x: 310, y: 346, w: 56, h: 12 }] : [];
+    const field = arena({ width: 960, platforms: cover });
+    const guardedHero = createFighter({ id: 'hero', x: 400, y: 438 });
+    const thrower = createFighter({ id: 'thrower', x: 580, y: 438,
+      team: 1, kind: 'slinger' });
+    const scene = createCombatState({ arena: field, fighters: [guardedHero, thrower] });
+    scene.projectiles.push({
+      id: 'rock-1', kind: 'rock', source: thrower.id, team: 1,
+      x: 200, y: 350, vx: 240, vy: -ROCK_GRAVITY,
+      radius: 8, damage: 20, ttl: 10, tier: 0,
+    });
+    if (defense === 'dodge') guardedHero.dodgeTicks = 5;
+    stepCombat(scene);
+    const impact = scene.events.find((entry) => entry.type === 'rock-impact');
+    assert.ok(impact);
+    assert.equal(guardedHero.hp, 100);
+    assert.equal(impact.target, defense === 'platform' ? null : guardedHero.id);
+    assert.equal(impact.blocked, defense === 'dodge');
+    if (defense === 'platform') assert.equal(impact.surface, 'platform');
+  }
+});
+
+test('a boss summons at most five living tagged minions, refills a free slot and stops when KO', () => {
+  assert.equal(BOSS_SUMMON_CAP, 5);
+  const { state, boss } = milestoneDuel(2);
+  const summon = () => {
+    boss.bossAbilityCooldown = 0;
+    stepCombat(state, { boss: { bossSkill: 'summon' } });
+    const cue = state.events.find((entry) => entry.type === 'boss-summon-windup');
+    for (let tick = 1; tick < 40; tick++) stepCombat(state);
+    return cue;
+  };
+  for (const expected of [2, 4, 5]) {
+    const cue = summon();
+    assert.ok(cue);
+    assert.equal(state.fighters.filter((fighter) => fighter.hp > 0
+      && fighter.summonedBy === boss.id).length, expected);
+    assert.ok(state.fighters.filter((fighter) => fighter.summonedBy === boss.id)
+      .every((fighter) => ['leaper', 'grunt'].includes(fighter.kind)));
+  }
+  boss.bossAbilityCooldown = 0;
+  stepCombat(state, { boss: { bossSkill: 'summon' } });
+  assert.equal(boss.bossCast, null);
+  assert.ok(!state.events.some((entry) => entry.type === 'boss-summon-windup'));
+  state.fighters.find((fighter) => fighter.summonedBy === boss.id).hp = 0;
+  const refillCue = summon();
+  assert.equal(refillCue.count, 1);
+  assert.equal(state.fighters.filter((fighter) => fighter.hp > 0
+    && fighter.summonedBy === boss.id).length, BOSS_SUMMON_CAP);
+  assert.equal(new Set(state.fighters.map((fighter) => fighter.id)).size, state.fighters.length);
+  boss.bossAbilityCooldown = 0;
+  boss.bossCast = null;
+  const survivors = state.fighters.filter((fighter) => fighter.hp > 0 && fighter.summonedBy === boss.id);
+  boss.hp = 0;
+  stepCombat(state, { boss: { bossSkill: 'summon' } });
+  assert.equal(boss.bossCast, null);
+  assert.equal(state.fighters.filter((fighter) => fighter.hp > 0
+    && fighter.summonedBy === boss.id).length, survivors.length,
+  'summoned enemies remain killable wave members after the boss falls');
+});
+
+test('quake hits the same grounded support only, while a jump or shallow intervening plank avoids it', () => {
+  for (const support of ['ground', 'plank', 'air']) {
+    const field = arena({ width: 960,
+      platforms: support === 'plank' ? [{ x: 300, y: 426, w: 180, h: 12 }] : [] });
+    const { state, hero, boss } = milestoneDuel(3, { heroX: 375, bossX: 510, field });
+    if (support === 'plank') hero.y = 426;
+    if (support === 'air') {
+      hero.y = 356;
+      hero.grounded = false;
+      hero.vy = -7;
+    }
+    stepCombat(state, { boss: { bossSkill: 'quake' } });
+    assert.equal(Boolean(boss.bossCast), support !== 'air',
+      'the AI-like range guard declines a quake while target is separated vertically');
+    if (support === 'air') continue;
+    for (let tick = 1; tick < 30; tick++) stepCombat(state);
+    const quake = state.events.find((entry) => entry.type === 'boss-quake');
+    assert.ok(quake);
+    assert.equal(hero.hp < 100, support === 'ground');
+    assert.equal(quake.target, support === 'ground' ? hero.id : null);
+    assert.equal(state.events.some((entry) => entry.type === 'hit'
+      && entry.delivery === 'quake'), support === 'ground');
+  }
+});
+
+test('tier-four volley has two separate locked rocks; tier-five ward halves ordinary damage only', () => {
+  const volley = milestoneDuel(4, { heroX: 210 });
+  stepCombat(volley.state, { boss: { bossSkill: 'volley' } });
+  assert.equal(volley.boss.bossCast.volley, 2);
+  for (let tick = 1; tick < 36; tick++) stepCombat(volley.state);
+  const first = volley.state.events.find((entry) => entry.type === 'boss-rock-throw');
+  assert.equal(first?.volleyIndex, 1);
+  assert.equal(volley.boss.bossCast?.ticks, 12);
+  for (let tick = 0; tick < 12; tick++) stepCombat(volley.state);
+  const second = volley.state.events.find((entry) => entry.type === 'boss-rock-throw');
+  assert.equal(second?.volleyIndex, 2);
+  assert.notEqual(first.projectileId, second.projectileId);
+  assert.equal(volley.boss.bossCast, null);
+
+  const ward = milestoneDuel(5, { heroX: 250, bossX: 500 });
+  stepCombat(ward.state, { boss: { bossSkill: 'ward' } });
+  for (let tick = 1; tick < 24; tick++) stepCombat(ward.state);
+  assert.equal(ward.boss.wardTicks, 90);
+  assert.ok(ward.state.events.some((entry) => entry.type === 'boss-ward'));
+  const wound = () => {
+    ward.state.projectiles.push({ id: `spear-${++ward.state.projectileSerial}`,
+      kind: 'spear', source: ward.hero.id, team: 0,
+      x: ward.boss.x - 70, y: ward.boss.y - 66,
+      vx: 70, vy: -SPEAR_GRAVITY, radius: 7, damage: 20, ttl: 8 });
+    stepCombat(ward.state);
+  };
+  const before = ward.boss.hp;
+  wound();
+  assert.equal(before - ward.boss.hp, 10);
+  assert.equal(ward.state.events.find((entry) => entry.type === 'boss-ward-hit')?.absorbed, 10);
+  ward.boss.invulnerable = 0;
+  ward.boss.wardTicks = 0;
+  ward.state.hitstop = 0;
+  const afterWard = ward.boss.hp;
+  wound();
+  assert.equal(afterWard - ward.boss.hp, 20,
+    'the shield protects only while its effective-frame timer remains');
+});
+
+test('leaper approaches with jumps, slinger keeps range and uses its own small-rock cues', () => {
+  const field = arena({ width: 960 });
+  const hero = createFighter({ id: 'hero', x: 220 });
+  const leaper = createFighter({ id: 'leaper', x: 380, team: 1, kind: 'leaper' });
+  const slinger = createFighter({ id: 'slinger', x: 600, team: 1, kind: 'slinger' });
+  const state = createCombatState({ arena: field, fighters: [hero, leaper, slinger] });
+  assert.ok(leaper.speed > slinger.speed);
+  let leaps = 0;
+  for (let tick = 0; tick < 90; tick++) {
+    const input = aiInput(leaper, hero, state);
+    leaps += Number(input.jump);
+    state.tick++;
+  }
+  assert.ok(leaps > 0, 'the leaper has a distinct gap-closing jump cadence');
+  leaper.x = 270;
+  leaper.y = 385;
+  leaper.grounded = false;
+  let aerialKick = false;
+  for (let tick = 0; tick < 30; tick++) {
+    aerialKick ||= aiInput(leaper, hero, state).kick;
+    state.tick++;
+  }
+  assert.equal(aerialKick, true, 'a leaper can aim a jump kick at a reachable opponent');
+  leaper.x = 380;
+  leaper.y = 438;
+  leaper.grounded = true;
+  slinger.bossAbilityCooldown = 0;
+  assert.equal(aiInput(slinger, hero, state).bossSkill, 'rock');
+  slinger.x = 300;
+  assert.equal(aiInput(slinger, hero, state).right, true,
+    'the ranged unit steps away when the player closes to melee range');
+  slinger.x = 600;
+  stepCombat(state, { slinger: aiInput(slinger, hero, state) });
+  assert.ok(state.events.some((entry) => entry.type === 'rock-windup'));
+  for (let tick = 1; tick < 22; tick++) stepCombat(state);
+  const smallRock = state.events.find((entry) => entry.type === 'rock-throw');
+  assert.equal(smallRock?.radius, 8);
+  assert.ok(!state.events.some((entry) => entry.type === 'boss-rock-throw'));
+});
+
+test('a hit or KO interrupts a boss cast without a delayed throw or posthumous summon', () => {
+  for (const [tier, skill, release] of [
+    [1, 'rock', 'boss-rock-throw'], [2, 'summon', 'boss-summon'],
+  ]) {
+    const { state, boss, hero } = milestoneDuel(tier);
+    stepCombat(state, { boss: { bossSkill: skill } });
+    assert.ok(boss.bossCast);
+    boss.hp = tier === 2 ? 1 : boss.hp;
+    state.projectiles.push({
+      id: `spear-interrupt-${tier}`, kind: 'spear', source: hero.id, team: 0,
+      x: boss.x - 70, y: boss.y - 72, vx: 70, vy: -SPEAR_GRAVITY,
+      radius: 7, damage: 20, ttl: 8,
+    });
+    stepCombat(state);
+    assert.equal(boss.bossCast, null);
+    assert.equal(boss.hp === 0, tier === 2);
+    for (let tick = 0; tick < 45; tick++) {
+      stepCombat(state);
+      assert.ok(!state.events.some((entry) => entry.type === release));
+    }
+  }
+});
+
+test('a hero jumping after the quake warning can evade the ground-only pulse', () => {
+  const { state, hero, boss } = milestoneDuel(3, { heroX: 390 });
+  stepCombat(state, { boss: { bossSkill: 'quake' } });
+  assert.ok(state.events.some((entry) => entry.type === 'boss-quake-windup'));
+  for (let tick = 1; tick < 30; tick++) {
+    stepCombat(state, { hero: { jump: tick === 1 } });
+  }
+  assert.ok(!hero.grounded);
+  assert.equal(hero.hp, 100);
+  assert.equal(state.events.find((entry) => entry.type === 'boss-quake')?.target, null);
+});
+
+test('same inputs replay the summoner, caster and projectiles exactly', () => {
+  const first = milestoneDuel(5, { heroX: 250 });
+  const second = milestoneDuel(5, { heroX: 250 });
+  for (let tick = 0; tick < 430; tick++) {
+    const move = tick % 125 < 45 ? { right: true } : tick % 125 < 90 ? { left: true } : {};
+    for (const { state, boss } of [first, second]) {
+      const hero = state.fighters[0];
+      const controls = { [hero.id]: move };
+      for (const fighter of state.fighters) {
+        if (fighter.team === 1 && fighter.hp > 0) controls[fighter.id] = aiInput(fighter, hero, state);
+      }
+      stepCombat(state, controls);
+      assert.ok(state.fighters.filter((fighter) => fighter.hp > 0
+        && fighter.summonedBy === boss.id).length <= BOSS_SUMMON_CAP);
+    }
+    assert.deepEqual(first.state, second.state, `fixed frame ${tick} replays without random branches`);
+  }
 });

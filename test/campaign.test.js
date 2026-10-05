@@ -2,6 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { CampaignSession, STORAGE_KEY } from '../public/campaign.js';
 import { MAX_LEVEL, THEMES, LEVELS, checkpointFor, getLevel, isCheckpoint } from '../shared/levels.js';
+import { createFighter } from '../shared/combat.js';
 
 function storage(initial = {}) {
   const values = new Map(Object.entries(initial));
@@ -83,8 +84,9 @@ test('all 56 stages have four ordered themes, unique scenes, valid waves and nin
 });
 
 test('a small regular-enemy lift reaches all 56 stages without changing waves or saves', () => {
-  const oldHp = { grunt: 64, rusher: 52, guard: 80, brute: 104 };
-  const oldDamage = { grunt: 0.73, rusher: 0.66, guard: 0.8, brute: 1.04 };
+  const oldHp = { grunt: 64, rusher: 52, guard: 80, brute: 104, leaper: 58, slinger: 56 };
+  const oldDamage = { grunt: 0.73, rusher: 0.66, guard: 0.8, brute: 1.04,
+    leaper: 0.76, slinger: 0.72 };
   const waveCounts = [1, 2, 1, 2, 2, 2, 2, 2, 2, 3, 2, 2, 3, 2];
   const enemyCounts = [1, 2, 2, 3, 3, 3, 4, 4, 4, 5, 4, 5, 5, 2];
   const addedBosses = new Set([10, 20, 30, 40, 50]);
@@ -379,7 +381,7 @@ test('light-wave charges are available only in rooms with more than three enemie
   assert.equal(wave.events.filter((event) => event.type === 'hit' && event.special).length, 2);
 });
 
-test('the campaign-only light wave accumulates charges, halves the current wave and protects the hero', () => {
+test('the campaign-only light wave accumulates charges, halves ordinary foes and protects the hero', () => {
   const session = new CampaignSession({ storage: seedProgress(12, 9) });
   session.start();
   let result = knockOutWithHero(session, 2);
@@ -422,6 +424,84 @@ test('the campaign-only light wave accumulates charges, halves the current wave 
   assert.equal(retry.specialEligible, true);
   assert.equal(retry.specialKills, 0);
   assert.equal(retry.specialCharges, 0);
+});
+
+test('each tenth-stage boss carries its cumulative tier without changing chapter bosses or the save route', () => {
+  for (const number of [10, 20, 30, 40, 50]) {
+    const session = new CampaignSession({ storage: seedProgress(number, checkpointFor(number)) });
+    const level = session.start().level;
+    assert.equal(level.waves.at(-1).groups[0].bossTier, number / 10);
+    while (session.waveIndex < level.waves.length - 1) knockOutWave(session);
+    const boss = session.combat.fighters.find((fighter) => fighter.kind === 'boss' && fighter.hp > 0);
+    assert.equal(boss.bossTier, number / 10, `milestone boss at level ${number}`);
+    assert.equal(session.snapshot().progress.checkpointLevel, checkpointFor(number));
+  }
+  for (const number of [14, 28, 42, 56]) {
+    const group = getLevel(number).waves.at(-1).groups[0];
+    assert.equal(group.bossTier ?? 0, 0, `chapter boss ${number} has no milestone skill tier`);
+  }
+});
+
+test('a light wave takes one third of Boss current HP, half from other foes, even during Boss ward', () => {
+  const session = new CampaignSession({ storage: seedProgress(50, 47) });
+  const level = session.start().level;
+  while (session.waveIndex < level.waves.length - 1) knockOutWave(session);
+  const boss = session.combat.fighters.find((fighter) => fighter.kind === 'boss' && fighter.hp > 0);
+  const hero = session.combat.fighters.find((fighter) => fighter.id === 'hero');
+  boss.hp = 91;
+  boss.wardTicks = 50;
+  boss.bossCast = { type: 'rock', ticks: 10, totalTicks: 20 };
+  const minion = createFighter({
+    id: 'wave-ordinary', team: 1, kind: 'grunt', x: boss.x + 58,
+    y: boss.y, maxHp: 60,
+  });
+  minion.hp = 45;
+  minion.summonedBy = boss.id;
+  session.combat.fighters.push(minion);
+  session.specialCharges = 1;
+
+  const result = session.step({ special: true });
+  assert.equal(result.specialCharges, 0);
+  assert.equal(boss.hp, 61, 'odd Boss health rounds the remaining two thirds upward');
+  assert.equal(minion.hp, 23);
+  assert.equal(boss.bossCast, null, 'the impact interrupts a telegraphed Boss cast');
+  assert.ok(hero.invulnerable > 0);
+  assert.deepEqual(result.events.filter((event) => event.type === 'hit' && event.special)
+    .map((event) => [event.target, event.damage]).sort(),
+  [[boss.id, 30], [minion.id, 22]].sort());
+
+  hero.hp = 0;
+  assert.equal(session.step().phase, 'failed');
+  const retry = session.retry();
+  assert.equal(retry.level.number, 47);
+  assert.equal(retry.specialCharges, 0);
+  assert.equal(retry.combat.fighters.some((fighter) => fighter.summonedBy), false);
+});
+
+test('Boss summons join the live wave, and defeating the Boss does not skip surviving minions', () => {
+  const session = new CampaignSession({ storage: seedProgress(20, 19) });
+  const level = session.start().level;
+  while (session.waveIndex < level.waves.length - 1) knockOutWave(session);
+  const boss = session.combat.fighters.find((fighter) => fighter.kind === 'boss' && fighter.hp > 0);
+  const hero = session.combat.fighters.find((fighter) => fighter.id === 'hero');
+  boss.bossCast = { type: 'summon', ticks: 1, totalTicks: 40, count: 2, tier: 2 };
+  boss.bossAbilityCooldown = 600;
+  hero.invulnerable = 300;
+  const arrival = session.step();
+  const minions = arrival.combat.fighters.filter((fighter) => fighter.summonedBy === boss.id && fighter.hp > 0);
+  assert.equal(minions.length, 2);
+  assert.equal(arrival.level.enemyCount, 4, 'extra summons never change the static level-size gate');
+  assert.ok(arrival.events.filter((event) => event.type === 'boss-summon').length >= 2);
+
+  boss.hp = 0;
+  const waiting = session.step();
+  assert.equal(waiting.phase, 'playing');
+  assert.equal(waiting.waveNumber, level.waves.length);
+  assert.equal(waiting.combat.fighters.filter((fighter) => fighter.summonedBy === boss.id && fighter.hp > 0).length, 2);
+  minions[0].hp = 0;
+  const finish = knockOutWithHero(session, 1);
+  assert.equal(finish.phase, 'aftermath', 'last minion KO starts the normal playable victory window');
+  assert.equal(finish.specialKills, 1, 'a summoned foe personally KOed by the player counts as an enemy');
 });
 
 test('the final boss ends the campaign and persists completion', () => {

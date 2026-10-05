@@ -3,24 +3,24 @@ import assert from 'node:assert/strict';
 import { CAMPAIGN_WORLD_WIDTH, LEVELS, checkpointFor, getLevel } from '../shared/levels.js';
 
 const MILESTONE_BOSSES = [
-  { number: 10, name: '雾林巨拳', originalWaves: 3, maxHp: 162, damageScale: 0.91 },
-  { number: 20, name: '地下铁卫', originalWaves: 2, maxHp: 172, damageScale: 0.94 },
-  { number: 30, name: '风暴巨兵', originalWaves: 2, maxHp: 181, damageScale: 0.98 },
-  { number: 40, name: '深海狂拳', originalWaves: 2, maxHp: 203, damageScale: 1.07 },
-  { number: 50, name: '荒原巨灵', originalWaves: 2, maxHp: 213, damageScale: 1.1 },
+  { number: 10, name: '雾林巨拳', originalWaves: 3, maxHp: 162, damageScale: 0.91, bossTier: 1 },
+  { number: 20, name: '地下铁卫', originalWaves: 2, maxHp: 172, damageScale: 0.94, bossTier: 2 },
+  { number: 30, name: '风暴巨兵', originalWaves: 2, maxHp: 181, damageScale: 0.98, bossTier: 3 },
+  { number: 40, name: '深海狂拳', originalWaves: 2, maxHp: 203, damageScale: 1.07, bossTier: 4 },
+  { number: 50, name: '荒原巨灵', originalWaves: 2, maxHp: 213, damageScale: 1.1, bossTier: 5 },
 ];
 
 test('five ten-stage milestone bosses gain a separate final wave without replacing chapter bosses', () => {
   assert.deepEqual(LEVELS.filter((level) => level.isBoss).map((level) => level.number),
     [10, 14, 20, 28, 30, 40, 42, 50, 56]);
 
-  for (const { number, name, originalWaves, maxHp, damageScale } of MILESTONE_BOSSES) {
+  for (const { number, name, originalWaves, maxHp, damageScale, bossTier } of MILESTONE_BOSSES) {
     const level = getLevel(number);
     assert.equal(level.waves.length, originalWaves + 1);
     assert.equal(level.waves.at(-1).index, originalWaves + 1);
     assert.ok(level.waves.slice(0, -1).every((wave) => wave.groups.every((group) => group.kind !== 'boss')));
     assert.deepEqual(level.waves.at(-1).groups, [{
-      kind: 'boss', count: 1, name, maxHp, damageScale,
+      kind: 'boss', count: 1, name, maxHp, damageScale, bossTier,
     }]);
     assert.equal(level.enemyCount,
       level.waves.reduce((total, wave) => total + wave.groups.reduce((sum, group) => sum + group.count, 0), 0));
@@ -33,8 +33,65 @@ test('five ten-stage milestone bosses gain a separate final wave without replaci
     const level = getLevel(number);
     assert.equal(level.waves.length, 2);
     assert.equal(level.waves.at(-1).groups[0].kind, 'boss');
+    assert.equal(level.waves.at(-1).groups[0].bossTier, undefined,
+      'chapter bosses retain their existing role and do not inherit milestone skills');
     assert.equal(level.waves.at(-1).groups[0].maxHp, maxHp);
     assert.equal(level.waves.at(-1).groups[0].damageScale, damageScale);
+  }
+});
+
+test('two new regular archetypes enter in stages 8 and 18 without changing the 56-stage structure', () => {
+  const introductions = { leaper: 8, slinger: 18 };
+  const names = { leaper: '跃袭者', slinger: '石掷手' };
+  const regularKinds = new Set(['grunt', 'rusher', 'guard', 'brute', 'leaper', 'slinger']);
+  const chapterCounts = [1, 2, 2, 3, 3, 3, 4, 4, 4, 5, 4, 5, 5, 2];
+  const chapterWaves = [1, 2, 1, 2, 2, 2, 2, 2, 2, 3, 2, 2, 3, 2];
+  const milestoneNumbers = new Set(MILESTONE_BOSSES.map(({ number }) => number));
+
+  for (const [kind, first] of Object.entries(introductions)) {
+    assert.equal(LEVELS.find((level) => level.waves.some((wave) => wave.groups.some((group) => group.kind === kind)))?.number,
+      first, `${names[kind]} has a deliberate introduction`);
+    assert.ok(LEVELS.slice(first - 1).filter((level) =>
+      level.waves.some((wave) => wave.groups.some((group) => group.kind === kind))).length > 10,
+    `${names[kind]} remains a recurring threat`);
+  }
+
+  for (const level of LEVELS) {
+    const bossBonus = Number(milestoneNumbers.has(level.number));
+    assert.equal(level.enemyCount, chapterCounts[level.stage - 1] + bossBonus,
+      `level ${level.number} retains its planned encounter count`);
+    assert.equal(level.waves.length, chapterWaves[level.stage - 1] + bossBonus,
+      `level ${level.number} retains its wave count`);
+    for (const group of level.waves.flatMap((wave) => wave.groups)) {
+      assert.ok(group.count >= 1);
+      assert.ok(group.kind === 'boss' || regularKinds.has(group.kind),
+        `level ${level.number} contains only known units`);
+      if (group.kind === 'leaper' || group.kind === 'slinger') {
+        assert.equal(group.name, names[group.kind]);
+        assert.equal(group.bossTier, undefined);
+      }
+    }
+  }
+
+  const eligible = LEVELS.filter((level) => level.enemyCount > 3).map((level) => level.number);
+  assert.equal(eligible.length, 29, 'replacing units does not change the light-wave gate');
+  assert.equal(eligible[0], 7);
+  assert.equal(getLevel(30).enemyCount, 3, 'the chapter-three milestone retains no light wave');
+  assert.equal(LEVELS.filter((level) => level.isCheckpoint).length, 16);
+
+  for (const [kind, numbers] of [
+    ['leaper', [8, 22, 36, 50]],
+    ['slinger', [18, 32, 46]],
+  ]) {
+    const groups = numbers.map((number) => getLevel(number).waves
+      .flatMap((wave) => wave.groups).find((group) => group.kind === kind));
+    assert.ok(groups.every(Boolean), `${kind} remains present across later chapters`);
+    for (let index = 1; index < groups.length; index++) {
+      assert.ok(groups[index].maxHp > groups[index - 1].maxHp,
+        `${kind} gains health with the chapter`);
+      assert.ok(groups[index].damageScale > groups[index - 1].damageScale,
+        `${kind} gains damage with the chapter`);
+    }
   }
 });
 

@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { attackOf, spearAimedFlight, spearOrigin, spearTrajectoryPoint } from '../shared/combat.js';
+import { attackOf, spearAimedFlight, spearFlight, spearOrigin, spearTrajectoryPoint } from '../shared/combat.js';
 import { platformPose } from '../shared/platforms.js';
 import { createRenderer } from '../public/render.js';
 
@@ -1691,4 +1691,216 @@ test('PvP ignores campaign corpse and bones fields but retains its KO tomato and
     assert.ok(!strokes.some(({ color, width }) => color === '#663f41'
       && Math.abs(width - 6.2) < 1e-9), 'campaign bones never appear in PvP');
   });
+});
+
+test('leaper and slinger stay thin, distinct and mirrored in both motion settings', () => {
+  for (const reducedMotion of [false, true]) {
+    for (const facing of [-1, 1]) {
+      const leaper = { ...fighter('leaper', 0, 0, facing), id: 'leaper', team: 1,
+        y: 340, grounded: false, vy: -4 };
+      const agile = renderFighters([leaper], { reducedMotion });
+      assert.ok(agile.fills.some(({ color, points }) => color === '#29423d'
+        && points.some((point) => point.kind === 'arc' && point.radius === 22)),
+      'the mobile fighter keeps an oversized head and thin stick body');
+      assert.equal(agile.strokes.filter(({ color, width, scaleX }) => color === '#a5e6bd'
+        && width === 2 && scaleX === facing).length, 2,
+      'split shin wraps identify the jumper from either direction');
+      assert.equal(agile.strokes.some(({ color }) => color === '#d8f8de'), !reducedMotion,
+        'only normal motion adds the short airborne foot accent');
+
+      const slinger = { ...fighter('slinger', 0, 0, facing), id: 'slinger', team: 1 };
+      const ranged = renderFighters([slinger], { reducedMotion });
+      assert.ok(ranged.fills.some(({ color }) => color === '#51433e'),
+        'the stone carrier has a dark satchel without widening its torso');
+      assert.ok(ranged.fills.some(({ color }) => color === '#3d4c4e'),
+        'the raised hand visibly holds a stone before a cast');
+      assert.ok(ranged.strokes.some(({ color, width, scaleX }) => color === '#e7b578'
+        && width === 2.5 && scaleX === facing), 'the headband mirrors with its facing');
+    }
+  }
+});
+
+test('slinger arc and both stone sizes use the 1920px campaign camera across four themes', () => {
+  for (const theme of ['forest', 'city', 'ocean', 'land']) {
+    for (const reducedMotion of [false, true]) {
+      const recording = recordingRenderer(reducedMotion);
+      const hero = { ...fighter('hero', 0, 0), id: 'hero', team: 0, x: 1450, height: 88 };
+      const origin = { x: 1489, y: 374.56 };
+      const target = { x: 1360, y: 380 };
+      const flight = spearFlight(origin.x, origin.y, target.x, target.y);
+      const slinger = { ...fighter('slinger', 0, 0, -1), id: 'slinger', team: 1,
+        x: 1510, height: 88, bossCast: { type: 'rock', ticks: 12, totalTicks: 22,
+          originX: origin.x, originY: origin.y, targetX: target.x, targetY: target.y,
+          vx: flight.vx, vy: flight.vy, radius: 8 } };
+      recording.renderer.render(scrollingState(1450, { fighters: [hero, slinger],
+        arena: { theme, width: 1920, groundY: 430, platforms: [], hazards: [] },
+        projectiles: [
+          { id: 'small', kind: 'rock', x: 1500, y: 320, vx: -10, vy: 3, radius: 8 },
+          { id: 'heavy', kind: 'rock', x: 1520, y: 325, vx: -8, vy: 4, radius: 14 },
+        ] }), { mode: 'campaign', theme, level: 0 });
+      const arc = recording.strokes.find(({ color, points }) => color === '#d4e9c8'
+        && points.length >= 11 && points.every(Array.isArray));
+      assert.ok(arc, `${theme} keeps the stone warning visible over its backdrop`);
+      assert.equal(arc.originX, -960);
+      assert.deepEqual(arc.points[0], [origin.x, origin.y]);
+      assert.ok(Math.abs(arc.points.at(-1)[0] - target.x) < .001);
+      assert.ok(Math.abs(arc.points.at(-1)[1] - target.y) < .001,
+        'the visual arc uses the same discrete gravity and locked aim as the projectile');
+      assert.ok(recording.strokes.some(({ color, points }) => color === '#d4e9c8'
+        && points.some((point) => point.kind === 'arc' && point.x === target.x)),
+      'the target has a readable reticle over photo and painted backdrops');
+      assert.ok(recording.fills.some(({ color, originX }) => color === '#3d4c4e'
+        && originX === 540));
+      assert.ok(recording.fills.some(({ color, originX }) => color === '#a2ada4'
+        && originX === 540), 'the smaller stone remains visible in the same camera frame');
+      assert.equal(recording.fills.find(({ color, originX }) => color === '#4a3c36'
+        && originX === 560)?.originX, 560,
+      'the large Boss stone remains separate and camera-aligned');
+      assert.equal(recording.strokes.some(({ color }) => color === '#e4c19c'), !reducedMotion,
+        'reduced motion removes the flight streak but preserves warning and stone');
+    }
+  }
+});
+
+test('second Boss stone warns at its second locked target and warning freezes in hitstop', () => {
+  withClock((advance) => {
+    const recording = recordingRenderer();
+    const hero = { ...fighter('hero', 0, 0), id: 'hero', team: 0, x: 1450, height: 88 };
+    const origin = { x: 1541, y: 339 };
+    const secondX = 1610;
+    const flight = spearFlight(origin.x, origin.y, secondX, 355);
+    const boss = { ...fighter('boss', 0, 0), id: 'boss', team: 1,
+      x: 1510, height: 136, width: 44, bossTier: 4,
+      bossCast: { type: 'volley', stage: 1, ticks: 8, totalTicks: 12,
+        originX: origin.x, originY: origin.y, targetX: 1360, secondTargetX: secondX,
+        targetY: 355, vx: flight.vx, vy: flight.vy } };
+    const state = scrollingState(1450, { fighters: [hero, boss], motionTick: 39 });
+    const meta = { mode: 'campaign', theme: 'land', level: 40 };
+    recording.renderer.render({ ...state, tick: 39 }, meta);
+    const warning = () => recording.strokes.find(({ color, points }) => color === '#ffe1aa'
+      && points.length === 21 && points.every(Array.isArray));
+    const before = warning();
+    assert.ok(before);
+    assert.equal(before.originX, -960);
+    assert.ok(Math.abs(before.points.at(-1)[0] - secondX) < .001);
+    assert.ok(Math.abs(before.points.at(-1)[1] - 355) < .001);
+    assert.ok(recording.strokes.some(({ color, points }) => color === '#ffe1aa'
+      && points.some((point) => point.kind === 'arc' && point.x === secondX)),
+    'the reticle moves with the second volley, not the first stone');
+    advance(400);
+    recording.strokes.length = 0;
+    recording.renderer.render({ ...state, tick: 40 }, meta);
+    assert.deepEqual(warning()?.points, before.points,
+      'hitstop leaves the fixed-frame telegraph at the same simulated pose');
+  });
+});
+
+test('summon, ground quake and ward show bounded warnings and a persistent Boss shell', () => {
+  for (const reducedMotion of [false, true]) {
+    const recording = recordingRenderer(reducedMotion);
+    const hero = { ...fighter('hero', 0, 0), id: 'hero', team: 0, x: 1450, height: 88 };
+    const boss = { ...fighter('boss', 0, 0), id: 'boss', team: 1,
+      x: 1510, height: 136, width: 44, bossTier: 5, wardTicks: 58 };
+    const meta = { mode: 'campaign', theme: 'ocean', level: 50 };
+    const renderCast = (type, fields = {}) => {
+      recording.strokes.length = 0;
+      recording.renderer.render(scrollingState(1450, { fighters: [hero, { ...boss,
+        bossCast: { type, ticks: 10, totalTicks: 30, ...fields } }] }), meta);
+      return recording.strokes;
+    };
+    const summon = renderCast('summon', { count: 3 });
+    assert.ok(summon.some(({ color, points }) => color === '#c6f4dd'
+      && points.some((point) => point.kind === 'ellipse' && point.x === boss.x)),
+    'summoning announces itself around the Boss feet');
+    assert.equal(summon.filter(({ color }) => color === '#eaffed').length, 3,
+      'its pre-cast marks communicate the capped batch size');
+    const quake = renderCast('quake', { range: 150 });
+    const strips = quake.filter(({ color, points }) => color === '#ffc29b'
+      && points.length === 7 && points.every(Array.isArray));
+    assert.equal(strips.length, 2, 'shock range warns on both sides of the Boss');
+    assert.deepEqual(strips.map((strip) => strip.points.at(-1)[0]).sort((a, b) => a - b),
+      [boss.x - 150, boss.x + 150]);
+    const ward = renderCast('ward');
+    assert.ok(ward.some(({ color, points }) => color === '#ccefcf'
+      && points.some((point) => point.kind === 'ellipse' && point.y === boss.y - 71)),
+    'the ward tells the player what is about to activate');
+    assert.ok(ward.some(({ color, points }) => color === '#c7f2d4'
+      && points.some((point) => point.kind === 'ellipse' && point.y === -55)),
+    'an active ward continues to outline the Boss without hiding its face');
+  }
+});
+
+test('Boss effects use actual world positions, deduplicate replays and clear on stage change', () => {
+  withClock(() => {
+    const recording = recordingRenderer(true);
+    const events = [
+      { id: 'rock', type: 'rock-impact', x: 1510, y: 320, radius: 14, tier: 4,
+        surface: 'ground' },
+      { id: 'spawn-a', type: 'boss-summon', x: 1350, y: 430, kind: 'leaper' },
+      { id: 'spawn-b', type: 'boss-summon', x: 1650, y: 430, kind: 'slinger' },
+      { id: 'quake', type: 'boss-quake', x: 1500, y: 430, range: 155 },
+      { id: 'ward', type: 'boss-ward', x: 1550, y: 430 },
+      { id: 'ward-absorb', type: 'boss-ward-hit', x: 1540, y: 340, absorbed: 10 },
+    ];
+    for (const event of events) {
+      recording.renderer.effect(event); // A snapshot may precede the first wide-world frame.
+      recording.renderer.effect({ ...event });
+    }
+    const meta = { mode: 'campaign', theme: 'land', level: 50 };
+    const state = scrollingState(1450);
+    recording.renderer.render(state, meta);
+    const ringAt = (color, x) => recording.strokes.filter(({ color: ink, points }) => ink === color
+      && points.some((point) => point.kind === 'arc' && point.x === x));
+    assert.equal(ringAt('#ffe1aa', 1510).length, 1,
+      'one actual stone impact survives a pre-frame event and replay at world x=1510');
+    assert.equal(ringAt('#ffe1aa', 1510)[0].originX, -960);
+    assert.deepEqual(recording.strokes.filter(({ color, points }) => color === '#d8fff0'
+      && points.some((point) => point.kind === 'ellipse')).map(({ points }) =>
+      points.find((point) => point.kind === 'ellipse').x).sort((a, b) => a - b),
+    [1350, 1650], 'each minion uses its own actual spawn position');
+    const quake = recording.strokes.filter(({ color, points }) => color === '#ffe0b9'
+      && points.length === 6 && points.every(Array.isArray));
+    assert.deepEqual(quake.map(({ points }) => points.at(-1)[0]).sort((a, b) => a - b),
+      [1345, 1655], 'ground shock stops at its two real range endpoints');
+    assert.equal(ringAt('#e4f8dd', 1550).length, 1);
+    assert.equal(ringAt('#e4f8dd', 1550)[0].points.find((point) => point.kind === 'arc').y,
+      360, 'the ward release belongs around the body, not on the Boss feet');
+    assert.equal(ringAt('#e4f8dd', 1540).length, 1);
+    assert.equal(ringAt('#e4f8dd', 1540)[0].points.find((point) => point.kind === 'arc').y,
+      340, 'the absorbed blow is confirmed at its true impact point');
+    assert.equal(recording.strokes.filter(({ color }) => color === '#b99477').length, 2,
+      'low motion uses only a small pair of stone-ground skid lines');
+
+    recording.strokes.length = 0;
+    recording.renderer.render({ ...state, tick: 0 }, { ...meta, level: 51 });
+    assert.equal(ringAt('#ffe1aa', 1510).length, 0);
+    assert.equal(ringAt('#e4f8dd', 1550).length, 0,
+      'retry and stage transitions clear the previous Boss effects');
+  });
+});
+
+test('rock and quake damage never draw punch ink, and campaign casts never leak into PvP', () => {
+  const recording = recordingRenderer(true);
+  const boss = { ...fighter('boss', 0, 0), id: 'boss', team: 1,
+    x: 600, height: 136, width: 44,
+    bossCast: { type: 'quake', ticks: 8, totalTicks: 30, range: 150 } };
+  const state = { tick: 39,
+    arena: { theme: 'city', width: 960, groundY: 430, platforms: [], hazards: [] },
+    fighters: [boss], projectiles: [{ kind: 'rock', x: 560, y: 350, radius: 14 }] };
+  recording.renderer.render(state, { mode: 'campaign', theme: 'city', level: 30 });
+  for (const delivery of ['rock', 'quake']) recording.renderer.effect({ id: delivery,
+    type: 'hit', source: 'boss', target: 'hero', x: 480, y: 350,
+    delivery, damage: 19, heavy: true });
+  recording.strokes.length = 0;
+  recording.renderer.render({ ...state, tick: 40 }, { mode: 'campaign', theme: 'city', level: 30 });
+  assert.equal(recording.strokes.filter(({ color }) => color === '#fff9e9').length, 0,
+    'ranged/ground hits keep their damage cue without a misleading close-contact fist mark');
+  assert.ok(recording.strokes.some(({ color }) => color === '#fff4ca'));
+  recording.fills.length = 0;
+  recording.strokes.length = 0;
+  recording.renderer.render({ ...state, tick: 0 }, { mode: 'duel', theme: 'city' });
+  assert.ok(!recording.fills.some(({ color }) => color === '#4a3c36'),
+    'a copied campaign stone snapshot is ignored in multiplayer');
+  assert.ok(!recording.strokes.some(({ color }) => color === '#ffc29b'),
+    'Boss-only telegraphs never enter a multiplayer match');
 });

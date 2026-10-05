@@ -29,12 +29,21 @@ const SPEAR_AIMED_SPEED = 26;
 const SPEAR_AIM_STEP = 1.25;
 const SPEAR_DEFAULT_ANGLE = 42;
 const SPEAR_LIFETIME = 94;
+export const ROCK_GRAVITY = SPEAR_GRAVITY;
+export const BOSS_SUMMON_CAP = 5;
+const BOSS_SKILL_ORDER = ['ward', 'volley', 'quake', 'summon', 'rock'];
+const BOSS_SKILL_TIER = { rock: 1, summon: 2, quake: 3, volley: 4, ward: 5 };
+const BOSS_WINDUP = { rock: 32, summon: 40, quake: 30, volley: 36, ward: 24 };
+const BOSS_QUAKE_RANGE = 190;
+const BOSS_WARD_TICKS = 90;
 
 const ARCHETYPES = {
   hero: { hp: 100, speed: 4.45, mass: 1, damage: 1, height: 88 },
   grunt: { hp: 42, speed: 3.0, mass: 1, damage: 0.72, height: 84 },
   rusher: { hp: 34, speed: 4.4, mass: 0.82, damage: 0.68, height: 81 },
   runner: { hp: 34, speed: 4.4, mass: 0.82, damage: 0.68, height: 81 },
+  leaper: { hp: 58, speed: 4.55, mass: 0.82, damage: 0.76, height: 83 },
+  slinger: { hp: 56, speed: 3.2, mass: 0.86, damage: 0.72, height: 84 },
   guard: { hp: 58, speed: 2.7, mass: 1.25, damage: 0.88, height: 88 },
   brute: { hp: 76, speed: 2.4, mass: 1.55, damage: 1.08, height: 96 },
   heavy: { hp: 76, speed: 2.4, mass: 1.55, damage: 1.08, height: 96 },
@@ -68,6 +77,8 @@ function inputOf(value) {
   const input = {};
   for (const button of BUTTONS) input[button] = value?.[button] === true;
   input.aimAngle = Number.isFinite(value?.aimAngle) ? value.aimAngle : null;
+  input.bossSkill = Object.hasOwn(BOSS_SKILL_TIER, value?.bossSkill)
+    ? value.bossSkill : null;
   return input;
 }
 
@@ -94,13 +105,15 @@ function standingSurface(platform, tick, fighter, x) {
 
 export function createFighter({
   id, name, x, y = 438, team = 0, kind = 'hero', maxHp, damageScale = 1,
-  spearEnabled = false,
+  spearEnabled = false, bossTier = 0, summonedBy = null,
 } = {}) {
   if (!id || !Number.isFinite(x) || !Number.isFinite(y)) {
     throw new TypeError('A fighter needs an id and finite x/y coordinates');
   }
   const stats = ARCHETYPES[kind] ?? ARCHETYPES.grunt;
   const health = Math.max(1, Math.round(maxHp ?? stats.hp));
+  const tier = kind === 'boss' && team === 1 && Number.isFinite(bossTier)
+    ? clamp(Math.floor(bossTier), 0, 5) : 0;
   return {
     id: String(id), name: name ?? (kind === 'hero' ? '火柴斗士' : '挑战者'),
     team, kind, x, y, vx: 0, vy: 0, facing: team === 0 ? 1 : -1,
@@ -115,6 +128,9 @@ export function createFighter({
     spearEnabled: spearEnabled === true,
     spearWindup: 0, spearCooldown: 0, spearAimX: null, spearAimY: null,
     spearAiming: false, spearAimAngle: SPEAR_DEFAULT_ANGLE, spearLaunchFacing: null,
+    bossTier: tier, summonedBy: typeof summonedBy === 'string' ? summonedBy : null,
+    bossCast: null, bossAbilityCooldown: tier ? 42 : kind === 'slinger' ? 70 : 0,
+    bossSkillIndex: 0, wardTicks: 0,
     attackBuffered: false, hitIds: [],
     prevInput: { left: false, right: false, jump: false, attack: false, kick: false,
       dodge: false, spear: false, aimUp: false, aimDown: false, aimCancel: false, aimAngle: null },
@@ -144,6 +160,7 @@ export function createCombatState({ mode = 'campaign', arena = {}, fighters = []
     fallingObject: null,
     projectiles: [],
     projectileSerial: 0,
+    summonSerial: 0,
     ...(mode === 'campaign' ? { spearRemaining: SPEARS_PER_LEVEL } : {}),
     corpses: [],
     aftermath: false,
@@ -498,10 +515,229 @@ function launchSpear(state, fighter) {
   fighter.spearLaunchFacing = null;
 }
 
+function activeBossSummons(state, boss) {
+  return state.fighters.filter((fighter) => fighter.hp > 0 && fighter.summonedBy === boss.id).length;
+}
+
+function bossSkills(fighter) {
+  return BOSS_SKILL_ORDER.filter((skill) => fighter.bossTier >= BOSS_SKILL_TIER[skill]);
+}
+
+function bossSkillAvailable(state, fighter, target, skill) {
+  const gap = Math.abs(target.x - fighter.x);
+  if (skill === 'rock' || skill === 'volley') return gap > 115 && gap < 700;
+  if (skill === 'summon') return fighter.grounded && activeBossSummons(state, fighter) < BOSS_SUMMON_CAP;
+  if (skill === 'quake') return fighter.grounded && gap <= BOSS_QUAKE_RANGE + 15
+    && Math.abs(target.y - fighter.y) <= 34;
+  return skill === 'ward' && fighter.wardTicks <= 0;
+}
+
+function nextBossSkill(state, fighter, target) {
+  if (fighter.kind !== 'boss' || fighter.bossTier <= 0) return null;
+  const unlocked = bossSkills(fighter);
+  for (let offset = 0; offset < unlocked.length; offset++) {
+    const skill = unlocked[(fighter.bossSkillIndex + offset) % unlocked.length];
+    if (bossSkillAvailable(state, fighter, target, skill)) return skill;
+  }
+  return null;
+}
+
+function rockOrigin(fighter, facing) {
+  return {
+    x: fighter.x + facing * (fighter.kind === 'boss' ? 31 : 21),
+    y: fighter.y - fighter.height * (fighter.kind === 'boss' ? 0.67 : 0.63),
+  };
+}
+
+function updateRockCastGeometry(fighter, cast) {
+  const origin = rockOrigin(fighter, cast.facing);
+  const targetX = cast.stage === 1 ? cast.secondTargetX : cast.targetX;
+  const flight = spearFlight(origin.x, origin.y, targetX, cast.targetY);
+  cast.originX = origin.x;
+  cast.originY = origin.y;
+  cast.vx = flight.vx;
+  cast.vy = flight.vy;
+}
+
+function beginBossCast(state, fighter, target, skill) {
+  if (state.mode !== 'campaign' || fighter.team !== 1 || !target || target.hp <= 0
+      || fighter.bossCast || fighter.bossAbilityCooldown > 0 || fighter.stun > 0
+      || fighter.attackStage > 0 || fighter.kickType || fighter.dodgeTicks > 0
+      || fighter.spearWindup > 0 || !fighter.grounded) return false;
+  const slingerRock = fighter.kind === 'slinger' && skill === 'rock';
+  if (!slingerRock && (fighter.kind !== 'boss' || fighter.bossTier < BOSS_SKILL_TIER[skill]
+      || !bossSkillAvailable(state, fighter, target, skill))) return false;
+  const windupTicks = slingerRock ? 22 : BOSS_WINDUP[skill];
+  const facing = fighter.facing < 0 ? -1 : 1;
+  const cast = {
+    type: skill, ticks: windupTicks, totalTicks: windupTicks, facing,
+    tier: fighter.bossTier, stage: 0,
+  };
+  if (skill === 'rock' || skill === 'volley') {
+    cast.targetX = target.x;
+    cast.targetY = target.y - target.height * 0.53;
+    cast.secondTargetX = cast.targetX + facing * 48;
+    cast.radius = slingerRock ? 8 : 13 + Math.floor(fighter.bossTier / 3);
+    cast.volley = skill === 'volley' ? 2 : 1;
+    updateRockCastGeometry(fighter, cast);
+  } else if (skill === 'summon') {
+    cast.count = Math.min(BOSS_SUMMON_CAP - activeBossSummons(state, fighter),
+      fighter.bossTier >= 4 ? 3 : 2);
+  } else if (skill === 'quake') cast.range = BOSS_QUAKE_RANGE;
+  else if (skill === 'ward') cast.durationTicks = BOSS_WARD_TICKS;
+  fighter.bossCast = cast;
+  fighter.bossAbilityCooldown = slingerRock ? 170 : 190 - 12 * fighter.bossTier;
+  if (!slingerRock) {
+    const unlocked = bossSkills(fighter);
+    fighter.bossSkillIndex = (unlocked.indexOf(skill) + 1) % unlocked.length;
+  }
+  const cueType = skill === 'rock' || skill === 'volley'
+    ? slingerRock ? 'rock-windup' : 'boss-rock-windup'
+    : `boss-${skill}-windup`;
+  event(state, cueType, {
+    source: fighter.id, x: cast.originX ?? fighter.x,
+    y: cast.originY ?? fighter.y, facing, tier: cast.tier,
+    windupTicks,
+    ...(cast.targetX === undefined ? {} : {
+      targetX: cast.targetX, targetY: cast.targetY,
+      vx: cast.vx, vy: cast.vy, radius: cast.radius, volley: cast.volley,
+    }),
+    ...(cast.count === undefined ? {} : { count: cast.count }),
+    ...(cast.range === undefined ? {} : { range: cast.range }),
+  });
+  return true;
+}
+
+function launchRock(state, fighter, cast) {
+  updateRockCastGeometry(fighter, cast);
+  const projectile = {
+    id: `rock-${++state.projectileSerial}`, kind: 'rock',
+    source: fighter.id, team: fighter.team,
+    x: cast.originX, y: cast.originY, vx: cast.vx, vy: cast.vy,
+    radius: cast.radius, ttl: SPEAR_LIFETIME,
+    damage: fighter.kind === 'slinger' ? 9 * fighter.damageScale
+      : (11 + fighter.bossTier * 2) * fighter.damageScale,
+    tier: cast.tier,
+  };
+  state.projectiles.push(projectile);
+  event(state, fighter.kind === 'slinger' ? 'rock-throw' : 'boss-rock-throw', {
+    source: fighter.id, projectileId: projectile.id,
+    x: projectile.x, y: projectile.y, vx: projectile.vx, vy: projectile.vy,
+    radius: projectile.radius, facing: cast.facing, tier: cast.tier,
+    volley: cast.volley, volleyIndex: cast.stage + 1,
+  });
+}
+
+function summonBossMinions(state, boss, cast) {
+  // Only active summons consume slots. A defeated boss cannot start another
+  // cast; surviving summons remain ordinary, killable wave enemies.
+  const freeSlots = BOSS_SUMMON_CAP - activeBossSummons(state, boss);
+  const kinds = boss.bossTier >= 3 ? ['leaper', 'slinger', 'grunt'] : ['leaper', 'grunt'];
+  for (let index = 0; index < Math.min(cast.count, freeSlots); index++) {
+    const kind = kinds[state.summonSerial % kinds.length];
+    const fighter = createFighter({
+      id: `summon-${boss.id}-${++state.summonSerial}`,
+      name: kind === 'leaper' ? '召唤跃袭者' : kind === 'slinger' ? '召唤石掷手' : '召唤斗士',
+      x: boss.x,
+      y: boss.y, team: boss.team, kind,
+      maxHp: Math.round(ARCHETYPES[kind].hp * (0.8 + boss.bossTier * 0.07)),
+      damageScale: 0.76 + boss.bossTier * 0.055,
+      summonedBy: boss.id,
+    });
+    // Spread living allies on safe strips near the boss instead of stacking
+    // successive summons at the same x. Later trap contact still hurts them.
+    const blocked = (x) => state.arena.hazards.some((hazard) =>
+      hazardActive(hazard, state.tick) && hazardTouchesFighter(hazard, fighter, x, fighter.y));
+    const candidates = [-1, 1, -2, 2, -3, 3, -4, 4].map((slot) =>
+      clamp(boss.x + Math.sign(slot) * (76 + (Math.abs(slot) - 1) * 68),
+        25, state.arena.width - 25));
+    const separate = (x) => state.fighters.every((other) => other.hp <= 0
+      || other.team !== boss.team || Math.abs(other.x - x) >= 42);
+    fighter.x = candidates.find((x) => separate(x) && !blocked(x))
+      ?? candidates.find((x) => !blocked(x)) ?? candidates[0];
+    state.fighters.push(fighter);
+    event(state, 'boss-summon', {
+      source: boss.id, target: fighter.id, x: fighter.x,
+      y: fighter.y, kind: fighter.kind, tier: cast.tier,
+    });
+  }
+}
+
+function footing(state, fighter) {
+  if (!fighter.grounded) return null;
+  if (Math.abs(fighter.y - state.arena.groundY) <= 3) return 'ground';
+  let found = null;
+  for (const platform of state.arena.platforms) {
+    const surface = standingSurface(platform, state.motionTick, fighter, fighter.x);
+    if (!surface || Math.abs(fighter.y - surface.y) > 3) continue;
+    found = platform;
+    if (fighter.x >= surface.pose.left && fighter.x <= surface.pose.right) break;
+  }
+  return found;
+}
+
+function releaseBossQuake(state, boss, cast) {
+  const support = footing(state, boss);
+  let victim = null;
+  let damage = 0;
+  let blocked = false;
+  for (const target of state.fighters.filter((fighter) => fighter.team !== boss.team
+      && fighter.hp > 0).sort((a, b) => a.id.localeCompare(b.id))) {
+    if (!support || footing(state, target) !== support
+        || Math.abs(target.x - boss.x) > cast.range
+        || Math.abs(target.y - boss.y) > 34) continue;
+    victim = target.id;
+    const before = target.hp;
+    const landed = applyDamage(state, target, {
+      amount: (14 + boss.bossTier) * boss.damageScale,
+      direction: Math.sign(target.x - boss.x) || cast.facing,
+      knockback: 6.4, stun: 18, source: boss.id,
+      heavy: true, delivery: 'quake',
+    });
+    if (landed) {
+      damage += before - target.hp;
+      state.hitstop = Math.max(state.hitstop, 3);
+    } else blocked = true;
+  }
+  event(state, 'boss-quake', {
+    source: boss.id, x: boss.x, y: boss.y, range: cast.range,
+    target: victim, damage, blocked, tier: cast.tier,
+  });
+}
+
+function advanceBossCast(state, fighter) {
+  const cast = fighter.bossCast;
+  if (!cast || fighter.hp <= 0) return;
+  if (cast.type === 'rock' || cast.type === 'volley') updateRockCastGeometry(fighter, cast);
+  cast.ticks--;
+  if (cast.ticks > 0) return;
+  if (cast.type === 'rock' || cast.type === 'volley') {
+    launchRock(state, fighter, cast);
+    if (cast.type === 'volley' && cast.stage === 0) {
+      cast.stage = 1;
+      cast.ticks = 12;
+      cast.totalTicks = 12;
+      updateRockCastGeometry(fighter, cast);
+      return;
+    }
+  } else if (cast.type === 'summon') summonBossMinions(state, fighter, cast);
+  else if (cast.type === 'quake') releaseBossQuake(state, fighter, cast);
+  else if (cast.type === 'ward') {
+    fighter.wardTicks = BOSS_WARD_TICKS;
+    event(state, 'boss-ward', {
+      source: fighter.id, x: fighter.x, y: fighter.y,
+      durationTicks: BOSS_WARD_TICKS, tier: cast.tier,
+    });
+  }
+  fighter.bossCast = null;
+}
+
 function applyDamage(state, target, { amount, direction, knockback, stun, invulnerable = 9,
   source = null, heavy = false, delivery = null }) {
   if (target.hp <= 0 || target.invulnerable > 0 || target.dodgeTicks > 0) return false;
-  const damage = Math.max(1, Math.round(amount));
+  const rawDamage = Math.max(1, Math.round(amount));
+  const warded = state.mode === 'campaign' && target.kind === 'boss' && target.wardTicks > 0;
+  const damage = warded ? Math.max(1, Math.ceil(rawDamage / 2)) : rawDamage;
   target.hp = Math.max(0, target.hp - damage);
   target.stun = Math.max(target.stun, stun);
   target.invulnerable = invulnerable;
@@ -510,6 +746,7 @@ function applyDamage(state, target, { amount, direction, knockback, stun, invuln
   target.attackTick = 0;
   target.kickType = null;
   target.kickTick = 0;
+  target.bossCast = null;
   cancelSpear(state, target);
   target.attackBuffered = false;
   target.comboWindow = 0;
@@ -520,6 +757,10 @@ function applyDamage(state, target, { amount, direction, knockback, stun, invuln
     x: target.x, y: target.y - target.height * 0.57,
     damage, target: target.id, source, heavy,
     ...(delivery ? { delivery } : {}),
+  });
+  if (warded) event(state, 'boss-ward-hit', {
+    x: target.x, y: target.y - target.height * 0.57,
+    target: target.id, source, absorbed: rawDamage - damage,
   });
   if (target.hp === 0) {
     event(state, 'ko', { x: target.x, y: target.y - target.height * 0.45, target: target.id, source });
@@ -626,7 +867,7 @@ function sweptPlatformHit(projectile, platform, nextX, nextY, motionTick) {
     -projectile.radius, Math.max(6, pose.height) + projectile.radius);
 }
 
-/** A swept path prevents fast spears from tunnelling through a thin stick figure. */
+/** A swept path prevents fast spears and rocks from tunnelling through a thin fighter. */
 function resolveProjectiles(state) {
   if (state.mode !== 'campaign') {
     state.projectiles = [];
@@ -635,7 +876,7 @@ function resolveProjectiles(state) {
   const active = [];
   const impacts = [];
   for (const projectile of state.projectiles) {
-    const nextVy = projectile.vy + SPEAR_GRAVITY;
+    const nextVy = projectile.vy + (projectile.kind === 'rock' ? ROCK_GRAVITY : SPEAR_GRAVITY);
     const nextX = projectile.x + projectile.vx;
     const nextY = projectile.y + nextVy;
     let victim = null;
@@ -689,16 +930,19 @@ function resolveProjectiles(state) {
     const before = victim?.hp ?? 0;
     const damaged = victim && applyDamage(state, victim, {
       amount: projectile.damage, direction: Math.sign(projectile.vx) || 1,
-      knockback: 6, stun: 19, source: projectile.source, heavy: true, delivery: 'spear',
+      knockback: projectile.kind === 'rock' ? 5.6 : 6,
+      stun: projectile.kind === 'rock' ? 17 : 19,
+      source: projectile.source, heavy: true, delivery: projectile.kind,
     });
     if (victim && !damaged) {
       event(state, 'evade', { x: victim.x, y: victim.y - victim.height / 2, target: victim.id });
     }
     if (damaged) state.hitstop = Math.max(state.hitstop, 3);
-    event(state, 'spear-impact', {
+    event(state, projectile.kind === 'rock' ? 'rock-impact' : 'spear-impact', {
       x, y, source: projectile.source, projectileId: projectile.id,
       target: victim?.id ?? null, damage: damaged ? before - victim.hp : 0,
       blocked: Boolean(victim && !damaged), surface,
+      ...(projectile.kind === 'rock' ? { radius: projectile.radius, tier: projectile.tier } : {}),
     });
   }
 }
@@ -827,6 +1071,7 @@ function moveFighter(state, fighter, input) {
 
   if (fighter.hp <= 0) {
     cancelSpear(state, fighter);
+    fighter.bossCast = null;
     fighter.vx *= 0.89;
     fighter.vy = Math.min(MAX_FALL_SPEED, fighter.vy + GRAVITY);
     fighter.x = clamp(fighter.x + fighter.vx, 19, state.arena.width - 19);
@@ -839,11 +1084,17 @@ function moveFighter(state, fighter, input) {
   if (fighter.hazardCooldown > 0) fighter.hazardCooldown--;
   if (fighter.dodgeCooldown > 0) fighter.dodgeCooldown--;
   if (fighter.spearCooldown > 0) fighter.spearCooldown--;
+  if (fighter.bossAbilityCooldown > 0) fighter.bossAbilityCooldown--;
+  if (fighter.wardTicks > 0) fighter.wardTicks--;
   if (fighter.comboWindow > 0) {
     fighter.comboWindow--;
     if (fighter.comboWindow === 0 && fighter.attackStage === 0) fighter.comboStage = 0;
   }
   if (fighter.stun > 0) fighter.stun--;
+  if (input.bossSkill) {
+    const target = state.fighters.find((other) => other.team !== fighter.team && other.hp > 0);
+    if (target) beginBossCast(state, fighter, target, input.bossSkill);
+  }
   if (fighter.grounded) fighter.coyote = 6;
   else if (fighter.coyote > 0) fighter.coyote--;
   if (fighter.jumpBuffer > 0) fighter.jumpBuffer--;
@@ -854,9 +1105,9 @@ function moveFighter(state, fighter, input) {
       + (Number(input.aimUp) - Number(input.aimDown)) * SPEAR_AIM_STEP;
     fighter.spearAimAngle = clamp(nextAngle, SPEAR_MIN_ANGLE, SPEAR_MAX_ANGLE);
   }
-  if (jumpPressed && fighter.kickType === null) fighter.jumpBuffer = 8;
+  if (jumpPressed && fighter.kickType === null && !fighter.bossCast) fighter.jumpBuffer = 8;
 
-  if (dodgePressed && fighter.stun === 0 && fighter.attackStage === 0
+  if (dodgePressed && !fighter.bossCast && fighter.stun === 0 && fighter.attackStage === 0
       && fighter.kickType === null && fighter.spearWindup === 0
       && fighter.dodgeCooldown === 0 && fighter.dodgeTicks === 0) {
     const direction = Number(input.right) - Number(input.left);
@@ -870,7 +1121,7 @@ function moveFighter(state, fighter, input) {
   if (fighter.dodgeTicks > 0) {
     fighter.dodgeTicks--;
     fighter.vx = fighter.facing * DODGE_SPEED * (fighter.dodgeTicks < 3 ? 0.56 : 1);
-  } else if (fighter.stun === 0 && fighter.spearWindup > 0) {
+  } else if (fighter.stun === 0 && (fighter.spearWindup > 0 || fighter.bossCast)) {
     fighter.vx *= fighter.grounded ? 0.55 : 0.82;
   } else if (fighter.stun === 0) {
     const direction = Number(input.right) - Number(input.left);
@@ -887,7 +1138,8 @@ function moveFighter(state, fighter, input) {
   }
 
   if (fighter.jumpBuffer > 0 && fighter.coyote > 0 && fighter.stun === 0
-      && fighter.dodgeTicks === 0 && fighter.kickType === null && fighter.spearWindup === 0) {
+      && !fighter.bossCast && fighter.dodgeTicks === 0
+      && fighter.kickType === null && fighter.spearWindup === 0) {
     fighter.vy = JUMP_SPEED;
     fighter.grounded = false;
     fighter.coyote = 0;
@@ -896,13 +1148,13 @@ function moveFighter(state, fighter, input) {
   }
 
   // Jump resolves first, so jump+kick in the same simulation tick is an air kick.
-  if (kickPressed && fighter.stun === 0 && fighter.dodgeTicks === 0
+  if (kickPressed && !fighter.bossCast && fighter.stun === 0 && fighter.dodgeTicks === 0
       && fighter.attackStage === 0 && fighter.kickType === null && fighter.spearWindup === 0
       && (fighter.grounded || !fighter.airKickUsed)) {
     startKick(state, fighter, fighter.grounded ? 'ground' : 'air');
   }
 
-  if (attackPressed && fighter.stun === 0 && fighter.dodgeTicks === 0
+  if (attackPressed && !fighter.bossCast && fighter.stun === 0 && fighter.dodgeTicks === 0
       && fighter.kickType === null && fighter.spearWindup === 0) {
     if (fighter.attackStage > 0) fighter.attackBuffered = fighter.attackStage < 3;
     else startAttack(state, fighter, fighter.comboWindow > 0 ? Math.min(3, fighter.comboStage + 1) : 1);
@@ -933,7 +1185,7 @@ function moveFighter(state, fighter, input) {
     }
   }
 
-  if (state.mode === 'campaign' && spearPressed
+  if (state.mode === 'campaign' && !fighter.bossCast && spearPressed
       && (fighter.team !== 0 || (!input.aimCancel && !otherActionPressed))
       && fighter.stun === 0
       && fighter.dodgeTicks === 0 && fighter.attackStage === 0
@@ -1036,6 +1288,7 @@ function moveFighter(state, fighter, input) {
   }
   if (fighter.y > WORLD_HEIGHT + 70) {
     fighter.hp = 0;
+    fighter.bossCast = null;
     cancelSpear(state, fighter);
     event(state, 'ko', { x: fighter.x, y: WORLD_HEIGHT - 10, target: fighter.id, source: 'fall' });
   }
@@ -1045,6 +1298,7 @@ function moveFighter(state, fighter, input) {
       && fighter.kickTick === kickOf(fighter).activeFrom) {
     emitKickEvent(state, fighter, 'air');
   }
+  if (fighter.hp > 0) advanceBossCast(state, fighter);
 }
 
 function resolveDuel(state) {
@@ -1094,7 +1348,9 @@ export function stepCombat(state, inputsById = {}) {
     return state;
   }
 
-  for (const fighter of state.fighters) moveFighter(state, fighter, inputOf(inputsById[fighter.id]));
+  // Summons are appended during a cast; they enter the AI loop on the next
+  // tick instead of acting before the player sees their entry cue.
+  for (const fighter of [...state.fighters]) moveFighter(state, fighter, inputOf(inputsById[fighter.id]));
   resolveAttacks(state);
   resolveProjectiles(state);
   for (const fighter of state.fighters) resolveHazards(state, fighter);
@@ -1335,20 +1591,32 @@ export function aiInput(fighter, target, state) {
   const targetAbove = verticalGap > 0 && !punchOverlap;
   const targetBelow = verticalGap < 0 && !punchOverlap;
   const isBoss = fighter.kind === 'boss';
-  const isRusher = fighter.kind === 'rusher' || fighter.kind === 'runner';
+  const isLeaper = fighter.kind === 'leaper';
+  const isSlinger = fighter.kind === 'slinger';
+  const isRusher = fighter.kind === 'rusher' || fighter.kind === 'runner' || isLeaper;
   const isGuard = fighter.kind === 'guard';
-  const cadence = isBoss ? 54 : isRusher ? 43 : isGuard ? 55 : 63;
+  const cadence = isBoss ? 54 : isLeaper ? 37 : isRusher ? 43 : isGuard ? 55 : 63;
   const idSeed = [...fighter.id].reduce((sum, char) => sum + char.charCodeAt(0), 0);
   const offset = idSeed % cadence;
   const kickCadence = isRusher ? 198 : 224;
   const phase = (state.tick + offset) % cadence;
-  const wantedGap = isBoss ? 59 : isRusher ? 48 : 57;
+  const wantedGap = isBoss ? 59 : isSlinger ? 215 : isRusher ? 48 : 57;
   const targetDirection = Math.sign(distance);
   const needsTurn = gap > (target.width ?? 29) * 0.35 && targetDirection !== fighter.facing;
   const canTurn = fighter.stun === 0 && fighter.dodgeTicks === 0
-    && fighter.attackStage === 0 && fighter.kickType === null && fighter.spearWindup === 0;
+    && fighter.attackStage === 0 && fighter.kickType === null
+    && fighter.spearWindup === 0 && !fighter.bossCast;
   let walking = gap > wantedGap || (needsTurn && canTurn) ? targetDirection : 0;
   let destinationX = target.x - targetDirection * wantedGap;
+  if (isSlinger && !targetAbove && !targetBelow) {
+    // The stone thrower keeps a readable firing lane, but cannot kite forever
+    // into a world edge or abandon route safety around a ground trap.
+    walking = gap < 135 && fighter.x - targetDirection * 88 > 30
+      && fighter.x - targetDirection * 88 < state.arena.width - 30
+      ? -targetDirection : gap > 235 ? targetDirection : 0;
+    destinationX = walking === -targetDirection
+      ? fighter.x - targetDirection * 88 : target.x - targetDirection * wantedGap;
+  }
   let route = null;
   if (targetAbove) {
     route = ascentRoute(fighter, target, state);
@@ -1372,7 +1640,8 @@ export function aiInput(fighter, target, state) {
     }
   }
   const freeToAct = fighter.stun === 0 && fighter.dodgeTicks === 0
-    && fighter.attackStage === 0 && fighter.kickType === null && fighter.spearWindup === 0;
+    && fighter.attackStage === 0 && fighter.kickType === null
+    && fighter.spearWindup === 0 && !fighter.bossCast;
   const hazardRoute = state.mode === 'campaign' && fighter.team === 1
     && state.arena.hazards.length > 0
     ? hazardRouteForGround(fighter, state, walking, destinationX, freeToAct)
@@ -1382,23 +1651,36 @@ export function aiInput(fighter, target, state) {
     && (route ? Math.abs(fighter.x - route.landingX) <= 30
       : verticalGap <= 130 && gap <= 72)
     && (state.tick + idSeed) % 36 === 7;
+  const special = !hazardRoute?.suppressOffense && !needsTurn && freeToAct
+    && fighter.grounded
+    && fighter.bossAbilityCooldown === 0 && state.mode === 'campaign'
+    && fighter.team === 1
+    ? isBoss ? nextBossSkill(state, fighter, target)
+      : isSlinger && gap > 135 && gap < 660 ? 'rock' : null
+    : null;
   return {
     left: walking < 0,
     right: walking > 0,
     jump: hazardRoute?.jump || (!hazardRoute?.suppressOffense
-      && (jumpForHeight || (!targetAbove && isRusher && gap > 120 && gap < 225 && phase === 3))),
+      && (jumpForHeight || (!targetAbove && isRusher
+        && gap > (isLeaper ? 75 : 120) && gap < (isLeaper ? 265 : 225)
+        && phase === 3))),
     attack: !hazardRoute?.suppressOffense && !needsTurn && fighter.spearWindup === 0
-      && gap < (isBoss ? 100 : 83)
+      && !fighter.bossCast && gap < (isBoss ? 100 : isSlinger ? 65 : 83)
       && punchOverlap && phase < (isBoss ? 5 : 3),
-    kick: !hazardRoute?.suppressOffense && !needsTurn && !isBoss && freeToAct && fighter.grounded
-      && verticalHitOverlap(fighter, target, 'ground') && gap < 80
-      && (state.tick + idSeed % kickCadence) % kickCadence === 0,
+    kick: !hazardRoute?.suppressOffense && !needsTurn && !isBoss && freeToAct
+      && ((fighter.grounded && verticalHitOverlap(fighter, target, 'ground') && gap < 80
+        && (state.tick + idSeed % kickCadence) % kickCadence === 0)
+        || (isLeaper && !fighter.grounded && !fighter.airKickUsed
+          && verticalHitOverlap(fighter, target, 'air') && gap < 95
+          && (state.tick + idSeed) % 15 === 0)),
     dodge: hazardRoute?.dodge || (!hazardRoute?.suppressOffense && !needsTurn
-      && !targetAbove && !targetBelow && (isBoss || isGuard || isRusher)
+      && !targetAbove && !targetBelow && (isBoss || isGuard || isRusher || isSlinger)
       && gap < 104 && target.attackStage > 0 && phase === 19),
     spear: !hazardRoute?.suppressOffense && state.mode === 'campaign'
       && fighter.team === 1 && fighter.spearEnabled
       && freeToAct && !needsTurn && gap > 140 && gap < 640
       && (state.tick + idSeed * 11) % 127 === 0,
+    ...(special ? { bossSkill: special } : {}),
   };
 }

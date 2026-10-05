@@ -723,6 +723,223 @@ function drawSpear(ctx, projectile, reducedMotion) {
   ctx.restore();
 }
 
+function drawRock(ctx, projectile, reducedMotion) {
+  if (projectile?.kind !== 'rock') return;
+  const x = number(projectile.x);
+  const y = number(projectile.y);
+  const radius = clamp(number(projectile.radius, 8), 5, 22);
+  const heavy = radius >= 11;
+  const outer = heavy ? '#4a3c36' : '#3d4c4e';
+  const face = heavy ? '#bc926e' : '#a2ada4';
+  if (!reducedMotion) {
+    const angle = Math.atan2(number(projectile.vy), number(projectile.vx, 1));
+    const dx = Math.cos(angle);
+    const dy = Math.sin(angle);
+    ctx.save();
+    ctx.globalAlpha = .52;
+    line(ctx, [[x - dx * (radius + 25), y - dy * (radius + 25)],
+      [x - dx * (radius + 8), y - dy * (radius + 8)]], '#e4c19c', 2.5);
+    ctx.restore();
+  }
+  ctx.save();
+  ctx.translate(x, y);
+  ctx.rotate(reducedMotion ? 0 : Math.atan2(number(projectile.vy), number(projectile.vx, 1)) * .22);
+  polygon(ctx, [[-radius, -radius * .36], [-radius * .48, -radius], [radius * .34, -radius * .87],
+    [radius, -radius * .21], [radius * .86, radius * .67], [0, radius],
+    [-radius * .8, radius * .45]], outer);
+  polygon(ctx, [[-radius * .58, -radius * .34], [-radius * .25, -radius * .66],
+    [radius * .4, -radius * .48], [radius * .62, radius * .13],
+    [radius * .06, radius * .48]], face);
+  line(ctx, [[-radius * .28, -radius * .34], [radius * .28, -radius * .29]], '#f8dfb8', 1.5);
+  ctx.restore();
+}
+
+function drawCastWarning(ctx, fighter, motionTick, reducedMotion, worldWidth, groundY) {
+  const cast = fighter?.bossCast;
+  if (!cast || number(fighter.hp, 100) <= 0 || (fighter.kind !== 'boss' && fighter.kind !== 'slinger')) return;
+  const type = cast.type;
+  const x = number(fighter.x);
+  const footY = number(fighter.y, groundY);
+  const total = Math.max(1, number(cast.totalTicks, 32));
+  const charge = clamp(1 - number(cast.ticks, total) / total, 0, 1);
+  const pulse = reducedMotion ? 0 : Math.sin(motionTick * .23) * 1.5;
+  const boss = fighter.kind === 'boss';
+  if (type === 'rock' || type === 'volley') {
+    const originX = number(cast.originX, x);
+    const originY = number(cast.originY, footY - number(fighter.height, 88) * .65);
+    const lockedTargetX = type === 'volley' && number(cast.stage) === 1
+      ? cast.secondTargetX : cast.targetX;
+    const targetX = clamp(number(lockedTargetX, x), 0, worldWidth);
+    const targetY = clamp(number(cast.targetY, footY - 35), 25, H - 14);
+    const vx = number(cast.vx);
+    const vy = number(cast.vy);
+    const travelTicks = Math.abs(vx) > .1
+      ? clamp(Math.abs((targetX - originX) / vx), 1, 70) : 1;
+    const segments = reducedMotion ? 10 : 20;
+    const arc = [];
+    for (let index = 0; index <= segments; index++) {
+      const point = spearTrajectoryPoint(originX, originY, { vx, vy }, travelTicks * index / segments);
+      arc.push([point.x, point.y]);
+    }
+    const signal = boss ? '#ffe1aa' : '#d4e9c8';
+    const radius = 15 + charge * 6 + pulse;
+    ctx.save();
+    ctx.globalAlpha = .53 + charge * .32;
+    line(ctx, arc, 'rgba(17,31,33,.94)', 5.4);
+    if (!reducedMotion) ctx.setLineDash([6, 6]);
+    line(ctx, arc, signal, reducedMotion ? 2.7 : 2.3);
+    ctx.setLineDash([]);
+    ctx.beginPath();
+    ctx.arc(targetX, targetY, radius, 0, TAU);
+    ctx.strokeStyle = 'rgba(17,31,33,.94)';
+    ctx.lineWidth = 5.2;
+    ctx.stroke();
+    ctx.strokeStyle = signal;
+    ctx.lineWidth = 2.4;
+    ctx.stroke();
+    line(ctx, [[targetX - 6, targetY], [targetX + 6, targetY]], signal, 2);
+    if (type === 'volley') {
+      // Two stones at the hand signal a second throw without pretending its
+      // later, possibly retargeted flight will follow this first locked arc.
+      ellipse(ctx, originX - 6, originY - 11, 3.2, 3.2, signal);
+      ellipse(ctx, originX + 6, originY - 11, 3.2, 3.2, signal);
+    }
+    ctx.restore();
+    return;
+  }
+  if (!boss) return;
+  if (type === 'summon') {
+    const radius = 37 + clamp(number(cast.count, 1), 1, 4) * 7 + charge * 5 + pulse;
+    ctx.save();
+    ctx.globalAlpha = .64 + charge * .25;
+    ctx.beginPath();
+    ctx.ellipse(x, footY - 3, radius, 13, 0, 0, TAU);
+    ctx.strokeStyle = 'rgba(17,31,33,.95)';
+    ctx.lineWidth = 6;
+    ctx.stroke();
+    ctx.strokeStyle = '#c6f4dd';
+    ctx.lineWidth = 2.7;
+    ctx.stroke();
+    for (let i = 0; i < Math.min(4, number(cast.count, 1)); i++) {
+      const markX = x + (i - (number(cast.count, 1) - 1) / 2) * 17;
+      line(ctx, [[markX - 4, footY - 4], [markX, footY - 15 - charge * 4],
+        [markX + 4, footY - 4]], '#eaffed', 1.8);
+    }
+    ctx.restore();
+    return;
+  }
+  if (type === 'quake') {
+    const range = clamp(number(cast.range, 145), 40, 360);
+    const y = footY - 3;
+    ctx.save();
+    ctx.globalAlpha = .62 + charge * .3;
+    for (const side of [-1, 1]) {
+      const points = [[x, y]];
+      for (let step = 1; step <= 6; step++) {
+        const px = clamp(x + side * range * step / 6, 0, worldWidth);
+        points.push([px, y + (step % 2 ? -5 : 1)]);
+      }
+      line(ctx, points, 'rgba(17,31,33,.95)', 7);
+      line(ctx, points, '#ffc29b', 3);
+      const edge = points.at(-1)[0];
+      line(ctx, [[edge, y - 10], [edge, y + 7]], '#fff1c8', 2.5);
+    }
+    ctx.restore();
+    return;
+  }
+  if (type === 'ward') {
+    ctx.save();
+    ctx.globalAlpha = .64 + charge * .28;
+    ctx.beginPath();
+    ctx.ellipse(x, footY - 71, 48 + charge * 3 + pulse, 72 + charge * 4, 0, 0, TAU);
+    ctx.strokeStyle = 'rgba(17,31,33,.94)';
+    ctx.lineWidth = 7;
+    ctx.stroke();
+    ctx.strokeStyle = '#ccefcf';
+    ctx.lineWidth = 2.6;
+    ctx.stroke();
+    ctx.restore();
+  }
+}
+
+function drawBossEffect(ctx, item, progress, reducedMotion, worldWidth) {
+  const calm = reducedMotion || item.calm;
+  const fade = 1 - progress;
+  if (item.type === 'boss-summon') {
+    const radius = calm ? 33 : 18 + item.radius * progress;
+    ctx.save();
+    ctx.globalAlpha = fade * .76;
+    ctx.beginPath();
+    ctx.ellipse(item.x, item.y - 2, radius, 11, 0, 0, TAU);
+    ctx.strokeStyle = '#203d3d';
+    ctx.lineWidth = 6;
+    ctx.stroke();
+    ctx.strokeStyle = '#d8fff0';
+    ctx.lineWidth = 2.6;
+    ctx.stroke();
+    for (const side of [-1, 0, 1]) {
+      const rise = calm ? 16 : 16 + progress * 19;
+      line(ctx, [[item.x + side * 14 - 4, item.y - 4],
+        [item.x + side * 14, item.y - rise],
+        [item.x + side * 14 + 4, item.y - 4]], '#aee6c9', 1.7);
+    }
+    ctx.restore();
+    return true;
+  }
+  if (item.type === 'boss-quake') {
+    const reach = calm ? item.range : Math.max(22, item.range * clamp(progress * 2.8, 0, 1));
+    ctx.save();
+    ctx.globalAlpha = fade * .83;
+    for (const side of [-1, 1]) {
+      const points = [[item.x, item.y]];
+      for (let step = 1; step <= 5; step++) {
+        points.push([clamp(item.x + side * reach * step / 5, 0, worldWidth),
+          item.y + (step % 2 ? -8 : 2)]);
+      }
+      line(ctx, points, '#273333', 8);
+      line(ctx, points, '#ffe0b9', 3.5);
+    }
+    ctx.restore();
+    return true;
+  }
+  if (item.type === 'boss-ward') {
+    const radius = calm ? 39 : 18 + item.radius * progress;
+    ctx.save();
+    ctx.globalAlpha = fade * .82;
+    ctx.beginPath();
+    ctx.arc(item.x, item.y, radius, -.95, 3.9);
+    ctx.strokeStyle = '#173439';
+    ctx.lineWidth = 7;
+    ctx.stroke();
+    ctx.strokeStyle = '#e4f8dd';
+    ctx.lineWidth = 2.8;
+    ctx.stroke();
+    ctx.restore();
+    return true;
+  }
+  if (item.type === 'boss-ward-hit') {
+    // The shell absorbs part of a confirmed hit at the actual contact point.
+    // A short, fixed-size brace reads even without animated particles.
+    const radius = calm ? 18 : 10 + item.radius * progress;
+    ctx.save();
+    ctx.globalAlpha = fade * .85;
+    ctx.beginPath();
+    ctx.arc(item.x, item.y, radius, -.95, .95);
+    ctx.strokeStyle = '#173439';
+    ctx.lineWidth = 6;
+    ctx.stroke();
+    ctx.strokeStyle = '#e4f8dd';
+    ctx.lineWidth = 2.6;
+    ctx.stroke();
+    line(ctx, [[item.x + radius + 3, item.y - 7],
+      [item.x + radius + 10, item.y], [item.x + radius + 3, item.y + 7]],
+    '#c7f2d4', 1.8);
+    ctx.restore();
+    return true;
+  }
+  return false;
+}
+
 function aimedSpearPreview(origin, flight, groundY, worldWidth) {
   const points = [[origin.x, origin.y]];
   const ground = groundY - SPEAR_RADIUS;
@@ -1685,6 +1902,8 @@ function drawFighter(ctx, fighter, index, groundY, tick, reducedMotion = false,
   const kickActive = Boolean(kick && kickTick >= kick.activeFrom && kickTick <= kick.activeTo);
   const hit = number(fighter.hurtFlash) > 0;
   const boss = fighter.kind === 'boss';
+  const leaper = fighter.kind === 'leaper';
+  const slinger = fighter.kind === 'slinger';
   const wanderer = fighter.kind === 'hero';
   const wandererPalette = WANDERER_PALETTES[fighter.team === 1 ? 1 : 0];
   const figureScale = boss ? 1.28 : 1;
@@ -1695,11 +1914,14 @@ function drawFighter(ctx, fighter, index, groundY, tick, reducedMotion = false,
   const bossWindup = boss && attacking
     && attackTick < strike.activeFrom && !defeated;
   const core = hit ? '#fff9e8' : wanderer ? '#35454b'
-    : boss ? '#e6c9b9' : index ? '#f5ddcf' : '#f5ecd7';
+    : boss ? '#e6c9b9' : leaper ? '#d7e9da' : slinger ? '#e9d9bc'
+      : index ? '#f5ddcf' : '#f5ecd7';
   const outline = wanderer ? WANDERER_FACE
-    : boss ? '#482d34' : index ? '#663f41' : '#173b3b';
+    : boss ? '#482d34' : leaper ? '#29423d' : slinger ? '#51433e'
+      : index ? '#663f41' : '#173b3b';
   const accent = wanderer ? wandererPalette.scarfLight
-    : boss ? '#ef8c72' : index ? '#ec7d6a' : '#f5b66d';
+    : boss ? '#ef8c72' : leaper ? '#a5e6bd' : slinger ? '#e7b578'
+      : index ? '#ec7d6a' : '#f5b66d';
 
   const altitude = clamp(groundY - y, 0, 180);
   ellipse(ctx, x, groundY + 6, Math.max(15, (boss ? 34 : 25) - altitude * .05),
@@ -1723,7 +1945,7 @@ function drawFighter(ctx, fighter, index, groundY, tick, reducedMotion = false,
   const bob = grounded && !defeated ? Math.abs(stride) * 2 + Math.sin(tick * .065 + index) * 1.2 : 0;
   const lean = dodge ? 13 : waveCasting ? -4 : bossWindup ? -7 : airKick ? 11 : kicking ? -5
     : attacking ? 6 : stun ? -9 : clamp(vx * 1.05, -6, 6);
-  const hip = [lean * .45, -36 - bob];
+  const hip = [lean * .45, -(leaper ? 40 : 36) - bob];
   const shoulder = [lean, -68 - bob];
   // Keep the crown near its old height while making the head unmistakably
   // larger than the slim, single-stroke body.
@@ -1738,12 +1960,34 @@ function drawFighter(ctx, fighter, index, groundY, tick, reducedMotion = false,
     for (let i = 0; i < 3; i++) line(ctx, [[-28 - i * 12, -45 + i * 12], [-56 - i * 10, -45 + i * 12]], 'rgba(249,226,181,.65)', 2 - i * .3);
   }
 
+  if (boss && number(fighter.wardTicks) > 0 && !defeated) {
+    // Tier-five ward is a thin shell behind the fighter, never a filled
+    // shield that hides its face or the windup at the fist.
+    const pulse = reducedMotion ? 0 : Math.sin(tick * .2) * 1.7;
+    ctx.save();
+    ctx.globalAlpha = .55 + (reducedMotion ? 0 : Math.sin(tick * .12) * .06);
+    ctx.beginPath();
+    ctx.ellipse(0, -55, 36 + pulse, 61 + pulse, 0, 0, TAU);
+    ctx.strokeStyle = '#173439';
+    ctx.lineWidth = 5.6;
+    ctx.stroke();
+    ctx.strokeStyle = '#c7f2d4';
+    ctx.lineWidth = 2.4;
+    ctx.stroke();
+    for (const side of [-1, 1]) {
+      line(ctx, [[side * 30, -93], [side * 40, -81], [side * 34, -69]], '#e9f8db', 1.6);
+    }
+    ctx.restore();
+  }
+
   if (wanderer) drawWandererCape(ctx, shoulder, fighter, facing, tick,
     reducedMotion, defeated, wandererPalette);
 
   const rearElbow = waveCasting ? [10 + lean * .4, -61 - bob]
+    : slinger && !attacking && !kicking ? [-15 + lean * .4, -68 - bob]
     : kicking ? [-13 + lean * .5, -65 - bob] : [-13 + lean * .5, -55 - bob];
   const rearHand = waveCasting ? [31 + lean * .3, -49 - bob]
+    : slinger && !attacking && !kicking ? [-22 + lean * .3, -79 - bob]
     : kicking ? [-8 + lean * .4, -75 - bob]
     : [-19 + lean * .42, attacking ? -36 - bob : -39 - bob];
   bone(ctx, [shoulder, rearElbow, rearHand], outline, core, 4.2);
@@ -1757,19 +2001,40 @@ function drawFighter(ctx, fighter, index, groundY, tick, reducedMotion = false,
     footFront = [airKick ? 27 + extension * (kick.reach - 27) : 22 + extension * (kick.reach - 25),
       (airKick ? -14 : -1) - extension * (airKick ? 24 : 38)];
   } else if (!grounded && !defeated) {
-    kneeBack = [-17, -16]; footBack = [-24, -26 + clamp(vy * .8, -5, 7)];
-    kneeFront = [15, -21]; footFront = [27, -14 - clamp(vy * .5, -4, 5)];
+    kneeBack = leaper ? [-20, -23] : [-17, -16];
+    footBack = leaper ? [-34, -33 + clamp(vy * .8, -5, 7)] : [-24, -26 + clamp(vy * .8, -5, 7)];
+    kneeFront = leaper ? [20, -25] : [15, -21];
+    footFront = leaper ? [39, -15 - clamp(vy * .5, -4, 5)] : [27, -14 - clamp(vy * .5, -4, 5)];
   } else if (dodge) {
     kneeBack = [-25, -18]; footBack = [-42, -3];
     kneeFront = [24, -22]; footFront = [40, -3];
   } else {
-    kneeBack = [-12 - stride * 11, -18]; footBack = [-(boss ? 27 : 21) - stride * 18, -1 + Math.max(0, stride) * 5];
-    kneeFront = [12 + stride * 11, -18]; footFront = [(boss ? 28 : 22) + stride * 18, -1 + Math.max(0, -stride) * 5];
+    kneeBack = [-12 - stride * (leaper ? 14 : 11), leaper ? -25 : -18];
+    footBack = [-(boss ? 27 : leaper ? 31 : 21) - stride * (leaper ? 20 : 18),
+      -1 + Math.max(0, stride) * 5];
+    kneeFront = [12 + stride * (leaper ? 14 : 11), leaper ? -25 : -18];
+    footFront = [(boss ? 28 : leaper ? 33 : 22) + stride * (leaper ? 20 : 18),
+      -1 + Math.max(0, -stride) * 5];
   }
   bone(ctx, [hip, kneeBack, footBack], outline, core, 4.8);
   bone(ctx, [hip, kneeFront, footFront], outline, core, 4.8);
+  if (leaper && !defeated) {
+    // Tall split shin wraps make the mobile foe readable even standing still;
+    // the accent stays on the legs rather than widening the stick torso.
+    line(ctx, [[kneeBack[0] - 2, kneeBack[1] + 5], [footBack[0] + 3, footBack[1] - 8]], accent, 2);
+    line(ctx, [[kneeFront[0] + 1, kneeFront[1] + 5], [footFront[0] - 3, footFront[1] - 8]], accent, 2);
+    if (!reducedMotion && !grounded) {
+      line(ctx, [[footBack[0] - 6, footBack[1] + 7], [footBack[0] - 16, footBack[1] + 11]],
+        '#d8f8de', 1.4);
+    }
+  }
   if (kicking && !defeated) drawKickEnergy(ctx, footFront, kick, kickTick, kickActive, airKick, index, reducedMotion);
   bone(ctx, [hip, shoulder], outline, core, 4.8);
+  if (slinger) {
+    line(ctx, [[shoulder[0] - 8, shoulder[1] + 4], [hip[0] + 12, hip[1] + 5]], '#82684e', 1.9);
+    ellipse(ctx, hip[0] + 11, hip[1] + 4, 9, 7, outline);
+    ellipse(ctx, hip[0] + 10, hip[1] + 3, 5.6, 4, accent);
+  }
   if (wanderer) {
     // A hairline cyan edge separates the inky, still-thin frame from dark
     // forest/ocean photos without painting it into a broad armored body.
@@ -1811,6 +2076,16 @@ function drawFighter(ctx, fighter, index, groundY, tick, reducedMotion = false,
     drawWandererHat(ctx, head);
   } else {
     drawFace(ctx, head, defeated ? 'sad' : expression, outline, accent, defeated, attackStage);
+    if (leaper) {
+      ctx.beginPath();
+      ctx.arc(head[0], head[1], HEAD_RADIUS - 2, -2.48, -.67);
+      ctx.strokeStyle = accent;
+      ctx.lineWidth = 3;
+      ctx.stroke();
+    } else if (slinger) {
+      line(ctx, [[head[0] - 16, head[1] - 14], [head[0], head[1] - 20],
+        [head[0] + 16, head[1] - 14]], accent, 2.5);
+    }
   }
   if (defeated && knockout) drawTomatoOnHead(ctx, head, knockout, time,
     reducedMotion, wanderer ? 16 : 0);
@@ -1841,6 +2116,10 @@ function drawFighter(ctx, fighter, index, groundY, tick, reducedMotion = false,
   }
   ellipse(ctx, frontHand[0], frontHand[1], 4.4, 4.4, accent);
   ellipse(ctx, rearHand[0], rearHand[1], 3.8, 3.8, accent);
+  if (slinger && !defeated) {
+    ellipse(ctx, rearHand[0] - 2, rearHand[1] - 5, 7.5, 6.2, '#3d4c4e');
+    ellipse(ctx, rearHand[0] - 3, rearHand[1] - 7, 3.5, 2.1, '#e1caa5');
+  }
 
   if (bossWindup) {
     drawBossWindup(ctx, {
@@ -2057,7 +2336,10 @@ export function createRenderer(canvas) {
     reducedMotion = Boolean(motionMedia?.matches);
     const type = String(event.type || '').toLowerCase();
     if (!['hit', 'dodge', 'land', 'ko', 'bones-scatter', 'kick', 'jump-kick', 'special-wave', 'fall-impact',
-      'spear-windup', 'spear-throw', 'spear-impact'].includes(type)) return;
+      'spear-windup', 'spear-throw', 'spear-impact',
+      'rock-windup', 'rock-throw', 'rock-impact', 'boss-rock-windup', 'boss-rock-throw',
+      'boss-summon-windup', 'boss-summon', 'boss-quake-windup', 'boss-quake',
+      'boss-ward-windup', 'boss-ward', 'boss-ward-hit'].includes(type)) return;
 
     const stamp = now();
     const stableId = event.id ?? event.eventId ?? event.uid;
@@ -2145,6 +2427,54 @@ export function createRenderer(canvas) {
       if (rings.length > 45) rings.splice(0, rings.length - 45);
       return;
     }
+    if (['rock-windup', 'boss-rock-windup', 'boss-summon-windup',
+      'boss-quake-windup', 'boss-ward-windup'].includes(type)) {
+      // The fighter's fixed-frame bossCast is the persistent warning. Event
+      // echoes would keep moving through pauses or hitstop and suggest a
+      // different launch/landing time from the combat simulation.
+      return;
+    }
+    if (['rock-throw', 'boss-rock-throw', 'rock-impact', 'boss-summon',
+      'boss-quake', 'boss-ward', 'boss-ward-hit'].includes(type)) {
+      const worldX = clamp(number(event.x, x), -50, Math.max(worldWidth + 50, 4096));
+      const impact = type === 'rock-impact';
+      const summon = type === 'boss-summon';
+      const quake = type === 'boss-quake';
+      const ward = type === 'boss-ward';
+      const wardHit = type === 'boss-ward-hit';
+      const throwRock = type === 'rock-throw' || type === 'boss-rock-throw';
+      const bossRock = number(event.tier) > 0 || type === 'boss-rock-throw';
+      const blocked = event.blocked === true;
+      const color = summon ? '#c6f4dd' : quake ? '#ffc29b' : ward || wardHit ? '#c7f2d4'
+        : blocked ? '#dbe7de' : bossRock ? '#ffe1aa' : '#d4e9c8';
+      const radius = summon ? 43 : quake ? 29 : ward ? 48 : wardHit ? 24
+        : impact ? clamp(number(event.radius, 8) * (bossRock ? 3.7 : 3), 22, 64)
+          : clamp(number(event.radius, 8) * 2, 14, 32);
+      const life = summon ? 390 : quake ? 360 : ward ? 340 : wardHit ? 230 : impact ? 300 : 185;
+      rings.push({ x: worldX, y: ward ? y - 70 : y, born: stamp, life, radius, color, type,
+        range: quake ? clamp(number(event.range, 145), 40, 360) : 0,
+        surface: event.surface, blocked, calm: reducedMotion });
+      const count = reducedMotion ? impact ? 3 : 0
+        : impact ? bossRock ? 12 : 7 : summon ? 5 : quake ? 9 : wardHit ? 3 : throwRock ? 3 : 0;
+      const palette = impact ? ['#f5dfbc', '#8b725e', '#c1d5cb']
+        : summon ? ['#ecffeb', '#a9e9cf'] : quake ? ['#ffe0b9', '#ad7b62'] : [color];
+      for (let i = 0; i < count; i++) {
+        const angle = impact || quake ? -Math.PI + (i / Math.max(1, count - 1)) * Math.PI
+          : -Math.PI + hash(i * 17 + worldX) * Math.PI;
+        const speed = (impact ? 115 : quake ? 145 : 72) * (.45 + hash(i * 13 + y) * .7);
+        particles.push({ x: worldX, y, vx: Math.cos(angle) * speed,
+          vy: Math.sin(angle) * speed - (impact || quake ? 12 : 38),
+          size: impact ? 2.2 : 1.6, color: palette[i % palette.length], born: stamp,
+          life: impact ? 310 : quake ? 350 : 260, dust: impact || quake });
+      }
+      if (!reducedMotion && (quake || impact && bossRock && !blocked)) {
+        shakeStrength = quake ? 4.2 : 3.2;
+        shakeUntil = stamp + (quake ? 165 : 125);
+      }
+      if (particles.length > 450) particles.splice(0, particles.length - 450);
+      if (rings.length > 45) rings.splice(0, rings.length - 45);
+      return;
+    }
     if (type.startsWith('spear-')) {
       const impact = type === 'spear-impact';
       const throwSpear = type === 'spear-throw';
@@ -2180,7 +2510,7 @@ export function createRenderer(canvas) {
     const source = specialHit ? lastFighters.get(String(event.source))?.fighter : null;
     const facing = specialHit ? targetX < number(source?.x, targetX) ? -1 : 1
       : number(event.facing, 1) < 0 ? -1 : 1;
-    if (type === 'hit' && !specialHit && event.delivery !== 'spear'
+    if (type === 'hit' && !specialHit && !['spear', 'rock', 'quake'].includes(event.delivery)
       && !String(event.source ?? '').startsWith('hazard:')) {
       const source = lastFighters.get(String(event.source))?.fighter;
       const direction = number(event.facing, number(source?.facing, 1)) < 0 ? -1 : 1;
@@ -2244,6 +2574,7 @@ export function createRenderer(canvas) {
         drawSpiritWave(ctx, item, clamp(progress, 0, 1), worldWidth, reducedMotion);
         continue;
       }
+      if (drawBossEffect(ctx, item, clamp(progress, 0, 1), reducedMotion, worldWidth)) continue;
       ctx.save();
       ctx.globalAlpha = (1 - progress) * (item.type === 'hit' || item.type === 'jump-kick' ? .74 : .45);
       ctx.beginPath();
@@ -2253,6 +2584,13 @@ export function createRenderer(canvas) {
       ctx.strokeStyle = item.color;
       ctx.lineWidth = item.type === 'ko' || item.type === 'jump-kick' ? 5 - 3 * progress : 3 - 2 * progress;
       ctx.stroke();
+      if (item.type === 'rock-impact' && item.surface && item.surface !== 'fighter' && !item.blocked) {
+        const spread = reducedMotion ? 15 : 15 + progress * 14;
+        for (const side of [-1, 1]) {
+          line(ctx, [[item.x, item.y + 2], [item.x + side * spread, item.y + 5],
+            [item.x + side * (spread + 8), item.y + 1]], '#b99477', 1.9);
+        }
+      }
       if (item.type === 'special-hit') drawSpiritHit(ctx, item, progress, reducedMotion);
       if (item.type === 'jump-kick' && !reducedMotion) {
         ctx.translate(item.x, item.y);
@@ -2406,6 +2744,14 @@ export function createRenderer(canvas) {
       }
     }
 
+    // Boss and slinger cast state advances in fixed combat frames, so warnings
+    // freeze with hitstop/pauses instead of drifting on wall-clock timers.
+    if (meta.mode === 'campaign') {
+      for (const fighter of fighters) {
+        drawCastWarning(ctx, fighter, motionTick, reducedMotion, worldWidth, groundY);
+      }
+    }
+
     const visibleIds = new Set(fighters.map((fighter) => String(fighter?.id)));
     // The next campaign wave can replace a KO'd enemy immediately. Its brief
     // visual echo holds the head in place until the tomato lands and fades.
@@ -2430,7 +2776,10 @@ export function createRenderer(canvas) {
         drawSpearWindup(ctx, current, tick, reducedMotion, groundY, cameraX, worldWidth);
       }
     });
-    for (const projectile of state.projectiles || []) drawSpear(ctx, projectile, reducedMotion);
+    for (const projectile of state.projectiles || []) {
+      drawSpear(ctx, projectile, reducedMotion);
+      if (meta.mode === 'campaign') drawRock(ctx, projectile, reducedMotion);
+    }
     if (meta.mode === 'campaign') drawFallingObject(ctx, state.fallingObject, tick, reducedMotion);
     for (const knockout of knockouts.values()) drawTomatoBurst(ctx, knockout, time, knockout.reducedMotion);
     drawEffects(time);

@@ -62,6 +62,10 @@ const duel = {
   inputSeq: 0, lastInputAt: 0, seenEvents: new Set(),
 };
 
+const MILESTONE_BOSS_SKILLS = Object.freeze([
+  '远程投石', '召唤援兵', '震地冲击', '双石连投', '短暂护体',
+]);
+
 class SoundEffects {
   constructor() {
     this._enabled = true;
@@ -225,6 +229,11 @@ class SoundEffects {
     switch (effect.type) {
       case 'hit':
         if (effect.special) break; // The light wave already has its own impact sound.
+        if (effect.delivery === 'rock') {
+          this.noise(0.082, 0.044, 1650, 'lowpass');
+          this.tone(350, 105, 0.12, 0.065, 'triangle');
+          break;
+        }
         // Only confirmed damage gets an audible wind/body hit; a whiff keeps visual wind only.
         this.noise(effect.heavy ? 0.1 : 0.065, effect.heavy ? 0.068 : 0.048, 900, 'highpass');
         this.tone(effect.heavy ? 132 : 185, effect.heavy ? 45 : 72,
@@ -246,6 +255,49 @@ class SoundEffects {
       case 'boss-windup':
         this.tone(92, 128, 0.19, 0.048, 'sine', 1);
         this.tone(310, 440, 0.22, 0.028, 'triangle', 1);
+        break;
+      case 'rock-windup':
+        this.tone(290, 190, 0.16, 0.023, 'triangle');
+        break;
+      case 'boss-rock-windup':
+        this.tone(105, 148, 0.27, 0.045, 'sine', 1);
+        this.noise(0.095, 0.018, 650, 'lowpass');
+        break;
+      case 'rock-throw':
+      case 'boss-rock-throw':
+        this.noise(0.13, effect.type === 'boss-rock-throw' ? 0.042 : 0.028,
+          1250, 'highpass');
+        this.tone(effect.type === 'boss-rock-throw' ? 210 : 320, 110,
+          0.13, 0.036, 'triangle');
+        break;
+      case 'rock-impact':
+        // Confirmed character damage has its own dry hit; don't double it.
+        if (effect.target && !effect.blocked) break;
+        this.tone(310, 92, 0.13, 0.048, 'triangle');
+        this.noise(0.06, 0.023, 1100, 'lowpass');
+        break;
+      case 'boss-summon-windup':
+        this.tone(155, 265, 0.3, 0.036, 'sine', 1);
+        this.tone(410, 530, 0.28, 0.018, 'triangle');
+        break;
+      case 'boss-summon':
+        this.tone(460, 305, 0.12, 0.027, 'triangle');
+        break;
+      case 'boss-quake-windup':
+        this.tone(78, 135, 0.31, 0.048, 'sine', 1);
+        break;
+      case 'boss-quake':
+        this.tone(100, 42, 0.35, 0.12, 'sine', 1);
+        this.noise(0.2, 0.052, 800, 'lowpass', 1);
+        break;
+      case 'boss-ward-windup':
+        this.tone(410, 610, 0.23, 0.028, 'triangle');
+        break;
+      case 'boss-ward':
+        this.tone(620, 940, 0.18, 0.045, 'sine', 1);
+        break;
+      case 'boss-ward-hit':
+        this.tone(810, 380, 0.12, 0.042, 'triangle', 1);
         break;
       case 'spear-aim': this.tone(330, 440, 0.12, 0.026); break;
       case 'spear-windup': this.tone(220, 340, 0.16, 0.028); break;
@@ -546,12 +598,14 @@ function updateCampaignHud() {
   const hero = combat?.fighters.find((fighter) => fighter.team === 0);
   const opponents = combat?.fighters.filter((fighter) => fighter.team === 1 && fighter.hp > 0) ?? [];
   const opponent = opponents[0];
+  const milestoneBoss = combat?.fighters.find((fighter) => fighter.kind === 'boss' && fighter.bossTier > 0);
+  const activeSummons = opponents.filter((fighter) => fighter.summonedBy).length;
   ui['theme-label'].textContent = `${level.themeName} · 第 ${level.chapter} 章`;
   ui['stage-label'].textContent = `关卡 ${String(level.number).padStart(2, '0')} / ${MAX_LEVEL}`;
   ui['stage-title'].textContent = level.name;
   ui['stage-subtitle'].textContent = campaignView.phase === 'aftermath'
     ? '对手已倒下 · 退开再走过倒地敌人，片刻后结算'
-    : `${level.isBoss ? '首领之战 · ' : ''}第 ${level.stage} 关 · 第 ${waveNumber}/${waveCount} 波 · ${level.enemyCount} 名对手`;
+    : `${level.isBoss ? '首领之战 · ' : ''}第 ${level.stage} 关 · 第 ${waveNumber}/${waveCount} 波 · ${level.enemyCount} 名初始对手${milestoneBoss?.bossTier >= 2 ? ` · 召唤兵 ${activeSummons}/5` : ''}`;
   ui['player-name'].textContent = '火柴斗士';
   ui['opponent-name'].textContent = opponent?.name ?? (campaignView.phase === 'aftermath'
     ? '对手已倒下' : ['cleared', 'completed'].includes(campaignView.phase) ? '本关已清除' : '等待下一波');
@@ -620,6 +674,11 @@ function updateCampaignHud() {
 
 function campaignOverlay() {
   const { phase, level, failedLevel, progress } = campaignView;
+  const bossTier = level.waves.flatMap((wave) => wave.groups)
+    .find((group) => group.kind === 'boss' && group.bossTier > 0)?.bossTier ?? 0;
+  const bossHint = bossTier
+    ? ` 本关首领逐级叠加${MILESTONE_BOSS_SKILLS.slice(0, bossTier).join('、')}；召唤援兵同时最多 5 名。光波对首领只扣当前血量的三分之一。`
+    : level.isBoss ? ' 光波对首领只扣当前血量的三分之一。' : '';
   if (phase === 'failed') {
     showOverlay({
       title: '挑战失败',
@@ -669,7 +728,7 @@ function campaignOverlay() {
   } else {
     showOverlay({
       title: level.number === 1 && progress.cleared.length === 0 ? '准备开战' : '继续征程',
-      body: `第 ${level.number} / ${MAX_LEVEL} 关 · ${level.themeName}「${level.name}」。A/D 移动，J 攻击，空格跳跃，Shift 闪避。每关最多投矛 ${SPEARS_PER_LEVEL} 次；按 I 预览弧线，↑↓ 调角，再按 I 确认发射，真正投出才扣次；Esc 取消。${campaignView.specialEligible ? '每击倒两名敌人可按 L 释放一次无敌光波。' : ''}`,
+      body: `第 ${level.number} / ${MAX_LEVEL} 关 · ${level.themeName}「${level.name}」。A/D 移动，J 攻击，空格跳跃，Shift 闪避。每关最多投矛 ${SPEARS_PER_LEVEL} 次；按 I 预览弧线，↑↓ 调角，再按 I 确认发射，真正投出才扣次；Esc 取消。${campaignView.specialEligible ? '每击倒两名敌人可按 L 释放一次无敌光波。' : ''}${bossHint}`,
       primary: '开始挑战',
       onPrimary: () => { resumeCampaign(); hideOverlay(); },
     });

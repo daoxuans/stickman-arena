@@ -175,7 +175,8 @@ export class CampaignSession {
           id: `enemy-${level.number}-${wave.index}-${serial}`,
           name: group.name, kind: group.kind, team: 1,
           x, y: level.groundY, maxHp: group.maxHp, damageScale: group.damageScale,
-          spearEnabled: level.number >= 15 && group.kind !== 'boss'
+          bossTier: group.bossTier ?? 0,
+          spearEnabled: level.number >= 15 && !['boss', 'slinger'].includes(group.kind)
             && serial === 0 && (level.number + wave.index) % 2 === 0,
         }));
         serial++;
@@ -210,7 +211,9 @@ export class CampaignSession {
 
     const hits = targets.map((target) => {
       const before = target.hp;
-      target.hp = Math.ceil(before / 2);
+      // Bosses withstand the campaign-only light wave: lose one third of
+      // current HP rather than the half taken by an ordinary enemy.
+      target.hp = target.kind === 'boss' ? Math.ceil(before * 2 / 3) : Math.ceil(before / 2);
       target.stun = Math.max(target.stun, 16);
       target.invulnerable = Math.max(target.invulnerable, 12);
       target.hurtFlash = 11;
@@ -218,6 +221,7 @@ export class CampaignSession {
       target.attackTick = 0;
       target.kickType = null;
       target.kickTick = 0;
+      target.bossCast = null;
       target.spearWindup = 0;
       target.spearAimX = null;
       target.spearAimY = null;

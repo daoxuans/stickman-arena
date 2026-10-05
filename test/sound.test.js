@@ -273,6 +273,38 @@ test('boss telegraph rises quietly and never plays while muted', () => {
   assert.equal(played.length, 2);
 });
 
+test('stone, summon, quake and ward have distinct bounded cues; an actual rock hit sounds only once', () => {
+  const SoundEffects = soundClass({});
+  const sound = new SoundEffects();
+  const played = [];
+  sound.tone = (...args) => played.push(['tone', ...args]);
+  sound.noise = (...args) => played.push(['noise', ...args]);
+
+  sound.play({ type: 'boss-rock-windup' });
+  assert.deepEqual(played.map(([kind]) => kind), ['tone', 'noise']);
+  assert.ok(played[0][4] < 0.05, 'a stone telegraph stays below a damaging hit');
+  played.length = 0;
+  sound.play({ type: 'rock-impact', target: 'hero' });
+  assert.equal(played.length, 0, 'a hit projectile has its own delivery-marked hit sound');
+  sound.play({ type: 'hit', delivery: 'rock', target: 'hero' });
+  assert.deepEqual(played.map(([kind]) => kind), ['noise', 'tone']);
+  played.length = 0;
+  sound.play({ type: 'rock-impact', blocked: true });
+  assert.deepEqual(played.map(([kind]) => kind), ['tone', 'noise']);
+
+  for (const type of ['rock-windup', 'rock-throw', 'boss-rock-throw',
+    'boss-summon-windup', 'boss-summon', 'boss-quake-windup', 'boss-quake',
+    'boss-ward-windup', 'boss-ward', 'boss-ward-hit']) {
+    played.length = 0;
+    sound.play({ type });
+    assert.ok(played.length >= 1 && played.length <= 2, `${type} is audible without an uncontrolled stack`);
+  }
+  played.length = 0;
+  sound.enabled = false;
+  sound.play({ type: 'boss-quake' });
+  assert.equal(played.length, 0);
+});
+
 test('rapid hits cap polyphony; critical KO remains audible and mute stops every tail', () => {
   const timer = clock();
   const { stats, FakeAudioContext } = fakeAudio();

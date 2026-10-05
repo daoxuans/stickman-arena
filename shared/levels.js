@@ -68,9 +68,16 @@ const WAVE_BLUEPRINTS = [
   [[['brute', 1]], [['boss', 1]]],
 ];
 
-const ENEMY_HP = { grunt: 64, rusher: 52, guard: 80, brute: 104, boss: 140 };
-const ENEMY_DAMAGE = { grunt: 0.73, rusher: 0.66, guard: 0.8, brute: 1.04, boss: 0.82 };
-const ENEMY_NAMES = { grunt: '斗士', rusher: '疾行者', guard: '盾卫', brute: '重拳手' };
+const ENEMY_HP = {
+  grunt: 64, rusher: 52, guard: 80, brute: 104, leaper: 58, slinger: 56, boss: 140,
+};
+const ENEMY_DAMAGE = {
+  grunt: 0.73, rusher: 0.66, guard: 0.8, brute: 1.04, leaper: 0.76, slinger: 0.72, boss: 0.82,
+};
+const ENEMY_NAMES = {
+  grunt: '斗士', rusher: '疾行者', guard: '盾卫', brute: '重拳手',
+  leaper: '跃袭者', slinger: '石掷手',
+};
 const MILESTONE_BOSSES = Object.freeze({
   10: '雾林巨拳',
   20: '地下铁卫',
@@ -78,6 +85,9 @@ const MILESTONE_BOSSES = Object.freeze({
   40: '深海狂拳',
   50: '荒原巨灵',
 });
+// Final-wave milestone groups carry bossTier 1..5. Combat owns the cumulative
+// skill mapping: rock, summon, quake, volley and ward, respectively. Chapter
+// bosses deliberately have no tier and keep their previous move set.
 const FALLING_TYPES = Object.freeze({
   forest: 'pinecone', city: 'debris', ocean: 'hail', land: 'pebble',
 });
@@ -219,21 +229,56 @@ function makeArena(theme, stage, chapterIndex, number) {
   };
 }
 
+// Promote one existing slot rather than adding enemies: the established wave
+// pacing and the >3-enemies light-wave gate stay stable. A new chapter eases
+// back into its terrain before fielding its mixed squads again.
+function promoteOne(blueprints, originalKind, newKind) {
+  for (let waveIndex = blueprints.length - 1; waveIndex >= 0; waveIndex--) {
+    const groups = blueprints[waveIndex];
+    const groupIndex = groups.findIndex(([kind]) => kind === originalKind);
+    if (groupIndex < 0) continue;
+    const count = groups[groupIndex][1];
+    groups.splice(groupIndex, 1,
+      ...(count > 1 ? [[originalKind, count - 1]] : []), [newKind, 1]);
+    return true;
+  }
+  return false;
+}
+
+function regularBlueprints(stage, number) {
+  const blueprints = WAVE_BLUEPRINTS[stage - 1]
+    .map((groups) => groups.map(([kind, count]) => [kind, count]));
+  if (number >= 8 && stage !== 14) {
+    // The first leaper replaces one of stage 8's two grunts; later leapers
+    // normally take a rusher slot and therefore remain a mobile frontline.
+    if (!promoteOne(blueprints, 'rusher', 'leaper') && stage === 8) {
+      promoteOne(blueprints, 'grunt', 'leaper');
+    }
+  }
+  if (number >= 18 && stage >= 4 && stage !== 14) {
+    // Place the new ranged unit in a later grunt-containing wave. Its lower
+    // health asks the player to close distance rather than merely tank it.
+    promoteOne(blueprints, 'grunt', 'slinger');
+  }
+  return blueprints;
+}
+
 function makeWaves(stage, chapterIndex, theme, number) {
-  const makeGroup = (kind, count, name = kind === 'boss' ? theme.bossName : ENEMY_NAMES[kind]) => ({
+  const makeGroup = (kind, count, name = kind === 'boss' ? theme.bossName : ENEMY_NAMES[kind], bossTier = 0) => ({
     kind, count, name,
     maxHp: Math.round(ENEMY_HP[kind] * (1 + chapterIndex * 0.13 + stage * 0.016)
       * (kind === 'boss' ? 1 : REGULAR_HP_BOOST)),
     damageScale: Number((ENEMY_DAMAGE[kind] * (1 + chapterIndex * 0.085 + stage * 0.011)
       * (kind === 'boss' ? 1 : REGULAR_DAMAGE_BOOST)).toFixed(2)),
+    ...(bossTier ? { bossTier } : {}),
   });
-  const waves = WAVE_BLUEPRINTS[stage - 1].map((blueprint, waveIndex) => ({
+  const waves = regularBlueprints(stage, number).map((blueprint, waveIndex) => ({
     index: waveIndex + 1,
     groups: blueprint.map(([kind, count]) => makeGroup(kind, count)),
   }));
   if (MILESTONE_BOSSES[number]) {
     waves.push({ index: waves.length + 1,
-      groups: [makeGroup('boss', 1, MILESTONE_BOSSES[number])] });
+      groups: [makeGroup('boss', 1, MILESTONE_BOSSES[number], number / 10)] });
   }
   return waves;
 }
