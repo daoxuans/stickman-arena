@@ -62,36 +62,119 @@ const duel = {
 };
 
 class SoundEffects {
-  constructor() { this.enabled = true; this.context = null; this.pendingKOs = new Set(); }
+  constructor() {
+    this._enabled = true;
+    this.context = null;
+    this.output = null;
+    this.resuming = null;
+    this.pendingKOs = new Set();
+    this.pendingCues = new Set();
+    this.cueGeneration = 0;
+    this.voices = new Set();
+    this.maxVoices = 24;
+  }
+
+  get enabled() { return this._enabled; }
+
+  set enabled(value) {
+    const next = Boolean(value);
+    if (next === this._enabled) return;
+    this._enabled = next;
+    if (!next) this.cancelPendingKOs();
+    if (this.output) this.output.gain.value = next ? 0.64 : 0;
+  }
 
   getContext() {
     if (!this.enabled) return null;
     const AudioContextType = window.AudioContext || window.webkitAudioContext;
     if (!AudioContextType) return null;
-    if (!this.context) this.context = new AudioContextType();
-    if (this.context.state === 'suspended') this.context.resume().catch(() => {});
+    if (!this.context) {
+      try {
+        this.context = new AudioContextType();
+        this.output = this.context.createGain();
+        this.output.gain.value = 0.64;
+        // A shared bus keeps overlapping hits punchy without clipping the output.
+        const compressor = this.context.createDynamicsCompressor?.();
+        if (compressor) {
+          compressor.threshold.value = -18;
+          compressor.knee.value = 18;
+          compressor.ratio.value = 4;
+          compressor.attack.value = 0.004;
+          compressor.release.value = 0.16;
+          this.output.connect(compressor).connect(this.context.destination);
+        } else {
+          this.output.connect(this.context.destination);
+        }
+      } catch {
+        this.context = null;
+        this.output = null;
+        return null;
+      }
+    }
+    if (this.context.state === 'suspended' && !this.resuming) {
+      try {
+        this.resuming = Promise.resolve(this.context.resume())
+          .catch(() => {})
+          .finally(() => { this.resuming = null; });
+      } catch { /* Browser denied playback. */ }
+    }
     return this.context;
   }
 
-  tone(frequency, endFrequency, seconds, volume = 0.1, shape = 'triangle') {
+  hasVoiceRoom(context, priority) {
+    for (const voice of this.voices) {
+      if (voice.endsAt <= context.currentTime) this.stopVoice(voice);
+    }
+    if (this.voices.size < this.maxVoices) return true;
+    if (!priority) return false;
+    const quietVoice = [...this.voices].find((voice) => voice.priority < priority);
+    if (!quietVoice) return false;
+    this.stopVoice(quietVoice);
+    return true;
+  }
+
+  stopVoice(voice) {
+    this.voices.delete(voice);
+    try { voice.source.stop?.(); } catch { /* The voice may already have ended. */ }
+    this.disconnectVoice(voice);
+  }
+
+  disconnectVoice(voice) {
+    for (const node of new Set([voice.source, voice.input, voice.gain])) {
+      try { node.disconnect?.(); } catch { /* A disconnected node is harmless. */ }
+    }
+  }
+
+  connectVoice(context, source, gain, seconds, priority, input = source) {
+    const voice = { source, input, gain, priority, endsAt: context.currentTime + seconds + 0.02 };
+    this.voices.add(voice);
+    source.onended = () => {
+      this.voices.delete(voice);
+      this.disconnectVoice(voice);
+    };
+    input.connect(gain).connect(this.output);
+    source.start(context.currentTime);
+    source.stop?.(context.currentTime + seconds + 0.01);
+  }
+
+  tone(frequency, endFrequency, seconds, volume = 0.1, shape = 'triangle', priority = 0) {
     const context = this.getContext();
-    if (!context) return;
+    if (!context || !this.hasVoiceRoom(context, priority)) return;
     const time = context.currentTime;
     const oscillator = context.createOscillator();
     const gain = context.createGain();
     oscillator.type = shape;
     oscillator.frequency.setValueAtTime(frequency, time);
     oscillator.frequency.exponentialRampToValueAtTime(Math.max(20, endFrequency), time + seconds);
-    gain.gain.setValueAtTime(volume, time);
+    gain.gain.setValueAtTime(0.001, time);
+    gain.gain.linearRampToValueAtTime(volume, time + Math.min(0.008, seconds * 0.2));
     gain.gain.exponentialRampToValueAtTime(0.001, time + seconds);
-    oscillator.connect(gain).connect(context.destination);
-    oscillator.start(time);
-    oscillator.stop(time + seconds + 0.01);
+    this.connectVoice(context, oscillator, gain, seconds, priority);
   }
 
-  noise(seconds = 0.075, volume = 0.07, cutoff = 0) {
+  noise(seconds = 0.075, volume = 0.07, cutoff = 0, filterType = 'lowpass', priority = 0) {
     const context = this.getContext();
-    if (!context) return;
+    if (!context || !this.hasVoiceRoom(context, priority)) return;
     const count = Math.ceil(context.sampleRate * seconds);
     const buffer = context.createBuffer(1, count, context.sampleRate);
     const data = buffer.getChannelData(0);
@@ -102,24 +185,38 @@ class SoundEffects {
     gain.gain.value = volume;
     if (cutoff > 0) {
       const filter = context.createBiquadFilter();
-      filter.type = 'lowpass';
+      filter.type = filterType;
       filter.frequency.value = cutoff;
-      source.connect(filter).connect(gain).connect(context.destination);
+      source.connect(filter);
+      this.connectVoice(context, source, gain, seconds, priority, filter);
     } else {
-      source.connect(gain).connect(context.destination);
+      this.connectVoice(context, source, gain, seconds, priority);
     }
-    source.start();
   }
 
   cancelPendingKOs() {
+    this.cueGeneration++;
     for (const timer of this.pendingKOs) window.clearTimeout(timer);
     this.pendingKOs.clear();
+    for (const timer of this.pendingCues) window.clearTimeout(timer);
+    this.pendingCues.clear();
+    // Called by the existing mute/round/mode transitions: no old tail can leak into a new scene.
+    for (const voice of [...this.voices]) this.stopVoice(voice);
+  }
+
+  queueCue(delay, callback, pending = this.pendingCues) {
+    const generation = this.cueGeneration;
+    const timer = window.setTimeout(() => {
+      pending.delete(timer);
+      if (this.enabled && generation === this.cueGeneration) callback();
+    }, delay);
+    pending.add(timer);
   }
 
   tomatoSplat() {
     // A low plop under filtered, quickly fading noise reads as a soft, wet splat.
-    this.tone(210, 68, 0.14, 0.07, 'sine');
-    this.noise(0.11, 0.05, 1050);
+    this.tone(210, 68, 0.14, 0.065, 'sine', 1);
+    this.noise(0.11, 0.048, 1050, 'lowpass', 1);
   }
 
   play(effect) {
@@ -127,32 +224,41 @@ class SoundEffects {
     switch (effect.type) {
       case 'hit':
         if (effect.special) break; // The light wave already has its own impact sound.
-        this.tone(effect.heavy ? 115 : 160, effect.heavy ? 42 : 65, effect.heavy ? 0.19 : 0.12, effect.heavy ? 0.18 : 0.12, 'sawtooth');
-        this.noise(effect.heavy ? 0.13 : 0.075, 0.09);
+        // Only confirmed damage gets an audible wind/body hit; a whiff keeps visual wind only.
+        this.noise(effect.heavy ? 0.1 : 0.065, effect.heavy ? 0.068 : 0.048, 900, 'highpass');
+        this.tone(effect.heavy ? 132 : 185, effect.heavy ? 45 : 72,
+          effect.heavy ? 0.18 : 0.115, effect.heavy ? 0.145 : 0.105, 'sine');
+        this.tone(effect.heavy ? 266 : 310, effect.heavy ? 74 : 116,
+          effect.heavy ? 0.105 : 0.075, effect.heavy ? 0.055 : 0.035, 'triangle');
         break;
       case 'special-wave':
-        this.tone(170, 720, 0.35, 0.11, 'sawtooth');
-        this.tone(420, 135, 0.42, 0.07, 'triangle');
-        this.noise(0.18, 0.055, 2300);
+        this.tone(170, 540, 0.28, 0.08, 'sawtooth', 1);
+        this.tone(105, 58, 0.34, 0.11, 'sine', 1);
+        this.noise(0.17, 0.055, 1800, 'lowpass', 1);
+        this.tone(740, 460, 0.42, 0.048, 'triangle', 1);
+        this.queueCue(105, () => this.tone(940, 675, 0.24, 0.038, 'sine', 1));
         break;
-      case 'special-ready': this.tone(520, 880, 0.17, 0.045); break;
+      case 'special-ready':
+        this.tone(520, 880, 0.17, 0.045);
+        this.tone(1040, 1320, 0.21, 0.022, 'sine');
+        break;
+      case 'boss-windup':
+        this.tone(92, 128, 0.19, 0.048, 'sine', 1);
+        this.tone(310, 440, 0.22, 0.028, 'triangle', 1);
+        break;
       case 'spear-aim': this.tone(330, 440, 0.12, 0.026); break;
       case 'spear-windup': this.tone(220, 340, 0.16, 0.028); break;
       case 'spear-throw':
-        this.tone(520, 170, 0.19, 0.05, 'triangle');
-        this.noise(0.09, 0.032, 2700);
+        this.tone(690, 220, 0.18, 0.046, 'triangle');
+        this.noise(0.095, 0.044, 1100, 'highpass');
         break;
       case 'spear-impact':
         if (effect.blocked) this.tone(470, 160, 0.09, 0.025);
         break;
       case 'ko': {
         // KO arrives when the fighter falls. The tomato lands on the head ~180 ms later.
-        this.tone(125, 75, 0.11, 0.025, 'sine');
-        const timer = window.setTimeout(() => {
-          this.pendingKOs.delete(timer);
-          if (this.enabled) this.tomatoSplat();
-        }, 180);
-        this.pendingKOs.add(timer);
+        this.tone(125, 75, 0.11, 0.025, 'sine', 1);
+        this.queueCue(180, () => this.tomatoSplat(), this.pendingKOs);
         break;
       }
       case 'bones-scatter':
@@ -163,12 +269,14 @@ class SoundEffects {
         break;
       case 'jump': this.tone(260, 410, 0.11, 0.035); break;
       case 'kick':
-        this.tone(240, 105, 0.12, 0.035);
-        this.noise(0.055, 0.025);
+        this.tone(280, 130, 0.105, 0.04);
+        this.noise(0.073, 0.035, 950, 'highpass');
         break;
       case 'jump-kick':
-        this.tone(320, 125, 0.16, 0.045, 'sawtooth');
-        this.noise(0.075, 0.03);
+        // The same jade overtone returns in the light wave, without pretending a kick hit.
+        this.noise(0.1, 0.04, 820, 'highpass', 1);
+        this.tone(410, 850, 0.15, 0.048, 'triangle', 1);
+        this.tone(1120, 790, 0.23, 0.033, 'sine', 1);
         break;
       case 'fall-impact':
         this.tone(effect.kind === 'hail' ? 650 : 260, effect.kind === 'hail' ? 185 : 82,
@@ -178,8 +286,8 @@ class SoundEffects {
       case 'land': this.tone(110, 60, 0.08, 0.04); break;
       case 'dodge': this.noise(0.11, 0.04); break;
       case 'level-clear':
-        this.tone(440, 660, 0.19, 0.09);
-        window.setTimeout(() => this.tone(550, 880, 0.21, 0.08), 115);
+        this.tone(440, 660, 0.19, 0.09, 'triangle', 1);
+        this.queueCue(115, () => this.tone(550, 880, 0.21, 0.08, 'triangle', 1));
         break;
       case 'campaign-fail': this.tone(220, 75, 0.33, 0.09); break;
       default: break;

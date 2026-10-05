@@ -662,8 +662,12 @@ test('world-space warning, KO tomato and light wave survive crossing the old 960
     const wave = recording.strokes.find(({ color, points }) => color === '#dffff8'
       && points.some((point) => point.kind === 'arc' && point.x === 1450));
     assert.equal(wave?.originX + 1450, 490, 'light wave expands from the hero in world space');
-    assert.ok(recording.rects.some(({ x, w, originX }) => x === 960 && w === 960
-      && originX === -960), 'instant wave flash covers the current viewport');
+    const crest = recording.strokes.find(({ color, points }) => color === '#ffe0ae'
+      && points.some((point) => point.kind === 'bezier'));
+    assert.equal(crest?.originX + crest.points[0][0], 442,
+      'the land-tinted crest stays with the hero beyond the old world seam');
+    assert.ok(!recording.rects.some(({ x, w, originX }) => x === 960 && w === 960
+      && originX === -960), 'a spell should not flash over the whole viewport');
   });
 });
 
@@ -748,8 +752,24 @@ test('the enlarged boss fist wake stays near its authoritative melee reach', () 
   }
 });
 
-test('the special wave expands from the player once and keeps a readable invulnerable aura', () => {
-  const { renderer, strokes } = recordingRenderer();
+test('Boss windup gathers local gold energy without changing its warning window', () => {
+  const winding = fighter('boss', 3, 8);
+  const normal = renderFighters([winding]);
+  const reduced = renderFighters([winding], { reducedMotion: true });
+  for (const { fills, strokes } of [normal, reduced]) {
+    assert.ok(fills.some(({ color }) => color === '#f59b77'),
+      'the existing warning mark stays readable before the damaging frame');
+    const gold = strokes.find(({ color }) => color === '#fff0c3');
+    assert.ok(gold?.points.some((point) => point.kind === 'arc' && point.radius < 45),
+      'the secondary warning is a small ring around the fist');
+  }
+  assert.equal(normal.strokes.filter(({ color }) => color === '#ffe8b5').length, 3);
+  assert.equal(reduced.strokes.filter(({ color }) => color === '#ffe8b5').length, 0,
+    'reduced motion keeps the warning but removes the loose charging sparks');
+});
+
+test('the special wave expands from the player once with a local crest and readable invulnerable aura', () => {
+  const { renderer, strokes, rects } = recordingRenderer();
   renderFrame(renderer, [], 39);
   strokes.length = 0;
   const wave = { id: '40:special-wave', type: 'special-wave', x: 310, y: 350, radius: 960 };
@@ -757,6 +777,11 @@ test('the special wave expands from the player once and keeps a readable invulne
   renderFrame(renderer, [{ ...fighter('hero', 0, 0), specialWaveTicks: 25 }], 40);
   assert.equal(strokes.filter(({ color }) => color === '#dffff8').length, 1);
   assert.equal(strokes.filter(({ color }) => color === '#72e4df').length, 1);
+  assert.equal(strokes.filter(({ color }) => color === '#ffe0ae').length, 1,
+    'the land scene lends the jade spell a restrained warm crest');
+  assert.ok(!rects.some(({ color }) => typeof color === 'string'
+    && color.startsWith('rgba(148,255,239,')),
+  'the cast uses a local crest instead of a full-screen flash');
   assert.ok(strokes.some(({ color }) => color === '#ddfff3'),
     'the hero is visibly shielded for the whole special window');
   strokes.length = 0;
@@ -770,7 +795,94 @@ test('the special wave expands from the player once and keeps a readable invulne
   reduced.renderer.effect({ ...wave, id: '40:low-motion-wave' });
   renderFrame(reduced.renderer, [], 40);
   assert.equal(reduced.strokes.filter(({ color }) => color === '#dffff8').length, 1,
-    'reduced motion retains the cast confirmation with a static flash');
+    'reduced motion retains a stationary cast confirmation without a flash');
+});
+
+test('confirmed hits create one near-contact ink brush, with a stronger heavy stroke', () => {
+  withClock((advance) => {
+    const { renderer, strokes } = recordingRenderer();
+    const attacker = { ...fighter('hero', 3, 8), id: 'hero', team: 0, x: 440 };
+    const victim = { ...fighter('grunt', 0, 0, -1), id: 'enemy', team: 1, x: 500 };
+    renderFrame(renderer, [attacker, victim], 39);
+    assert.equal(strokes.filter(({ color }) => color === '#fff9e9').length, 0,
+      'the pose alone never claims a landed hit');
+    const hit = { id: '40:hit', type: 'hit', source: 'hero', target: 'enemy',
+      x: 500, y: 378, damage: 17, heavy: true };
+    renderer.effect(hit);
+    strokes.length = 0;
+    renderFrame(renderer, [attacker, victim], 40);
+    const brush = strokes.filter(({ color }) => color === '#fff9e9');
+    assert.equal(brush.length, 1);
+    assert.equal(brush[0].width, 5, 'the heavy hit lays a bolder white ink stroke');
+    assert.ok(brush[0].originX > 480 && brush[0].originX < 510,
+      'the impact sits at the target within the short hit shake, not at the attacker');
+    assert.ok(strokes.some(({ color }) => color === '#f8cf8c'),
+      'P1 keeps a warm gold contact accent');
+    renderer.effect({ ...hit });
+    advance(50);
+    strokes.length = 0;
+    renderFrame(renderer, [attacker, victim], 41);
+    assert.equal(strokes.filter(({ color }) => color === '#fff9e9').length, 1,
+      'replayed authoritative hits do not double the impact');
+    advance(196);
+    strokes.length = 0;
+    renderFrame(renderer, [attacker, victim], 42);
+    assert.equal(strokes.filter(({ color }) => color === '#fff9e9').length, 0,
+      'the brush clears within a quarter second');
+  });
+});
+
+test('impact accents respect scene, PvP team and reduced-motion bounds', () => {
+  const duel = recordingRenderer();
+  const p2 = { ...fighter('hero', 0, 0, -1), id: 'p2', team: 1, x: 600 };
+  duel.renderer.render({ tick: 39, arena: { theme: 'city', groundY: 430 },
+    fighters: [p2] }, { mode: 'duel', theme: 'city' });
+  duel.renderer.effect({ id: 'p2-hit', type: 'hit', source: 'p2', target: 'p1',
+    x: 510, y: 380, heavy: false });
+  duel.strokes.length = 0;
+  duel.renderer.render({ tick: 40, arena: { theme: 'city', groundY: 430 },
+    fighters: [p2] }, { mode: 'duel', theme: 'city' });
+  assert.ok(duel.strokes.some(({ color, scaleX }) => color === '#b7f2f2' && scaleX === -1),
+    'P2 turns the same local brush cool and mirrors the strike direction');
+  assert.equal(duel.strokes.filter(({ color }) => color === '#d1d2ee').length, 2,
+    'city colour stays in just two little directional flecks');
+  duel.strokes.length = 0;
+  duel.renderer.render({ tick: 0, arena: { theme: 'forest', groundY: 430 },
+    fighters: [p2] }, { mode: 'duel', theme: 'forest' });
+  assert.equal(duel.strokes.filter(({ color }) => color === '#fff9e9').length, 0,
+    'switching scenery clears the previous impact instead of recolouring it');
+
+  const calm = recordingRenderer(true);
+  renderFrame(calm.renderer, [], 39);
+  for (let i = 0; i < 30; i++) calm.renderer.effect({ id: `hit-${i}`, type: 'hit',
+    x: 400 + i, y: 350, source: 'hero', target: `enemy-${i}`, heavy: i % 2 === 0 });
+  calm.renderer.effect({ id: 'hazard-hit', type: 'hit', x: 650, y: 350,
+    source: 'hazard:spikes', target: 'hero' });
+  calm.renderer.effect({ id: 'wave-hit', type: 'hit', x: 700, y: 350,
+    source: 'hero', target: 'enemy', special: true });
+  calm.strokes.length = 0;
+  renderFrame(calm.renderer, [], 40);
+  assert.equal(calm.strokes.filter(({ color }) => color === '#fff9e9').length, 24,
+    'many same-frame hits stay within the fixed local-mark budget');
+  assert.equal(calm.strokes.filter(({ color }) => color === '#ffe0ae').length, 0,
+    'reduced motion removes travelling flecks while preserving the contact strokes');
+});
+
+test('a confirmed spear hit keeps projectile impact feedback without a melee brush', () => {
+  const { renderer, strokes } = recordingRenderer();
+  renderFrame(renderer, [], 39);
+  renderer.effect({ id: '40:spear-damage', type: 'hit', delivery: 'spear',
+    source: 'hero', target: 'enemy', x: 500, y: 350, heavy: true, damage: 22 });
+  renderer.effect({ id: '40:spear-impact', type: 'spear-impact',
+    x: 500, y: 350, source: 'hero', target: 'enemy', damage: 22, surface: 'fighter' });
+  strokes.length = 0;
+  renderFrame(renderer, [], 40);
+  assert.equal(strokes.filter(({ color }) => color === '#fff9e9').length, 0,
+    'a projectile must not draw the new near-contact fist ink');
+  assert.ok(strokes.some(({ color }) => color === '#fff4ca'),
+    'the ordinary confirmed-damage cue is still present');
+  assert.ok(strokes.some(({ color }) => color === '#fff4ce'),
+    'the existing spear impact ring remains readable');
 });
 
 test('falling-object warning and object are legible only in campaign scenes', () => {
@@ -875,7 +987,11 @@ test('kick silhouettes and jump-kick event streaks mirror both facing directions
     renderFrame(renderer, [], 40);
     const streak = strokes.find(({ color }) => color === '#a7f3e5');
     assert.equal(streak?.scaleX, facing);
-    assert.ok(streak.points[1][0] > streak.points[0][0], 'event streak points forward locally');
+    assert.ok(streak.points[1].x > streak.points[0][0], 'curved event streak moves forward locally');
+    const ring = strokes.find(({ color, points }) => color === '#eaffec'
+      && points.some((point) => point.kind === 'arc'));
+    assert.equal(ring?.points.find((point) => point.kind === 'arc')?.x, 400 + facing * 84,
+      'the burst originates near the foot rather than at the torso');
   }
 });
 
@@ -890,7 +1006,8 @@ test('kick and jump-kick events deduplicate repeated authoritative snapshots', (
     renderer.effect(event);
     renderFrame(renderer, [], 40);
     const singleCount = strokes.filter(({ color }) => palette.includes(color)).length;
-    assert.equal(singleCount, type === 'kick' ? 8 : 29, `${type} has one ring and its expected particles`);
+    assert.equal(singleCount, type === 'kick' ? 8 : 21,
+      `${type} has one ring and a bounded number of short-lived shards`);
     strokes.length = 0;
     renderer.effect({ ...event });
     renderFrame(renderer, [], 41);
@@ -927,10 +1044,30 @@ test('reduced motion keeps both kick impact cues but removes jump-kick flourish'
     renderFrame(recording.renderer, [], 40);
   }
   const palette = ['#eaffec', '#8de9df', '#f5d995'];
-  assert.equal(normal.strokes.filter(({ color }) => palette.includes(color)).length, 29);
+  assert.equal(normal.strokes.filter(({ color }) => palette.includes(color)).length, 21);
   assert.equal(reduced.strokes.filter(({ color }) => palette.includes(color)).length, 6);
   assert.equal(normal.strokes.filter(({ color }) => color === '#a7f3e5' || color === '#f4e2ac').length, 2);
   assert.equal(reduced.strokes.filter(({ color }) => color === '#a7f3e5' || color === '#f4e2ac').length, 0);
+});
+
+test('low-motion jump-kick confirms the move with a stationary ring', () => {
+  withClock((advance) => {
+    const { renderer, strokes } = recordingRenderer(true);
+    renderFrame(renderer, [], 39);
+    renderer.effect({ id: 'stationary-jump-kick', type: 'jump-kick',
+      x: 400, y: 300, facing: 1 });
+    strokes.length = 0;
+    renderFrame(renderer, [], 40);
+    const radius = () => strokes.find(({ color, points }) => color === '#eaffec'
+      && points.some((point) => point.kind === 'arc'))
+      ?.points.find((point) => point.kind === 'arc')?.radius;
+    const first = radius();
+    assert.ok(first > 20 && first < 40);
+    advance(150);
+    strokes.length = 0;
+    renderFrame(renderer, [], 41);
+    assert.equal(radius(), first, 'the reduced-motion cue fades in place without radial travel');
+  });
 });
 
 test('the head is much wider than every slim body stroke', () => {

@@ -170,13 +170,19 @@ export function createDuelState(theme = 'city') {
   });
 }
 
-function startAttack(fighter, stage) {
+function startAttack(state, fighter, stage) {
   fighter.attackStage = stage;
   fighter.attackTick = 0;
   fighter.comboStage = stage;
   fighter.comboWindow = 0;
   fighter.attackBuffered = false;
   fighter.hitIds = [];
+  // A single warning cue follows the committed boss windup, never a missed
+  // hit or a client-side animation frame. It carries no combat consequence.
+  if (fighter.kind === 'boss') event(state, 'boss-windup', {
+    x: fighter.x, y: fighter.y - fighter.height * 0.62,
+    source: fighter.id, stage, facing: fighter.facing,
+  });
 }
 
 export function attackOf(fighter) {
@@ -485,7 +491,8 @@ function launchSpear(state, fighter) {
   fighter.spearLaunchFacing = null;
 }
 
-function applyDamage(state, target, { amount, direction, knockback, stun, invulnerable = 9, source = null, heavy = false }) {
+function applyDamage(state, target, { amount, direction, knockback, stun, invulnerable = 9,
+  source = null, heavy = false, delivery = null }) {
   if (target.hp <= 0 || target.invulnerable > 0 || target.dodgeTicks > 0) return false;
   const damage = Math.max(1, Math.round(amount));
   target.hp = Math.max(0, target.hp - damage);
@@ -505,6 +512,7 @@ function applyDamage(state, target, { amount, direction, knockback, stun, invuln
   event(state, 'hit', {
     x: target.x, y: target.y - target.height * 0.57,
     damage, target: target.id, source, heavy,
+    ...(delivery ? { delivery } : {}),
   });
   if (target.hp === 0) {
     event(state, 'ko', { x: target.x, y: target.y - target.height * 0.45, target: target.id, source });
@@ -674,7 +682,7 @@ function resolveProjectiles(state) {
     const before = victim?.hp ?? 0;
     const damaged = victim && applyDamage(state, victim, {
       amount: projectile.damage, direction: Math.sign(projectile.vx) || 1,
-      knockback: 6, stun: 19, source: projectile.source, heavy: true,
+      knockback: 6, stun: 19, source: projectile.source, heavy: true, delivery: 'spear',
     });
     if (victim && !damaged) {
       event(state, 'evade', { x: victim.x, y: victim.y - victim.height / 2, target: victim.id });
@@ -890,7 +898,7 @@ function moveFighter(state, fighter, input) {
   if (attackPressed && fighter.stun === 0 && fighter.dodgeTicks === 0
       && fighter.kickType === null && fighter.spearWindup === 0) {
     if (fighter.attackStage > 0) fighter.attackBuffered = fighter.attackStage < 3;
-    else startAttack(fighter, fighter.comboWindow > 0 ? Math.min(3, fighter.comboStage + 1) : 1);
+    else startAttack(state, fighter, fighter.comboWindow > 0 ? Math.min(3, fighter.comboStage + 1) : 1);
   }
 
   if (fighter.attackStage > 0) {
@@ -898,7 +906,7 @@ function moveFighter(state, fighter, input) {
     const strike = attackOf(fighter);
     if (fighter.attackTick >= strike.duration) {
       if (fighter.attackBuffered && fighter.attackStage < 3) {
-        startAttack(fighter, fighter.attackStage + 1);
+        startAttack(state, fighter, fighter.attackStage + 1);
       } else {
         // The third strike finishes the string; it cannot loop into itself.
         fighter.comboStage = fighter.attackStage === 3 ? 0 : fighter.attackStage;
@@ -1108,12 +1116,202 @@ function ascentRoute(fighter, target, state) {
 }
 
 function supportingPlatform(fighter, state) {
+  let support = null;
   for (const platform of state.arena.platforms ?? []) {
-    const support = standingSurface(platform, state.motionTick, fighter, fighter.x);
-    if (support && Math.abs(fighter.y - support.y) < 3)
-      return { left: support.pose.left, right: support.pose.right };
+    const surface = standingSurface(platform, state.motionTick, fighter, fighter.x);
+    if (!surface || Math.abs(fighter.y - surface.y) >= 3) continue;
+    const current = { left: surface.pose.left, right: surface.pose.right,
+      containsCenter: fighter.x >= surface.pose.left && fighter.x <= surface.pose.right };
+    // A foot can touch two adjacent treads. Route from the one carrying the
+    // fighter's centre, not the neighbouring plank found first in the array.
+    if (!support || (current.containsCenter && !support.containsCenter)) support = current;
+  }
+  return support;
+}
+
+const HAZARD_ROUTE_MARGIN = 3;
+const HAZARD_PHASE_MARGIN = 6;
+const HAZARD_FLIGHT_TICKS = 52;
+
+function hazardTouchesFighter(hazard, fighter, x, y) {
+  return x + fighter.width * 0.43 > hazard.x
+    && x - fighter.width * 0.43 < hazard.x + hazard.w
+    && y > hazard.y && y - fighter.height * 0.49 < hazard.y + hazard.h;
+}
+
+// Forecast the fixed-step jump/dodge arc against the shared one-way platform
+// geometry. A route must end outside *every* ground hazard, even one that
+// happens to be dormant on its landing tick.
+function predictHazardFlight(fighter, state, direction, { jump = false, dodgeAt = 0 } = {}) {
+  if (dodgeAt && (fighter.dodgeCooldown > 0 || direction === 0)) return null;
+  let { x, y, vx } = fighter;
+  let vy = jump ? JUMP_SPEED : fighter.vy;
+  let dodgeTicks = fighter.dodgeTicks;
+  for (let tick = 1; tick <= HAZARD_FLIGHT_TICKS; tick++) {
+    const oldX = x;
+    const oldY = y;
+    if (tick === dodgeAt) dodgeTicks = DODGE_TICKS;
+    const protectedByDodge = dodgeTicks > 0 || (dodgeAt > 0
+      && tick - dodgeAt < DODGE_TICKS);
+    if (dodgeTicks > 0) {
+      dodgeTicks--;
+      vx = direction * DODGE_SPEED * (dodgeTicks < 3 ? 0.56 : 1);
+    } else if (direction === 0) vx *= 0.88;
+    else vx = approach(vx, direction * fighter.speed,
+      jump && tick === 1 && fighter.grounded ? 0.9 : 0.52);
+    x = clamp(x + vx, 19, state.arena.width - 19);
+    vy = Math.min(MAX_FALL_SPEED, vy + GRAVITY);
+    y += vy;
+
+    let landed = false;
+    if (vy >= 0) {
+      let landingY = state.arena.groundY;
+      for (const platform of state.arena.platforms) {
+        const current = standingSurface(platform, state.motionTick + tick, fighter, x);
+        if (!current) continue;
+        const previous = standingSurface(platform, state.motionTick + tick - 1, fighter, oldX)
+          ?? standingSurface(platform, state.motionTick + tick - 1, fighter, x);
+        if (oldY <= (previous?.y ?? current.y) + 1 && y >= current.y)
+          landingY = Math.min(landingY, current.y);
+      }
+      if (y >= landingY && (landingY < state.arena.groundY
+          || oldY <= state.arena.groundY + 1)) {
+        y = landingY;
+        landed = true;
+      }
+    }
+
+    if (!protectedByDodge && state.arena.hazards.some((hazard) =>
+      hazardActive(hazard, state.tick + tick)
+      && hazardTouchesFighter(hazard, fighter, x, y))) return null;
+    if (landed) {
+      if (state.arena.hazards.some((hazard) => hazardTouchesFighter(hazard, fighter, x, y)))
+        return null;
+      return { x, y, tick };
+    }
   }
   return null;
+}
+
+function canWalkPastHazard(fighter, state, direction, farX) {
+  let { x, vx } = fighter;
+  for (let tick = 1; tick <= 110; tick++) {
+    vx = approach(vx, direction * fighter.speed, 0.9);
+    const nextX = clamp(x + vx, 19, state.arena.width - 19);
+    if (nextX === x) return false;
+    x = nextX;
+    for (const hazard of state.arena.hazards) {
+      if (!hazardTouchesFighter(hazard, fighter, x, fighter.y)) continue;
+      // A periodic trap must stay off for the entire passage, with room for
+      // a brief hitstop elsewhere in the fight; its current phase alone is
+      // not enough to make walking into it safe.
+      for (let margin = 0; margin <= HAZARD_PHASE_MARGIN; margin++) {
+        if (hazardActive(hazard, state.tick + tick + margin)) return false;
+      }
+    }
+    if (direction * (x - farX) >= 0) return true;
+  }
+  return false;
+}
+
+function hazardRouteForGround(fighter, state, walking, destinationX, freeToAct) {
+  if (!fighter.grounded) return null;
+  const touching = state.arena.hazards.find((hazard) =>
+    hazardTouchesFighter(hazard, fighter, fighter.x, fighter.y));
+  if (touching) {
+    const left = touching.x - fighter.width * 0.43 - HAZARD_ROUTE_MARGIN;
+    const right = touching.x + touching.w + fighter.width * 0.43 + HAZARD_ROUTE_MARGIN;
+    const momentum = Math.sign(fighter.vx);
+    const escape = momentum || (fighter.x - left < right - fighter.x ? -1 : 1);
+    const dodge = freeToAct && fighter.dodgeCooldown === 0
+      && hazardActive(touching, state.tick + 1);
+    return { walking: escape, jump: false, dodge, suppressOffense: true };
+  }
+  if (walking === 0) return null;
+  const direction = Math.sign(walking);
+  const candidate = state.arena.hazards.filter((hazard) => fighter.y > hazard.y
+    && fighter.y - fighter.height * 0.49 < hazard.y + hazard.h)
+    .map((hazard) => {
+      const clearance = fighter.width * 0.43 + HAZARD_ROUTE_MARGIN;
+      const nearX = direction > 0 ? hazard.x - clearance : hazard.x + hazard.w + clearance;
+      const farX = direction > 0 ? hazard.x + hazard.w + clearance : hazard.x - clearance;
+      return { hazard, nearX, farX, distance: direction * (nearX - fighter.x) };
+    }).filter(({ nearX, distance }) => direction * (destinationX - nearX) > 0
+      && distance > -3 && distance < 72)
+    .sort((a, b) => a.distance - b.distance)[0];
+  if (!candidate) return null;
+  const { nearX, farX, distance } = candidate;
+  const launchBuffer = Math.max(fighter.speed * 2 + 3,
+    Math.abs(fighter.vx) * 2.6 + 4);
+  const walkSafe = freeToAct && canWalkPastHazard(fighter, state, direction, farX);
+  if (walkSafe) return { walking: direction, jump: false, dodge: false, suppressOffense: true };
+
+  const crosses = (flight) => flight && (direction * (flight.x - farX) >= 0
+    || flight.y <= candidate.hazard.y);
+  const jump = predictHazardFlight(fighter, state, direction, { jump: true });
+  const jumpDodge = jump ? null
+    : predictHazardFlight(fighter, state, direction, { jump: true, dodgeAt: 8 });
+  if (freeToAct && !fighter.prevInput.jump && distance <= launchBuffer
+      && (crosses(jump) || crosses(jumpDodge))) {
+    return { walking: direction, jump: true, dodge: false, suppressOffense: true };
+  }
+
+  // If the current position is not yet a safe takeoff, see whether a running
+  // takeoff at the near edge will be. Otherwise brake before the hazard and
+  // wait for a full dormant window or for dodge to recharge.
+  const launchX = nearX - direction * launchBuffer;
+  const launchFighter = { ...fighter, x: launchX, vx: direction * fighter.speed };
+  const laterJump = predictHazardFlight(launchFighter, state, direction, { jump: true });
+  const laterDodge = laterJump ? null
+    : predictHazardFlight(launchFighter, state, direction, { jump: true, dodgeAt: 8 });
+  if (distance > launchBuffer && freeToAct && (crosses(laterJump) || crosses(laterDodge)))
+    return null; // Continue the run-up; the next AI tick will reassess.
+  const brake = Math.max(10, Math.abs(fighter.vx) * 2.6 + 5);
+  if (distance > launchBuffer + brake) return null;
+  return { walking: distance < fighter.speed + 3 ? -direction : 0,
+    jump: false, dodge: false, suppressOffense: true };
+}
+
+function hazardRouteInAir(fighter, state, walking, freeToAct) {
+  if (fighter.grounded || fighter.stun > 0 || fighter.dodgeTicks > 0) return null;
+  const nearHazard = state.arena.hazards.some((hazard) => fighter.y < hazard.y + 20
+    && fighter.x > hazard.x - 175 && fighter.x < hazard.x + hazard.w + 175);
+  if (!nearHazard) return null;
+  const direction = Math.sign(walking);
+  const momentum = Math.sign(fighter.vx) || direction;
+  const closeToTrap = state.arena.hazards.some((hazard) => fighter.y < hazard.y + 20
+    && fighter.x > hazard.x - fighter.width * 0.43 - 18
+    && fighter.x < hazard.x + hazard.w + fighter.width * 0.43 + 18);
+  if (predictHazardFlight(fighter, state, direction)) {
+    return closeToTrap ? { walking, jump: false, dodge: false, suppressOffense: true } : null;
+  }
+  if (momentum !== direction && predictHazardFlight(fighter, state, momentum)) {
+    return { walking: momentum, jump: false, dodge: false, suppressOffense: true };
+  }
+  if (freeToAct && fighter.dodgeCooldown === 0 && momentum !== 0) {
+    const jumpAge = (fighter.vy - JUMP_SPEED) / GRAVITY;
+    const delay = jumpAge < 8 ? Math.max(1, Math.ceil(8 - jumpAge)) : 1;
+    if (predictHazardFlight(fighter, state, momentum, { dodgeAt: delay })) {
+      return { walking: momentum, jump: false, dodge: delay === 1, suppressOffense: true };
+    }
+    if (delay !== 1 && predictHazardFlight(fighter, state, momentum, { dodgeAt: 1 })) {
+      return { walking: momentum, jump: false, dodge: true, suppressOffense: true };
+    }
+  }
+  if (momentum !== 0 && predictHazardFlight(fighter, state, -momentum)) {
+    return { walking: -momentum, jump: false, dodge: false, suppressOffense: true };
+  }
+  return { walking: momentum, jump: false, dodge: false, suppressOffense: true };
+}
+
+function safePlatformExit(fighter, state, exitX, direction) {
+  if (state.arena.hazards.length === 0) return true;
+  // The fighter leaves the plank at its edge, then keeps moving while falling.
+  // Testing the ground directly beneath the edge would wrongly reject safe
+  // exits whose landing point is beyond the trap (and send the AI backwards).
+  const falling = { ...fighter, x: exitX, vx: direction * fighter.speed,
+    vy: 0, grounded: false };
+  return Boolean(predictHazardFlight(falling, state, direction));
 }
 
 /** Deterministic pursuit: align with a reachable platform before jumping; never punch empty air. */
@@ -1142,22 +1340,36 @@ export function aiInput(fighter, target, state) {
   const canTurn = fighter.stun === 0 && fighter.dodgeTicks === 0
     && fighter.attackStage === 0 && fighter.kickType === null && fighter.spearWindup === 0;
   let walking = gap > wantedGap || (needsTurn && canTurn) ? targetDirection : 0;
+  let destinationX = target.x - targetDirection * wantedGap;
   let route = null;
   if (targetAbove) {
     route = ascentRoute(fighter, target, state);
-    const destinationX = route?.landingX ?? target.x;
+    destinationX = route?.landingX ?? target.x;
     walking = Math.abs(destinationX - fighter.x) > 25 ? Math.sign(destinationX - fighter.x) : 0;
   } else if (targetBelow && fighter.grounded) {
     const support = supportingPlatform(fighter, state);
     if (support) {
-      const exitRight = target.x > support.right
-        || (target.x >= support.left && fighter.x - support.left > support.right - fighter.x);
-      const exitX = exitRight ? support.right + fighter.width : support.left - fighter.width;
+      const leftExit = support.left - fighter.width;
+      const rightExit = support.right + fighter.width;
+      const leftDanger = !safePlatformExit(fighter, state, leftExit, -1);
+      const rightDanger = !safePlatformExit(fighter, state, rightExit, 1);
+      // A player below the plank should be approached via the exit nearest
+      // their position, not the edge nearest the pursuer. Prefer a safe exit
+      // when one edge would drop directly into a ground trap.
+      const exitRight = leftDanger !== rightDanger ? leftDanger
+        : Math.abs(rightExit - target.x) < Math.abs(leftExit - target.x);
+      const exitX = exitRight ? rightExit : leftExit;
       walking = Math.sign(exitX - fighter.x);
+      destinationX = exitX;
     }
   }
   const freeToAct = fighter.stun === 0 && fighter.dodgeTicks === 0
     && fighter.attackStage === 0 && fighter.kickType === null && fighter.spearWindup === 0;
+  const hazardRoute = state.mode === 'campaign' && fighter.team === 1
+    && state.arena.hazards.length > 0
+    ? hazardRouteForGround(fighter, state, walking, destinationX, freeToAct)
+      ?? hazardRouteInAir(fighter, state, walking, freeToAct) : null;
+  if (hazardRoute) walking = hazardRoute.walking;
   const jumpForHeight = targetAbove && fighter.grounded && freeToAct
     && (route ? Math.abs(fighter.x - route.landingX) <= 30
       : verticalGap <= 130 && gap <= 72)
@@ -1165,15 +1377,19 @@ export function aiInput(fighter, target, state) {
   return {
     left: walking < 0,
     right: walking > 0,
-    jump: jumpForHeight || (!targetAbove && isRusher && gap > 120 && gap < 225 && phase === 3),
-    attack: !needsTurn && fighter.spearWindup === 0 && gap < (isBoss ? 100 : 83)
+    jump: hazardRoute?.jump || (!hazardRoute?.suppressOffense
+      && (jumpForHeight || (!targetAbove && isRusher && gap > 120 && gap < 225 && phase === 3))),
+    attack: !hazardRoute?.suppressOffense && !needsTurn && fighter.spearWindup === 0
+      && gap < (isBoss ? 100 : 83)
       && punchOverlap && phase < (isBoss ? 5 : 3),
-    kick: !needsTurn && !isBoss && freeToAct && fighter.grounded
+    kick: !hazardRoute?.suppressOffense && !needsTurn && !isBoss && freeToAct && fighter.grounded
       && verticalHitOverlap(fighter, target, 'ground') && gap < 80
       && (state.tick + idSeed % kickCadence) % kickCadence === 0,
-    dodge: !needsTurn && !targetAbove && !targetBelow && (isBoss || isGuard || isRusher)
-      && gap < 104 && target.attackStage > 0 && phase === 19,
-    spear: state.mode === 'campaign' && fighter.team === 1 && fighter.spearEnabled
+    dodge: hazardRoute?.dodge || (!hazardRoute?.suppressOffense && !needsTurn
+      && !targetAbove && !targetBelow && (isBoss || isGuard || isRusher)
+      && gap < 104 && target.attackStage > 0 && phase === 19),
+    spear: !hazardRoute?.suppressOffense && state.mode === 'campaign'
+      && fighter.team === 1 && fighter.spearEnabled
       && freeToAct && !needsTurn && gap > 140 && gap < 640
       && (state.tick + idSeed * 11) % 127 === 0,
   };

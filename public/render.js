@@ -78,6 +78,15 @@ const THEMES = {
   },
 };
 
+// Keep the jade/gold spell language constant; just the small secondary flecks
+// borrow a hue from the current landscape so photographs stay legible.
+const SPIRIT_TINTS = {
+  forest: '#b8ead0',
+  city: '#d1d2ee',
+  ocean: '#b9f1eb',
+  land: '#ffe0ae',
+};
+
 const PHOTO_THEMES = ['forest', 'city', 'ocean', 'land'];
 const PHOTO_BACKGROUNDS = Object.fromEntries(PHOTO_THEMES.map((theme) => [theme,
   ['', '-2', '-3', '-4'].map((suffix) => `./assets/backgrounds/${theme}${suffix}.webp`),
@@ -1018,6 +1027,17 @@ function drawBossWindup(ctx, { hand, head, tick, attackTick, activeFrom, stage, 
   const signal = stage === 3 ? '#f59b77' : '#ffd09a';
   ctx.save();
 
+  // Warm power gathers at the actual fist, never across the whole stage. The
+  // existing warning above the head remains the primary dodge instruction.
+  if (!reducedMotion) {
+    const focus = ctx.createRadialGradient(hand[0], hand[1], 2,
+      hand[0], hand[1], 30 + charge * 7);
+    focus.addColorStop(0, 'rgba(255,241,199,.55)');
+    focus.addColorStop(1, 'rgba(255,208,154,0)');
+    ctx.globalAlpha = .16 + charge * .24;
+    ellipse(ctx, hand[0], hand[1], 30 + charge * 7, 30 + charge * 7, focus);
+  }
+
   // The raised warning mark stays readable against all four landscapes. Its
   // opacity and the fist arc fill across the exact non-damaging windup ticks.
   const markX = head[0];
@@ -1037,7 +1057,23 @@ function drawBossWindup(ctx, { hand, head, tick, attackTick, activeFrom, stage, 
   ctx.lineWidth = 2.5 + charge * 2.5;
   ctx.lineCap = 'round';
   ctx.stroke();
+  ctx.beginPath();
+  ctx.arc(hand[0], hand[1], radius + 7, -.95, -.95 + 1.7 * charge);
+  ctx.strokeStyle = '#fff0c3';
+  ctx.lineWidth = 1.8;
+  ctx.stroke();
   ellipse(ctx, hand[0], hand[1], 7 + charge * 4, 7 + charge * 4, stage === 3 ? 'rgba(242,112,83,.42)' : 'rgba(255,198,132,.36)');
+
+  if (!reducedMotion) {
+    ctx.globalAlpha = .28 + charge * .32;
+    for (let i = 0; i < 3; i++) {
+      const a = -1.1 + i * 1.05;
+      const near = radius + 12 + i * 2;
+      line(ctx, [[hand[0] + Math.cos(a) * near, hand[1] + Math.sin(a) * near],
+        [hand[0] + Math.cos(a) * (near + 5), hand[1] + Math.sin(a) * (near + 5)]],
+      '#ffe8b5', 1.4);
+    }
+  }
 
   // The winding air trail warns of reach without reading as a projectile.
   ctx.globalAlpha = .15 + charge * .38;
@@ -1142,27 +1178,92 @@ function drawKickEnergy(ctx, foot, kick, kickTick, active, airborne, index, redu
   }
 
   if (airborne) {
-    const tipX = kick.reach + 11;
-    const wake = ctx.createLinearGradient(x - 75, y, tipX, y);
-    wake.addColorStop(0, 'rgba(112,226,222,0)');
-    wake.addColorStop(.7, index ? 'rgba(255,135,105,.36)' : 'rgba(92,222,221,.36)');
-    wake.addColorStop(1, index ? 'rgba(255,199,164,.68)' : 'rgba(206,255,230,.7)');
-    ctx.globalAlpha = reducedMotion ? .7 : .85;
-    polygon(ctx, [
-      [x - 75, y - 7], [x - 14, y - 21], [tipX, y],
-      [x - 14, y + 21], [x - 75, y + 7],
-    ], wake);
-    polygon(ctx, [[x - 31, y - 2], [tipX - 15, y - 5], [tipX, y],
-      [tipX - 15, y + 5], [x - 31, y + 2]], accent);
+    // A jade crescent wraps the foot; the former long triangular wedge could
+    // read as a projectile and obscure the attacker's thin stick silhouette.
+    ctx.globalCompositeOperation = 'screen';
     if (!reducedMotion) {
-      line(ctx, [[x - 69, y - 21], [x - 19, y - 14], [tipX - 9, y - 3]], accent, 2.2);
-      line(ctx, [[x - 80, y + 22], [x - 24, y + 14], [tipX - 10, y + 4]], accent, 2.2);
+      const focus = ctx.createRadialGradient(x + 4, y, 1, x + 4, y, 31);
+      focus.addColorStop(0, index ? 'rgba(255,180,142,.58)' : 'rgba(224,255,231,.7)');
+      focus.addColorStop(1, 'rgba(112,226,222,0)');
+      ctx.globalAlpha = .46;
+      ellipse(ctx, x + 4, y, 31, 27, focus);
     }
-    ellipse(ctx, x, y, 9, 8, core);
+    ctx.globalAlpha = reducedMotion ? .78 : .9;
+    ctx.beginPath();
+    ctx.arc(x + 4, y, 17, -1.52, 1.1);
+    ctx.strokeStyle = accent;
+    ctx.lineWidth = 5;
+    ctx.stroke();
+    ctx.beginPath();
+    ctx.arc(x, y, 24, -1.62, .92);
+    ctx.strokeStyle = index ? '#ffe4c1' : '#f4e2ac';
+    ctx.lineWidth = 2;
+    ctx.stroke();
+    if (!reducedMotion) {
+      ctx.beginPath();
+      ctx.moveTo(x - 46, y - 18);
+      ctx.bezierCurveTo(x - 24, y - 30, x + 2, y - 25, x + 19, y - 15);
+      ctx.strokeStyle = accent;
+      ctx.lineWidth = 2.2;
+      ctx.stroke();
+      ctx.beginPath();
+      ctx.moveTo(x - 40, y + 17);
+      ctx.bezierCurveTo(x - 17, y + 28, x + 4, y + 20, x + 19, y + 12);
+      ctx.stroke();
+    }
+    ellipse(ctx, x + 4, y, 9, 8, core);
   } else {
     ctx.globalAlpha = .7;
     line(ctx, [[x - 25, y - 11], [x + 4, y - 6], [x + 13, y]], accent, 4);
     ellipse(ctx, x + 2, y, 6, 5, core);
+  }
+  ctx.restore();
+}
+
+function drawContactImpact(ctx, mark, time, reducedMotion) {
+  const progress = clamp((time - mark.born) / mark.life, 0, 1);
+  const calm = reducedMotion || mark.reducedMotion;
+  const drift = calm ? 0 : (1 - (1 - progress) ** 2) * (mark.heavy ? 10 : 6);
+  ctx.save();
+  ctx.translate(mark.x + mark.facing * drift, mark.y);
+  ctx.scale(mark.facing, 1);
+  ctx.globalCompositeOperation = 'screen';
+  if (!calm) {
+    const radius = mark.heavy ? 33 : 25;
+    const glow = ctx.createRadialGradient(0, 0, 1, 0, 0, radius);
+    glow.addColorStop(0, 'rgba(255,249,230,.46)');
+    glow.addColorStop(1, 'rgba(255,249,230,0)');
+    ctx.globalAlpha = (1 - progress) * .34;
+    ellipse(ctx, 0, 0, radius, radius, glow);
+  }
+
+  // A short, curved calligraphic strike at the confirmed point of contact.
+  // No part travels from the attacker like a projectile or extends the hitbox.
+  ctx.globalAlpha = (1 - progress) * (mark.heavy ? .98 : .87);
+  ctx.beginPath();
+  ctx.moveTo(-11, -12);
+  ctx.bezierCurveTo(1, -20, 16, -16, 22, -5);
+  ctx.strokeStyle = '#26383c';
+  ctx.lineWidth = mark.heavy ? 9 : 7;
+  ctx.lineCap = 'round';
+  ctx.stroke();
+  ctx.strokeStyle = '#fff9e9';
+  ctx.lineWidth = mark.heavy ? 5 : 3.6;
+  ctx.stroke();
+  ctx.beginPath();
+  ctx.moveTo(-8, 11);
+  ctx.bezierCurveTo(4, 16, 16, 10, 20, 4);
+  ctx.strokeStyle = mark.accent;
+  ctx.lineWidth = mark.heavy ? 3.4 : 2.4;
+  ctx.stroke();
+  if (!calm) {
+    ctx.globalAlpha = (1 - progress) * .8;
+    for (let i = 0; i < (mark.heavy ? 5 : 3); i++) {
+      const y = (i - (mark.heavy ? 2 : 1)) * 10;
+      const distance = 23 + i * 3 + progress * 9;
+      line(ctx, [[distance, y], [distance + (mark.heavy ? 9 : 6), y - 4 + i]],
+        i % 2 ? mark.accent : mark.tint, mark.heavy ? 2.1 : 1.6);
+    }
   }
   ctx.restore();
 }
@@ -1755,6 +1856,7 @@ export function createRenderer(canvas) {
 
   const particles = [];
   const rings = [];
+  const impactMarks = [];
   const seenIds = new Set();
   const seenOrder = [];
   const recentAnonymous = new Map();
@@ -1766,6 +1868,7 @@ export function createRenderer(canvas) {
   let lastFighters = new Map();
   let lastTick = -1;
   let lastScene = '';
+  let sceneTheme = 'forest';
   let worldWidth = W;
   let cameraX = 0;
   let cameraAt = 0;
@@ -1881,7 +1984,7 @@ export function createRenderer(canvas) {
     if (type === 'special-wave') {
       rings.push({ x, y, born: stamp, life: reducedMotion ? 290 : 560,
         radius: clamp(Math.max(number(event.radius, W), worldWidth), 160, worldWidth + 200),
-        color: '#dffff8', type });
+        color: '#dffff8', tint: SPIRIT_TINTS[sceneTheme], calm: reducedMotion, type });
       if (!reducedMotion) {
         shakeStrength = 3.5;
         shakeUntil = stamp + 120;
@@ -1921,9 +2024,25 @@ export function createRenderer(canvas) {
     const specialHit = type === 'hit' && event.special === true;
     const fallingImpact = type === 'fall-impact';
     const facing = number(event.facing, 1) < 0 ? -1 : 1;
-    const count = reducedMotion ? 5 : ultimate ? 28
-      : specialHit ? 13 : fallingImpact ? 8 : heavy ? 23
-        : type === 'hit' ? 17 : type === 'land' ? 10 : type === 'kick' ? 7 : 9;
+    if (type === 'hit' && !specialHit && event.delivery !== 'spear'
+      && !String(event.source ?? '').startsWith('hazard:')) {
+      const source = lastFighters.get(String(event.source))?.fighter;
+      const direction = number(event.facing, number(source?.facing, 1)) < 0 ? -1 : 1;
+      const accent = source?.kind === 'hero' && source.team === 1 ? '#b7f2f2'
+        : source?.team === 1 ? '#ffc0a0' : '#f8cf8c';
+      impactMarks.push({ x: clamp(x - direction * 5, 0, worldWidth), y,
+        born: stamp, life: reducedMotion ? 145 : heavy ? 245 : 185,
+        facing: direction, heavy, accent,
+        tint: SPIRIT_TINTS[sceneTheme], reducedMotion });
+      if (impactMarks.length > 24) impactMarks.splice(0, impactMarks.length - 24);
+    }
+    // The jump-kick event is emitted on its first damaging frame. Its origin
+    // is the fighter's torso, so shift only the decoration toward the foot.
+    const fx = ultimate ? clamp(x + facing * 84, 0, worldWidth) : x;
+    const fy = ultimate ? clamp(y + 10, 0, H) : y;
+    const count = reducedMotion ? 5 : ultimate ? 20
+      : specialHit ? 11 : fallingImpact ? 8 : heavy ? 18
+        : type === 'hit' ? 12 : type === 'land' ? 10 : type === 'kick' ? 7 : 9;
     const speed = ultimate ? 205 : fallingImpact ? 75 : type === 'hit' ? 180
       : type === 'dodge' ? 80 : 60;
     const palette = ultimate ? ['#eaffec', '#8de9df', '#f5d995']
@@ -1936,17 +2055,18 @@ export function createRenderer(canvas) {
       const angle = ultimate
         ? (facing < 0 ? Math.PI : 0) + (i / Math.max(1, count - 1) - .5) * 1.65
         : (i / count) * TAU + hash(i * 11 + x + y) * .3;
-      const force = speed * (.35 + hash(i * 7 + x) * .8);
-      particles.push({ x, y, vx: Math.cos(angle) * force,
+      const force = speed * (.35 + hash(i * 7 + fx) * .8);
+      particles.push({ x: fx, y: fy, vx: Math.cos(angle) * force,
         vy: Math.sin(angle) * force - (type === 'land' || fallingImpact ? 45 : 0),
-        size: 1.5 + hash(i * 13 + y) * (ultimate ? 4 : 3),
+        size: 1.5 + hash(i * 13 + fy) * (ultimate ? 4 : 3),
         color: palette[i % palette.length], born: stamp,
-        life: ultimate ? 390 : fallingImpact ? 250 : type === 'kick' ? 210
-          : type === 'land' ? 340 : type === 'dodge' ? 330 : 480,
+        life: ultimate ? 320 : fallingImpact ? 250 : type === 'kick' ? 210
+          : type === 'land' ? 340 : type === 'dodge' ? 330 : type === 'hit' ? 320 : 480,
         dust: type === 'land' || type === 'dodge' || fallingImpact });
     }
-    rings.push({ x, y, born: stamp, life: ultimate ? 410 : fallingImpact ? 220 : type === 'kick' ? 190 : 300,
-      radius: ultimate ? 105 : fallingImpact ? 28 : heavy ? 70 : type === 'hit' ? 53 : type === 'kick' ? 25 : 34,
+    rings.push({ x: fx, y: fy, born: stamp,
+      life: ultimate ? 320 : fallingImpact ? 220 : type === 'kick' ? 190 : type === 'hit' ? 250 : 300,
+      radius: ultimate ? 66 : fallingImpact ? 28 : heavy ? 57 : type === 'hit' ? 43 : type === 'kick' ? 25 : 34,
       color: palette[0], type, facing });
     if (!reducedMotion && (type === 'hit' || ultimate)) {
       shakeStrength = ultimate ? 4 : clamp(3 + number(event.damage) * .13, 3, heavy ? 8 : 7);
@@ -1957,54 +2077,83 @@ export function createRenderer(canvas) {
     if (rings.length > 45) rings.splice(0, rings.length - 45);
   }
 
-  function drawEffects(time, viewportX) {
+  function drawEffects(time) {
     for (let i = rings.length - 1; i >= 0; i--) {
       const item = rings[i];
       const progress = (time - item.born) / item.life;
       if (progress >= 1) { rings.splice(i, 1); continue; }
       if (item.type === 'special-wave') {
-        const radius = reducedMotion ? 130 : 12 + item.radius * (1 - (1 - progress) ** 2.6);
+        const calm = reducedMotion || item.calm;
+        const radius = calm ? 74 : 18 + item.radius * (1 - (1 - progress) ** 2.4);
+        const crest = clamp(1 - progress / (calm ? .85 : .38), 0, 1);
         ctx.save();
         ctx.globalCompositeOperation = 'screen';
-        ctx.globalAlpha = (1 - progress) * (reducedMotion ? .55 : .8);
-        // Damage resolves on the cast tick. A brief whole-arena flash makes
-        // that immediate effect legible before the expanding crest arrives.
-        ctx.fillStyle = `rgba(148,255,239,${.16 * (1 - clamp(progress / .22, 0, 1))})`;
-        ctx.fillRect(viewportX, 0, W, H);
-        const bloom = ctx.createRadialGradient(item.x, item.y, Math.max(0, radius - 35),
-          item.x, item.y, radius + 42);
-        bloom.addColorStop(0, 'rgba(116,238,227,0)');
-        bloom.addColorStop(.55, 'rgba(140,255,241,.44)');
-        bloom.addColorStop(1, 'rgba(140,255,241,0)');
-        ctx.fillStyle = bloom;
-        ctx.fillRect(viewportX, 0, W, H);
+        // Damage resolves at cast time. A local crest confirms it immediately;
+        // a thin ring then carries the wave through the world without a
+        // repeated full-viewport flash or an expensive screen-sized bloom.
+        if (!calm && crest > 0) {
+          const glow = ctx.createRadialGradient(item.x, item.y, 4, item.x, item.y, 66);
+          glow.addColorStop(0, 'rgba(198,255,226,.32)');
+          glow.addColorStop(1, 'rgba(116,238,227,0)');
+          ctx.globalAlpha = crest * .42;
+          ellipse(ctx, item.x, item.y, 66, 66, glow);
+        }
+        ctx.globalAlpha = (1 - progress) * (calm ? .66 : .72);
         ctx.beginPath();
         ctx.arc(item.x, item.y, radius, 0, TAU);
         ctx.strokeStyle = '#72e4df';
-        ctx.lineWidth = reducedMotion ? 6 : 20 * (1 - progress) + 3;
+        ctx.lineWidth = calm ? 4 : 8 * (1 - progress) + 2.5;
         ctx.stroke();
         ctx.beginPath();
         ctx.arc(item.x, item.y, radius, 0, TAU);
         ctx.strokeStyle = item.color;
-        ctx.lineWidth = reducedMotion ? 2.5 : 5 - 2 * progress;
+        ctx.lineWidth = calm ? 2.4 : 3.8 - 1.5 * progress;
         ctx.stroke();
+        if (crest > 0) {
+          ctx.globalAlpha = crest * (calm ? .7 : .58);
+          ctx.beginPath();
+          ctx.moveTo(item.x - 48, item.y - 8);
+          ctx.bezierCurveTo(item.x - 22, item.y - 46,
+            item.x + 20, item.y - 46, item.x + 48, item.y - 8);
+          ctx.strokeStyle = item.tint;
+          ctx.lineWidth = 2.4;
+          ctx.stroke();
+          ctx.beginPath();
+          ctx.moveTo(item.x - 38, item.y + 22);
+          ctx.bezierCurveTo(item.x - 15, item.y + 39,
+            item.x + 18, item.y + 39, item.x + 40, item.y + 20);
+          ctx.strokeStyle = '#baf5e5';
+          ctx.lineWidth = 1.8;
+          ctx.stroke();
+        }
         ctx.restore();
         continue;
       }
       ctx.save();
       ctx.globalAlpha = (1 - progress) * (item.type === 'hit' || item.type === 'jump-kick' ? .74 : .45);
       ctx.beginPath();
-      ctx.arc(item.x, item.y, 7 + item.radius * progress, 0, TAU);
+      // Under the system's reduced-motion preference, keep one fixed ring
+      // rather than expanding it across the figure while the cue fades.
+      ctx.arc(item.x, item.y, 7 + item.radius * (reducedMotion ? .38 : progress), 0, TAU);
       ctx.strokeStyle = item.color;
       ctx.lineWidth = item.type === 'ko' || item.type === 'jump-kick' ? 5 - 3 * progress : 3 - 2 * progress;
       ctx.stroke();
       if (item.type === 'jump-kick' && !reducedMotion) {
         ctx.translate(item.x, item.y);
         ctx.scale(item.facing, 1);
-        const travel = 25 + 63 * progress;
         ctx.globalAlpha = (1 - progress) * .57;
-        line(ctx, [[10, -16], [travel, -25]], '#a7f3e5', 4 - 2 * progress);
-        line(ctx, [[7, 14], [travel + 8, 21]], '#f4e2ac', 3 - 1.7 * progress);
+        ctx.beginPath();
+        ctx.moveTo(-23, -12);
+        ctx.bezierCurveTo(-5, -28, 13 + 22 * progress, -25, 28 + 24 * progress, -11);
+        ctx.strokeStyle = '#a7f3e5';
+        ctx.lineWidth = 3.5 - 1.8 * progress;
+        ctx.stroke();
+        ctx.beginPath();
+        ctx.moveTo(-20, 11);
+        ctx.bezierCurveTo(1, 26, 18 + 18 * progress, 19, 27 + 24 * progress, 8);
+        ctx.strokeStyle = '#f4e2ac';
+        ctx.lineWidth = 2.8 - 1.4 * progress;
+        ctx.stroke();
       }
       ctx.restore();
     }
@@ -2020,6 +2169,11 @@ export function createRenderer(canvas) {
       if (item.dust) ellipse(ctx, px, py, item.size * (1 + progress), item.size * .55, item.color);
       else line(ctx, [[px, py], [px - item.vx * .027, py - item.vy * .027]], item.color, item.size);
       ctx.restore();
+    }
+    for (let i = impactMarks.length - 1; i >= 0; i--) {
+      const mark = impactMarks[i];
+      if (time - mark.born >= mark.life) { impactMarks.splice(i, 1); continue; }
+      drawContactImpact(ctx, mark, time, reducedMotion);
     }
   }
 
@@ -2044,6 +2198,7 @@ export function createRenderer(canvas) {
       lastFighters.clear();
       particles.length = 0;
       rings.length = 0;
+      impactMarks.length = 0;
       shakeUntil = 0;
       cameraX = 0;
       cameraAt = 0;
@@ -2051,6 +2206,7 @@ export function createRenderer(canvas) {
     const firstFrame = lastTick < 0 || sceneChanged;
     lastTick = tick;
     lastScene = scene;
+    sceneTheme = theme;
     worldWidth = Math.max(W, number(arena.width, W));
     scaleCanvas();
 
@@ -2155,7 +2311,7 @@ export function createRenderer(canvas) {
     for (const projectile of state.projectiles || []) drawSpear(ctx, projectile, reducedMotion);
     if (meta.mode === 'campaign') drawFallingObject(ctx, state.fallingObject, tick, reducedMotion);
     for (const knockout of knockouts.values()) drawTomatoBurst(ctx, knockout, time, knockout.reducedMotion);
-    drawEffects(time, cameraX);
+    drawEffects(time);
     ctx.restore();
     ctx.restore();
     drawAtmosphere(ctx, theme, tick, level);

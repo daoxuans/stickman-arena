@@ -82,10 +82,16 @@ test('boss attacks telegraph for twelve full ticks before their active frame', (
       createFighter({ id: 'boss', x: 350, y: 438, team: 1, kind: 'boss' }),
     ],
   });
+  const cues = [];
   for (let tick = 0; tick < 12; tick++) {
     stepCombat(state, { boss: { attack: tick === 0 } });
+    cues.push(...state.events.filter((entry) => entry.type === 'boss-windup'));
     assert.equal(state.fighters[0].hp, 100);
   }
+  assert.equal(cues.length, 1, 'one audio/visual warning belongs to the attack start, not each windup frame');
+  assert.deepEqual({ source: cues[0].source, stage: cues[0].stage, facing: cues[0].facing },
+    { source: 'boss', stage: 1, facing: -1 });
+  assert.ok(Number.isFinite(cues[0].x) && Number.isFinite(cues[0].y));
   stepCombat(state);
   assert.ok(state.fighters[0].hp < 100);
 });
@@ -630,6 +636,239 @@ test('ordinary enemy AI kicks occasionally while the balanced boss AI does not',
   }
 });
 
+function pursueThroughHazards({ field, heroX, enemyX, kind = 'grunt', heroY = field.groundY,
+  enemyY = field.groundY, frames = 480, firstInput = null }) {
+  const hero = createFighter({ id: 'hero', x: heroX, y: heroY, team: 0 });
+  // Keep the target at the requested position even when it stands on the
+  // danger zone; the test is about the enemy's navigation, not the player's HP.
+  hero.invulnerable = frames + 100;
+  const enemy = createFighter({ id: 'enemy', x: enemyX, y: enemyY,
+    team: 1, kind });
+  const state = createCombatState({ arena: field, fighters: [hero, enemy] });
+  const path = [];
+  const hazardHits = [];
+  for (let frame = 0; frame < frames; frame++) {
+    const controls = frame === 0 && firstInput !== null
+      ? firstInput : aiInput(enemy, hero, state);
+    stepCombat(state, { enemy: controls });
+    path.push([enemy.x, enemy.y, enemy.hp]);
+    for (const entry of state.events) {
+      if (entry.type === 'hit' && entry.target === enemy.id
+          && entry.source?.startsWith('hazard:')) hazardHits.push(frame);
+    }
+  }
+  return { hero, enemy, path, hazardHits };
+}
+
+test('level 02 pursuer approaches a player in the thorns without ping-pong damage', () => {
+  const level = getLevel(2);
+  assert.ok(level.hazards.some(({ x, w }) => x <= 600 && x + w >= 600),
+    'this regression exercises the actual level 02 ground hazard');
+  const field = { ...level.arena, fallingHazard: null };
+  const setup = { field, heroX: 600, enemyX: 850 };
+  const first = pursueThroughHazards(setup);
+  assert.deepEqual(first.path, pursueThroughHazards(setup).path,
+    'identical inputs and level phase should replay the same trajectory');
+  assert.ok(first.path.some(([x]) => Math.abs(x - 600) < 95),
+    'the enemy still approaches a fightable distance rather than abandoning pursuit');
+  assert.equal(first.hazardHits.length, 0,
+    `the enemy should not repeatedly step into the level 02 thorns (${first.hazardHits})`);
+});
+
+test('ground enemies cross a persistent trap from either side without taking damage', () => {
+  const level = getLevel(2);
+  const field = { ...level.arena, fallingHazard: null };
+  for (const kind of ['grunt', 'brute']) {
+    for (const [enemyX, heroX] of [[850, 470], [470, 850]]) {
+      const result = pursueThroughHazards({ field, enemyX, heroX, kind });
+      const description = `${kind} ${enemyX} → ${heroX}`;
+      assert.ok(result.path.some(([x]) => Math.abs(x - heroX) < 85),
+        `${description}: reaches the player on the far side, not just the near edge`);
+      assert.equal(result.hazardHits.length, 0,
+        `${description}: no repeated damage while crossing (${result.hazardHits})`);
+    }
+  }
+});
+
+test('a periodic ground trap can be crossed at a safe time without repeat damage', () => {
+  const field = arena({ width: 1920, hazards: [{
+    type: 'thorns', x: 594, y: 424, w: 76, h: 14, damage: 2,
+    period: 140, activeTicks: 80, phase: 0,
+  }] });
+  for (const kind of ['grunt', 'brute']) {
+    const result = pursueThroughHazards({ field, enemyX: 850, heroX: 470, kind });
+    assert.ok(result.path.some(([x]) => Math.abs(x - 470) < 85),
+      `${kind}: eventually crosses instead of waiting forever at the near edge`);
+    assert.equal(result.hazardHits.length, 0,
+      `${kind}: watches the active phase or clears the trap safely (${result.hazardHits})`);
+  }
+});
+
+test('an enemy knocked back by the level 02 hazard does not rush into it again', () => {
+  const level = getLevel(2);
+  const field = { ...level.arena, fallingHazard: null };
+  const result = pursueThroughHazards({
+    field, heroX: 600, enemyX: 665, firstInput: {},
+  });
+  assert.deepEqual(result.hazardHits, [0],
+    `the deliberately forced first hit must not become a damage loop (${result.hazardHits})`);
+  assert.ok(result.path.slice(1).some(([x]) => Math.abs(x - 600) < 95),
+    'after stun and knockback, the enemy still seeks a safe attack approach');
+  assert.equal(result.enemy.hp, result.enemy.maxHp - level.hazards[0].damage,
+    'later movement cannot slowly drain HP on the same obstacle');
+});
+
+test('a melee knockback does not make a recovering enemy repeatedly enter the trap', () => {
+  const field = arena({ width: 1920, hazards: [{
+    type: 'thorns', x: 594, y: 424, w: 76, h: 14, damage: 2,
+  }] });
+  const hero = createFighter({ id: 'hero', x: 620, y: 438, team: 0 });
+  hero.invulnerable = 600;
+  const enemy = createFighter({ id: 'enemy', x: 685, y: 438, team: 1, kind: 'grunt' });
+  const state = createCombatState({ arena: field, fighters: [hero, enemy] });
+  let struck = false;
+  const hazardHits = [];
+  const path = [];
+  for (let frame = 0; frame < 480; frame++) {
+    stepCombat(state, {
+      hero: { attack: frame === 0 },
+      enemy: frame < 6 ? {} : aiInput(enemy, hero, state),
+    });
+    path.push([enemy.x, enemy.y]);
+    struck ||= state.events.some((entry) => entry.type === 'hit'
+      && entry.target === enemy.id && entry.source === hero.id);
+    if (state.events.some((entry) => entry.type === 'hit'
+        && entry.target === enemy.id && entry.source === 'hazard:thorns')) hazardHits.push(frame);
+  }
+  assert.equal(struck, true, 'the enemy is first knocked away by an actual punch');
+  assert.ok(path.some(([x]) => Math.abs(x - hero.x) < 95),
+    'the recovering enemy resumes pursuit instead of staying away indefinitely');
+  assert.equal(hazardHits.length, 0,
+    `approaching again must not turn into repeated thorn hits (${hazardHits})`);
+});
+
+test('hazard avoidance still lets a pursuer climb to a player on the upper tier', () => {
+  const field = arena({ width: 1920, platforms: [
+    { x: 500, y: 338, w: 200, h: 14 },
+    { x: 540, y: 238, w: 160, h: 14 },
+  ], hazards: [{ type: 'thorns', x: 594, y: 424, w: 76, h: 14, damage: 2 }] });
+  const result = pursueThroughHazards({
+    field, heroX: 600, heroY: 238, enemyX: 850, kind: 'rusher',
+  });
+  assert.ok(result.path.some(([x, y]) => Math.abs(x - 600) < 85 && Math.abs(y - 238) < 3),
+    'the pursuer reaches the actual upper fighting surface');
+  assert.equal(result.hazardHits.length, 0,
+    `climbing should not require repeated thorn damage (${result.hazardHits})`);
+});
+
+test('nearby traps with no safe landing leave the pursuer waiting on the safe side', () => {
+  const field = arena({ width: 1920, hazards: [
+    { type: 'thorns', x: 600, y: 424, w: 135, h: 14, damage: 2 },
+    // The six-pixel gap is narrower than a fighter, and the combined zone
+    // cannot be cleared by one safe leap, even with a mid-air dash.
+    { type: 'thorns', x: 741, y: 424, w: 134, h: 14, damage: 2 },
+  ] });
+  const result = pursueThroughHazards({ field, heroX: 420, enemyX: 1050 });
+  const safeEdge = 875 + result.enemy.width * 0.43;
+  assert.ok(result.path.some(([x]) => x < 950), 'the enemy walks up to inspect the route');
+  assert.ok(result.path.every(([x]) => x >= safeEdge),
+    'the enemy does not walk or land inside either hazard');
+  assert.ok(result.path.every(([, y]) => y >= field.groundY - 8),
+    'an impossible crossing should not start an inevitably harmful leap');
+  assert.equal(result.hazardHits.length, 0);
+  const tail = result.path.slice(-120).map(([x]) => x);
+  assert.ok(Math.max(...tail) - Math.min(...tail) < 12,
+    'after approaching, it waits instead of repeatedly running back and forth');
+});
+
+test('a trap reaching either world edge never tempts the enemy into a dead-end jump', () => {
+  const cases = [
+    { heroX: 20, enemyX: 350, hazard: { x: 0, w: 170 }, side: 'right' },
+    { heroX: 940, enemyX: 600, hazard: { x: 800, w: 160 }, side: 'left' },
+  ];
+  for (const { heroX, enemyX, hazard, side } of cases) {
+    const field = arena({ width: 960, hazards: [{
+      type: 'thorns', y: 424, h: 14, damage: 2, ...hazard,
+    }] });
+    const result = pursueThroughHazards({ field, heroX, enemyX });
+    const clearance = result.enemy.width * 0.43;
+    const safeEdge = side === 'right'
+      ? hazard.x + hazard.w + clearance : hazard.x - clearance;
+    assert.ok(result.path.some(([x]) => Math.abs(x - safeEdge) < 50),
+      `${side} side: enemy should approach the obstacle before waiting`);
+    assert.ok(result.path.every(([x]) => side === 'right'
+      ? x >= safeEdge : x <= safeEdge),
+    `${side} side: no room to land beyond the world boundary`);
+    assert.ok(result.path.every(([, y]) => y >= field.groundY - 8),
+      `${side} side: no useless leap toward an impossible landing`);
+    assert.equal(result.hazardHits.length, 0, `${side} side: no trap damage`);
+  }
+});
+
+test('a ground trap underneath a high platform does not block movement on the plank', () => {
+  const field = arena({ width: 1920,
+    platforms: [{ x: 480, y: 338, w: 440, h: 14 }],
+    hazards: [{ type: 'thorns', x: 594, y: 424, w: 76, h: 14, damage: 2 }],
+  });
+  const result = pursueThroughHazards({
+    field, heroX: 850, heroY: 338, enemyX: 520, enemyY: 338, frames: 260,
+  });
+  assert.ok(result.path.some(([x, y]) => x > 610 && x < 655 && Math.abs(y - 338) < 3),
+    'the enemy walks on the actual raised surface above the trap');
+  assert.ok(result.path.some(([x]) => Math.abs(x - 850) < 85),
+    'a trap far below its feet must not halt pursuit');
+  assert.equal(result.hazardHits.length, 0);
+  assert.equal(result.enemy.hp, result.enemy.maxHp);
+});
+
+test('a pursuer drops off the safe side of a raised platform toward a ground target', () => {
+  for (const { number, kind, enemyX, heroX } of [
+    { number: 16, kind: 'rusher', enemyX: 550, heroX: 877 },
+    { number: 30, kind: 'boss', enemyX: 650, heroX: 1030 },
+  ]) {
+    const level = getLevel(number);
+    const [hazard] = level.hazards;
+    const plank = level.platforms.find(({ x, y }) => x > hazard.x + hazard.w
+      && x < heroX && y < level.groundY - 50);
+    assert.ok(plank, `level ${number} has a raised plank beyond its hazard`);
+    const result = pursueThroughHazards({ field: { ...level.arena, fallingHazard: null },
+      kind, enemyX, heroX, frames: 420 });
+    const onPlank = result.path.findIndex(([x, y]) => x >= plank.x && x <= plank.x + plank.w
+      && Math.abs(y - plank.y) < 3);
+    assert.ok(onPlank >= 0, `level ${number}: enemy reaches the elevated surface`);
+    const backOnGround = result.path.findIndex(([x, y], frame) => frame > onPlank
+      && x > hazard.x + hazard.w && Math.abs(x - heroX) < 85
+      && Math.abs(y - level.groundY) < 3);
+    assert.ok(backOnGround > onPlank,
+      `level ${number}: pursuer leaves the plank toward the ground target`);
+    assert.equal(result.hazardHits.length, 0,
+      `level ${number}: it does not loop through the hazard while choosing an exit`);
+    assert.equal(result.enemy.hp, result.enemy.maxHp);
+  }
+});
+
+test('level 55 heavy keeps moving toward the ground target after its first high plank', () => {
+  const level = getLevel(55);
+  const [hazard] = level.hazards;
+  const plank = level.platforms.find(({ x, y, w }) => x < hazard.x && x + w > hazard.x
+    && y < level.groundY - 50 && w > 100);
+  assert.ok(plank, 'the first raised plank overlaps the fissure horizontally');
+  const result = pursueThroughHazards({ field: { ...level.arena, fallingHazard: null },
+    kind: 'brute', enemyX: 562, heroX: 908, frames: 420 });
+  const onPlank = result.path.findIndex(([x, y]) => x >= plank.x && x <= plank.x + plank.w
+    && Math.abs(y - plank.y) < 3);
+  assert.ok(onPlank >= 0, 'the heavy climbs onto the plank before reaching the fissure');
+  const beyondFissure = result.path.findIndex(([x, y], frame) => frame > onPlank
+    && x > hazard.x + hazard.w + 20 && Math.abs(x - 908) < 85
+    && Math.abs(y - level.groundY) < 3);
+  assert.ok(beyondFissure > onPlank,
+    'after the plank, the heavy reaches the safe ground near the target');
+  assert.ok(result.path.slice(beyondFissure).every(([x]) => x > hazard.x + hazard.w),
+    'once past the fissure, it does not reverse back into the same trap');
+  assert.equal(result.hazardHits.length, 0);
+  assert.equal(result.enemy.hp, result.enemy.maxHp);
+});
+
 test('an unlimited campaign spear first aims, then fires only after a fresh confirmation', () => {
   const state = sparring(520);
   const [hero, enemy] = state.fighters;
@@ -659,6 +898,8 @@ test('an unlimited campaign spear first aims, then fires only after a fresh conf
   assert.equal(events.filter((entry) => entry.type === 'spear-throw').length, 1);
   assert.equal(events.filter((entry) => entry.type === 'spear-impact').length, 1);
   assert.equal(events.filter((entry) => entry.type === 'hit' && entry.source === 'hero').length, 1);
+  assert.equal(events.find((entry) => entry.type === 'hit' && entry.source === 'hero').delivery, 'spear',
+    'projectile contact stays distinguishable from the melee ink-strike effect');
   assert.equal(enemy.hp, 42 - 22);
   assert.equal(state.projectiles.length, 0);
   stepCombat(state, { hero: { spear: false } });
