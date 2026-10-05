@@ -1,6 +1,7 @@
 import { cancelSpearAim, createDuelState, SPEARS_PER_LEVEL, SPEAR_MAX_ANGLE, SPEAR_MIN_ANGLE,
   TICK_RATE } from '../shared/combat.js';
 import { LEVELS, MAX_LEVEL, THEMES, getLevel } from '../shared/levels.js';
+import { avatarFromCamera, avatarFromFile } from './avatar.js';
 import { CampaignSession } from './campaign.js';
 import { createRenderer } from './render.js';
 
@@ -17,6 +18,11 @@ const IDS = [
   'spear-status', 'spear-key-guide', 'spear-guide-remaining',
   'spear-button', 'spear-aim-controls', 'spear-angle',
   'aim-up-button', 'aim-down-button', 'aim-cancel-button', 'touch-tip',
+  'replay-exit', 'avatar-open', 'avatar-chip-default', 'avatar-chip-photo',
+  'avatar-dialog', 'avatar-close', 'avatar-preview-default', 'avatar-preview',
+  'avatar-upload', 'avatar-camera', 'avatar-camera-fallback', 'avatar-file',
+  'avatar-camera-file', 'avatar-camera-view', 'avatar-video', 'avatar-shutter',
+  'avatar-stop-camera', 'avatar-message', 'avatar-reset',
 ];
 const ui = Object.fromEntries(IDS.map((id) => [id, document.getElementById(id)]));
 for (const id of IDS) {
@@ -35,6 +41,13 @@ let toastTimer;
 let resultOverlayTimer = null;
 let overlayPrimaryAction = null;
 let overlaySecondaryAction = null;
+let sceneToken = 0;
+let avatarDialogOpen = false;
+let avatarPausedCampaign = false;
+let avatarPreviousFocus = null;
+let avatarRequestId = 0;
+let cameraRequestId = 0;
+let cameraStream = null;
 
 const keyboard = new Set();
 const pointerButtons = new Map();
@@ -694,6 +707,7 @@ function sendInput(force = false) {
 }
 
 document.addEventListener('keydown', (event) => {
+  if (avatarDialogOpen) return;
   const button = keyBindings.get(event.code);
   if (!button) return;
   if (document.activeElement === ui['room-input']) return;
@@ -705,6 +719,7 @@ document.addEventListener('keydown', (event) => {
   }
 });
 document.addEventListener('keyup', (event) => {
+  if (avatarDialogOpen) return;
   const button = keyBindings.get(event.code);
   if (!button) return;
   event.preventDefault();
@@ -783,8 +798,192 @@ function releaseInput(cancelAim = false) {
   }
   sendInput(true);
 }
+
+function updateAvatarAvailability() {
+  const inDuelFight = mode === 'duel' && ['countdown', 'playing'].includes(duel.phase);
+  ui['avatar-open'].disabled = inDuelFight;
+  ui['avatar-open'].title = inDuelFight
+    ? '本局结束后可设置头像' : '设置我的侠客头像：上传照片或拍照';
+}
+
+function stopCamera() {
+  // Invalidate an outstanding permission request as well as an active stream.
+  cameraRequestId++;
+  if (cameraStream) {
+    for (const track of cameraStream.getTracks()) track.stop();
+    cameraStream = null;
+  }
+  ui['avatar-video'].pause?.();
+  ui['avatar-video'].srcObject = null;
+  ui['avatar-camera-view'].hidden = true;
+  ui['avatar-camera'].disabled = false;
+}
+
+function finishAvatarDialog() {
+  if (!avatarDialogOpen) return;
+  avatarDialogOpen = false;
+  avatarRequestId++;
+  stopCamera();
+  ui['avatar-dialog'].hidden = true;
+  avatarPreviousFocus?.focus?.();
+  avatarPreviousFocus = null;
+  if (avatarPausedCampaign && mode === 'campaign') showMainlineResumeOverlay();
+  avatarPausedCampaign = false;
+}
+
+function closeAvatarDialog() {
+  if (!avatarDialogOpen) return;
+  if (ui['avatar-dialog'].open && typeof ui['avatar-dialog'].close === 'function') {
+    ui['avatar-dialog'].close();
+  } else {
+    ui['avatar-dialog'].removeAttribute?.('open');
+  }
+  finishAvatarDialog();
+}
+
+function openAvatarDialog() {
+  if (avatarDialogOpen || ui['avatar-open'].disabled) return;
+  avatarPreviousFocus = document.activeElement ?? ui['avatar-open'];
+  avatarPausedCampaign = mode === 'campaign' && !campaignPaused
+    && ['playing', 'aftermath'].includes(campaignView.phase);
+  if (avatarPausedCampaign) campaignPaused = true;
+  // Clear held keys in the waiting-room too: their keyup happens inside the
+  // dialog and must not become a stuck attack when the PvP countdown starts.
+  releaseInput(avatarPausedCampaign);
+  if (avatarPausedCampaign) syncMusic();
+  ui['avatar-message'].textContent = '选择 JPG、PNG、WebP 或浏览器支持的 HEIC，最大 8 MB。';
+  ui['avatar-camera-fallback'].hidden = true;
+  ui['avatar-dialog'].hidden = false;
+  avatarDialogOpen = true;
+  try {
+    if (typeof ui['avatar-dialog'].showModal === 'function') ui['avatar-dialog'].showModal();
+    else ui['avatar-dialog'].setAttribute('open', '');
+    ui['avatar-upload'].focus?.();
+  } catch {
+    // A browser without usable native dialogs can still expose the same form.
+    ui['avatar-dialog'].setAttribute('open', '');
+    ui['avatar-upload'].focus?.();
+  }
+}
+
+function setAvatar(canvas) {
+  // The only copies are this page's Canvas pixels and local preview data URLs.
+  // No photo enters the campaign save, fighter state, room or WebSocket.
+  const preview = canvas?.toDataURL('image/png') ?? '';
+  renderer.setAvatar(canvas);
+  for (const id of ['avatar-preview', 'avatar-chip-photo']) {
+    ui[id].src = preview;
+    ui[id].hidden = !canvas;
+  }
+  ui['avatar-preview-default'].hidden = Boolean(canvas);
+  ui['avatar-chip-default'].hidden = Boolean(canvas);
+}
+
+async function handleAvatarFile(input) {
+  const file = input.files?.[0];
+  input.value = '';
+  if (!file || !avatarDialogOpen) return;
+  stopCamera();
+  const requestId = ++avatarRequestId;
+  ui['avatar-message'].textContent = '正在处理照片…';
+  try {
+    const canvas = await avatarFromFile(file);
+    if (!avatarDialogOpen || requestId !== avatarRequestId) return;
+    setAvatar(canvas);
+    ui['avatar-message'].textContent = '头像已应用到我方侠客；刷新页面后需重新选择。';
+  } catch (error) {
+    if (avatarDialogOpen && requestId === avatarRequestId) {
+      ui['avatar-message'].textContent = error.message || '照片处理失败，请换一张再试。';
+    }
+  }
+}
+
+async function openCamera() {
+  if (!avatarDialogOpen) return;
+  avatarRequestId++; // A pending file decode must not replace a newly requested camera shot.
+  stopCamera();
+  const requestId = cameraRequestId;
+  const getUserMedia = navigator.mediaDevices?.getUserMedia?.bind(navigator.mediaDevices);
+  if (!getUserMedia) {
+    ui['avatar-message'].textContent = '此设备或当前访问地址不支持网页相机，可改用系统相机或相册。';
+    ui['avatar-camera-fallback'].hidden = false;
+    return;
+  }
+  ui['avatar-camera'].disabled = true;
+  ui['avatar-message'].textContent = '正在等待相机授权…';
+  let stream;
+  try {
+    stream = await getUserMedia({ audio: false, video: { facingMode: 'user' } });
+    if (!avatarDialogOpen || requestId !== cameraRequestId) {
+      for (const track of stream.getTracks()) track.stop();
+      return;
+    }
+    cameraStream = stream;
+    ui['avatar-video'].srcObject = stream;
+    ui['avatar-camera-view'].hidden = false;
+    await ui['avatar-video'].play?.();
+    if (requestId !== cameraRequestId) return;
+    ui['avatar-camera-fallback'].hidden = true;
+    ui['avatar-message'].textContent = '调整画面后点击“拍照并使用”；视频仅在本页预览。';
+  } catch {
+    if (requestId !== cameraRequestId) return;
+    stopCamera();
+    ui['avatar-camera-fallback'].hidden = false;
+    ui['avatar-message'].textContent = '无法打开相机或未获授权，请改用系统相机/相册或上传照片。';
+  } finally {
+    if (requestId === cameraRequestId) ui['avatar-camera'].disabled = false;
+  }
+}
+
+ui['avatar-open'].addEventListener('click', openAvatarDialog);
+ui['avatar-close'].addEventListener('click', closeAvatarDialog);
+ui['avatar-dialog'].addEventListener('close', () => {
+  // Native close events are queued; an old one must not hide a newly reopened dialog.
+  if (!ui['avatar-dialog'].open) finishAvatarDialog();
+});
+ui['avatar-dialog'].addEventListener('cancel', (event) => {
+  event.preventDefault();
+  closeAvatarDialog();
+});
+ui['avatar-dialog'].addEventListener('click', (event) => {
+  if (event.target === ui['avatar-dialog']) closeAvatarDialog();
+});
+ui['avatar-upload'].addEventListener('click', () => {
+  stopCamera();
+  ui['avatar-file'].click();
+});
+ui['avatar-camera-fallback'].addEventListener('click', () => {
+  stopCamera();
+  ui['avatar-camera-file'].click();
+});
+ui['avatar-file'].addEventListener('change', () => handleAvatarFile(ui['avatar-file']));
+ui['avatar-camera-file'].addEventListener('change', () => handleAvatarFile(ui['avatar-camera-file']));
+ui['avatar-camera'].addEventListener('click', openCamera);
+ui['avatar-stop-camera'].addEventListener('click', () => {
+  stopCamera();
+  ui['avatar-message'].textContent = '相机已关闭；可重新拍照或上传照片。';
+});
+ui['avatar-shutter'].addEventListener('click', () => {
+  if (!cameraStream) return;
+  try {
+    const canvas = avatarFromCamera(ui['avatar-video']);
+    avatarRequestId++;
+    setAvatar(canvas);
+    stopCamera();
+    ui['avatar-message'].textContent = '照片已应用到我方侠客；刷新页面后需重新选择。';
+  } catch (error) {
+    ui['avatar-message'].textContent = error.message || '拍摄失败，请再试一次。';
+  }
+});
+ui['avatar-reset'].addEventListener('click', () => {
+  avatarRequestId++;
+  stopCamera();
+  setAvatar(null);
+  ui['avatar-message'].textContent = '已恢复默认侠客表情；刷新页面也不会保存照片。';
+});
 window.addEventListener('blur', () => {
   releaseInput(true);
+  if (cameraStream) stopCamera();
   sound.setAudible(false);
 });
 window.addEventListener('focus', () => {
@@ -795,6 +994,7 @@ window.addEventListener('focus', () => {
 document.addEventListener('visibilitychange', () => {
   if (document.hidden) {
     releaseInput(true);
+    if (avatarDialogOpen) stopCamera();
     sound.setAudible(false);
   } else if (typeof document.hasFocus !== 'function' || document.hasFocus()) {
     sound.setAudible(true);
@@ -824,14 +1024,18 @@ function drawMap() {
     node.className = 'map-node';
     if (stage.isCheckpoint) node.classList.add('is-checkpoint');
     if (stage.isBoss) node.classList.add('is-boss');
+    const cleared = progress.cleared.includes(stage.number);
     if (stage.number === progress.currentLevel && !progress.completed) node.classList.add('is-current');
-    else if (progress.completed && progress.cleared.includes(stage.number)) node.classList.add('is-cleared');
-    else if (stage.number < progress.currentLevel && progress.cleared.includes(stage.number)) node.classList.add('is-cleared');
+    else if (cleared) node.classList.add('is-cleared');
     else node.classList.add('is-locked');
-    node.title = `第 ${stage.number} 关 · ${stage.name}${stage.isCheckpoint ? ' · 存档点' : ''}`;
+    if (campaignView.replaying && stage.number === campaignView.replayLevel) node.classList.add('is-replaying');
+    node.title = `第 ${stage.number} 关 · ${stage.name}${stage.isCheckpoint ? ' · 存档点' : ''}`
+      + (cleared ? ' · 点击重打（不改变主线）' : '');
     node.setAttribute('aria-label', node.title);
+    node.setAttribute('aria-pressed', String(campaignView.replaying && stage.number === campaignView.replayLevel));
     node.textContent = String(stage.number).padStart(2, '0');
     node.addEventListener('click', () => {
+      if (cleared) return enterReplay(stage.number);
       notify(stage.number === progress.currentLevel
         ? `当前关卡：${stage.name}`
         : `第 ${stage.number} 关「${stage.name}」${stage.number > progress.currentLevel ? '尚未到达' : '不可跳关，需按存档线路推进'}`);
@@ -839,6 +1043,7 @@ function drawMap() {
     fragment.append(node);
   }
   ui['map-grid'].replaceChildren(fragment);
+  ui['replay-exit'].hidden = !campaignView.replaying;
 }
 
 function updateCampaignHud() {
@@ -849,22 +1054,24 @@ function updateCampaignHud() {
   const opponent = opponents[0];
   const milestoneBoss = combat?.fighters.find((fighter) => fighter.kind === 'boss' && fighter.bossTier > 0);
   const activeSummons = opponents.filter((fighter) => fighter.summonedBy).length;
+  const replayLabel = campaignView.replaying ? '重打练习 · ' : '';
   ui['theme-label'].textContent = `${level.themeName} · 第 ${level.chapter} 章`;
-  ui['stage-label'].textContent = `关卡 ${String(level.number).padStart(2, '0')} / ${MAX_LEVEL}`;
+  ui['stage-label'].textContent = `${replayLabel}关卡 ${String(level.number).padStart(2, '0')} / ${MAX_LEVEL}`;
   ui['stage-title'].textContent = level.name;
   ui['stage-subtitle'].textContent = campaignView.phase === 'aftermath'
-    ? '对手已倒下 · 退开再走过倒地敌人，片刻后结算'
-    : `${level.isBoss ? '首领之战 · ' : ''}第 ${level.stage} 关 · 第 ${waveNumber}/${waveCount} 波 · ${level.enemyCount} 名初始对手${milestoneBoss?.bossTier >= 2 ? ` · 召唤兵 ${activeSummons}/5` : ''}`;
+    ? `${replayLabel}对手已倒下 · 退开再走过倒地敌人，片刻后结算`
+    : `${replayLabel}${level.isBoss ? '首领之战 · ' : ''}第 ${level.stage} 关 · 第 ${waveNumber}/${waveCount} 波 · ${level.enemyCount} 名初始对手${milestoneBoss?.bossTier >= 2 ? ` · 召唤兵 ${activeSummons}/5` : ''}`;
   ui['player-name'].textContent = '火柴斗士';
   ui['opponent-name'].textContent = opponent?.name ?? (campaignView.phase === 'aftermath'
     ? '对手已倒下' : ['cleared', 'completed'].includes(campaignView.phase) ? '本关已清除' : '等待下一波');
   health(ui['player-health'], ui['player-health-text'], hero);
   health(ui['opponent-health'], ui['opponent-health-text'], opponent);
   ui['match-clock'].textContent = `${waveNumber} / ${waveCount}`;
-  ui['session-status'].textContent = campaignView.phase === 'aftermath'
-    ? '胜利收尾 · 可继续走动' : '单人闯关 · 本机存档';
-  ui['checkpoint-label'].textContent = `存档点：第 ${String(progress.checkpointLevel).padStart(2, '0')} 关`;
-  ui['progress-label'].textContent = `当前进度 ${String(progress.currentLevel).padStart(2, '0')} / ${MAX_LEVEL} · 失败 ${progress.deaths} 次`;
+  ui['session-status'].textContent = campaignView.replaying
+    ? '重打练习 · 不计正式进度'
+    : campaignView.phase === 'aftermath' ? '胜利收尾 · 可继续走动' : '单人闯关 · 本机存档';
+  ui['checkpoint-label'].textContent = `${campaignView.replaying ? '主线' : ''}存档点：第 ${String(progress.checkpointLevel).padStart(2, '0')} 关`;
+  ui['progress-label'].textContent = `${campaignView.replaying ? '主线进度' : '当前进度'} ${String(progress.currentLevel).padStart(2, '0')} / ${MAX_LEVEL} · 失败 ${progress.deaths} 次${campaignView.replaying ? '（练习不计）' : ''}`;
   ui['special-status'].hidden = !specialEligible;
   ui['special-key-guide'].hidden = !specialEligible;
   ui['special-button'].hidden = !specialEligible;
@@ -923,6 +1130,32 @@ function updateCampaignHud() {
 
 function campaignOverlay() {
   const { phase, level, failedLevel, progress } = campaignView;
+  if (campaignView.replaying) {
+    const levelLabel = `第 ${String(level.number).padStart(2, '0')} 关「${level.name}」`;
+    if (phase === 'failed' || phase === 'cleared') {
+      showOverlay({
+        title: phase === 'failed' ? '练习失利' : '重打成功',
+        body: `${levelLabel}${phase === 'failed' ? '挑战失利' : '已经完成'}。这是独立练习，主线进度、存档与失败次数均未改变。`,
+        primary: '再打这一关', onPrimary: retryReplay,
+        secondary: '返回主线', onSecondary: exitReplay,
+      });
+    } else if (phase === 'aftermath') {
+      showOverlay({
+        title: '练习收尾',
+        body: '敌人已倒下。可走过倒地敌人触发散骨，片刻后显示练习结果；随时可返回主线。',
+        primary: '继续走动', onPrimary: () => { resumeCampaign(); hideOverlay(); },
+        secondary: '返回主线', onSecondary: exitReplay,
+      });
+    } else {
+      showOverlay({
+        title: `重打第 ${String(level.number).padStart(2, '0')} 关`,
+        body: `${levelLabel}从起点开始独立练习。胜负不会解锁新关或改变正式存档；可随时从右侧返回主线。`,
+        primary: '开始重打', onPrimary: () => { resumeCampaign(); hideOverlay(); },
+        secondary: '返回主线', onSecondary: exitReplay,
+      });
+    }
+    return;
+  }
   const bossTier = level.waves.flatMap((wave) => wave.groups)
     .find((group) => group.kind === 'boss' && group.bossTier > 0)?.bossTier ?? 0;
   const bossHint = bossTier
@@ -935,6 +1168,7 @@ function campaignOverlay() {
       primary: `从第 ${progress.checkpointLevel} 关重试`,
       onPrimary: () => {
         campaignView = campaign.retry();
+        sceneToken++;
         resumeCampaign();
         drawMap();
         updateCampaignHud();
@@ -948,6 +1182,7 @@ function campaignOverlay() {
       primary: '进入下一关',
       onPrimary: () => {
         campaignView = campaign.next();
+        sceneToken++;
         resumeCampaign();
         drawMap();
         updateCampaignHud();
@@ -957,11 +1192,12 @@ function campaignOverlay() {
   } else if (phase === 'completed') {
     showOverlay({
       title: '56 关全部突破',
-      body: '森林、城市、海洋与陆地的九场首领战均已突破。你的通关记录保存在这台浏览器。',
+      body: '森林、城市、海洋与陆地的九场首领战均已突破。通关记录保存在这台浏览器；点击右侧已通过的关卡可随时重打。',
       primary: '开启新的征程',
       onPrimary: () => {
         if (!window.confirm('重新开始将清除当前的 56 关通关进度，确定继续吗？')) return;
         campaignView = campaign.reset();
+        sceneToken++;
         resumeCampaign();
         drawMap();
         updateCampaignHud();
@@ -980,14 +1216,94 @@ function campaignOverlay() {
       body: `第 ${level.number} / ${MAX_LEVEL} 关 · ${level.themeName}「${level.name}」。A/D 移动，J 攻击，空格跳跃，Shift 闪避。每关最多投矛 ${SPEARS_PER_LEVEL} 次；按 I 预览弧线，↑↓ 调角，再按 I 确认发射，真正投出才扣次；Esc 取消。${campaignView.specialEligible ? '每击倒两名敌人可按 L 释放一次无敌光波。' : ''}${bossHint}`,
       primary: '开始挑战',
       onPrimary: () => { resumeCampaign(); hideOverlay(); },
+      secondary: '设置头像', onSecondary: openAvatarDialog,
     });
   }
 }
 
-function resumeCampaign() {
+function showMainlineResumeOverlay({ fromReplay = false } = {}) {
+  const ending = campaignView.phase === 'aftermath';
+  if (campaignView.replaying) {
+    showOverlay({
+      title: '练习已暂停',
+      body: `第 ${campaignView.level.number} 关的重打现场未重置；头像设置只改变本页画面，不影响练习或正式存档。`,
+      primary: ending ? '继续走动' : '继续重打',
+      onPrimary: () => { resumeCampaign({ preserveAim: true }); hideOverlay(); },
+      secondary: '返回主线', onSecondary: exitReplay,
+    });
+    return;
+  }
+  showOverlay({
+    title: ending ? '继续主线收尾' : '主线已暂停',
+    body: `${fromReplay
+      ? `已回到第 ${campaignView.level.number} 关原来的现场，生命、敌人和机关状态没有因重打而回退。`
+      : `第 ${campaignView.level.number} 关已暂停，设置头像不会重置当前战斗。`}${ending ? '可继续走动等待结算。' : '准备好后继续挑战。'}`,
+    primary: ending ? '继续走动' : '继续主线',
+    onPrimary: () => { resumeCampaign({ preserveAim: true }); hideOverlay(); },
+    secondary: '设置头像', onSecondary: openAvatarDialog,
+  });
+}
+
+function enterReplay(levelNumber) {
+  if (mode !== 'campaign' || !campaignView.progress.cleared.includes(levelNumber)) return;
+  if (campaignView.replaying && campaignView.replayLevel === levelNumber
+    && ['playing', 'aftermath'].includes(campaignView.phase)) {
+    notify('正在重打这一关；可继续战斗或点击“退出重打”返回主线。');
+    return;
+  }
   cancelResultOverlay();
   sound.cancelPendingKOs();
-  releaseInput(true);
+  campaignPaused = true;
+  releaseInput(false);
+  campaignView = campaign.replay(levelNumber);
+  sceneToken++;
+  accumulator = 0;
+  drawMap();
+  updateCampaignHud();
+  campaignOverlay();
+  syncMusic();
+}
+
+function retryReplay() {
+  if (!campaignView.replaying) return;
+  cancelResultOverlay();
+  sound.cancelPendingKOs();
+  releaseInput(false);
+  campaignView = campaign.retryReplay();
+  sceneToken++;
+  drawMap();
+  resumeCampaign();
+  hideOverlay();
+}
+
+function exitReplay({ showResult = true } = {}) {
+  if (!campaignView.replaying) return;
+  cancelResultOverlay();
+  sound.cancelPendingKOs();
+  releaseInput(false);
+  campaignView = campaign.exitReplay();
+  sceneToken++;
+  campaignPaused = true;
+  accumulator = 0;
+  drawMap();
+  updateCampaignHud();
+  if (showResult && mode === 'campaign') {
+    if (['playing', 'aftermath'].includes(campaignView.phase)) showMainlineResumeOverlay({ fromReplay: true });
+    else campaignOverlay();
+  }
+  syncMusic();
+}
+
+ui['replay-exit'].addEventListener('click', () => exitReplay());
+
+function resumeCampaign({ preserveAim = false } = {}) {
+  cancelResultOverlay();
+  sound.cancelPendingKOs();
+  releaseInput(!preserveAim);
+  if (preserveAim) {
+    const hero = campaignView.combat?.fighters.find((fighter) => fighter.team === 0);
+    if (hero?.prevInput) hero.prevInput.spear = false;
+  }
   accumulator = 0;
   campaignPaused = false;
   updateCampaignHud();
@@ -1077,8 +1393,10 @@ function resetDuelRoom() {
   duel.phase = 'idle';
   duel.inputSeq = 0;
   duel.seenEvents.clear();
+  sceneToken++;
   previewDuel();
   ui['room-message'].textContent = '创建房间，邀请朋友输入房间码即可对战。';
+  updateAvatarAvailability();
   syncMusic();
 }
 
@@ -1129,12 +1447,14 @@ function handleServerMessage(message) {
       updateDuelHud();
       break;
     case 'countdown':
+      closeAvatarDialog();
       cancelResultOverlay();
       sound.cancelPendingKOs();
       duel.phase = 'countdown';
       if (mode === 'duel') showOverlay({ title: `${message.seconds}`, body: '对手已就位 · 战斗即将开始' });
       break;
     case 'start':
+      closeAvatarDialog();
       cancelResultOverlay();
       sound.cancelPendingKOs();
       duel.phase = 'playing';
@@ -1142,6 +1462,7 @@ function handleServerMessage(message) {
       duel.theme = message.theme;
       duel.inputSeq = 0;
       duel.seenEvents.clear();
+      sceneToken++;
       ui['room-message'].textContent = `房间 ${message.code} · 战斗进行中`;
       if (mode === 'duel') hideOverlay();
       sendInput(true);
@@ -1215,6 +1536,7 @@ function handleServerMessage(message) {
     default:
       break;
   }
+  updateAvatarAvailability();
   syncMusic();
 }
 
@@ -1299,11 +1621,14 @@ themeSelect?.addEventListener('change', () => {
 
 function switchMode(next) {
   if (mode === next) return;
+  closeAvatarDialog();
+  if (mode === 'campaign' && campaignView.replaying) exitReplay({ showResult: false });
   cancelResultOverlay();
   sound.cancelPendingKOs();
   if (mode === 'duel' && duel.code) leaveRoom();
   releaseInput(true);
   mode = next;
+  sceneToken++;
   ui['campaign-panel'].hidden = next !== 'campaign';
   ui['duel-panel'].hidden = next !== 'duel';
   for (const [button, isActive] of [[ui['campaign-button'], next === 'campaign'], [ui['duel-button'], next === 'duel']]) {
@@ -1320,6 +1645,7 @@ function switchMode(next) {
     hideOverlay();
     previewDuel();
   }
+  updateAvatarAvailability();
   syncMusic();
 }
 
@@ -1408,6 +1734,8 @@ function frame(now) {
     theme: mode === 'campaign' ? stage.theme : duel.theme,
     mode, level: stage?.number, time: now / 1000,
     campaignPhase: mode === 'campaign' ? campaignView.phase : undefined,
+    localFighterId: mode === 'campaign' ? 'hero' : duel.role,
+    sceneToken,
   });
   if (now - lastHudAt > 80) {
     if (mode === 'campaign') updateCampaignHud();
@@ -1427,4 +1755,5 @@ ui['campaign-panel'].hidden = false;
 ui['duel-panel'].hidden = true;
 ui.toast.hidden = true;
 updateSoundToggle();
+updateAvatarAvailability();
 requestAnimationFrame(frame);

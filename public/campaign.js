@@ -83,6 +83,10 @@ export class CampaignSession {
     this.specialCharges = 0;
     this.specialHeld = false;
     this.aftermathUntilTick = null;
+    // A replay is a temporary fight. Keep the official scene itself in memory
+    // so leaving practice can resume it without rewinding its combat state.
+    this.replayLevel = null;
+    this.officialState = null;
     this.#load();
   }
 
@@ -115,12 +119,17 @@ export class CampaignSession {
 
   /** Start the saved level from its original positions, with fresh health and hazards. */
   start() {
+    if (this.replayLevel !== null) return this.snapshot();
     if (this.progress.completed) {
       this.phase = 'completed';
       return this.snapshot();
     }
     const level = getLevel(this.progress.currentLevel);
     if (isCheckpoint(level.number)) this.progress.checkpointLevel = level.number;
+    return this.#startLevel(level, true);
+  }
+
+  #startLevel(level, saveProgress) {
     this.levelNumber = level.number;
     this.waveIndex = 0;
     this.failedLevel = null;
@@ -137,7 +146,38 @@ export class CampaignSession {
       mode: 'campaign', arena: copyArena(level), fighters: [player],
     });
     this.#spawnWave();
-    this.#save();
+    if (saveProgress) this.#save();
+    return this.snapshot();
+  }
+
+  /** Fight an already-cleared stage without modifying the official save/run. */
+  replay(levelNumber) {
+    if (!this.progress.cleared.includes(levelNumber)) return this.snapshot();
+    if (this.officialState === null) {
+      this.officialState = {
+        phase: this.phase, combat: this.combat, levelNumber: this.levelNumber,
+        waveIndex: this.waveIndex, failedLevel: this.failedLevel,
+        specialEligible: this.specialEligible, specialKills: this.specialKills,
+        specialCharges: this.specialCharges, specialHeld: this.specialHeld,
+        aftermathUntilTick: this.aftermathUntilTick,
+      };
+    }
+    this.replayLevel = levelNumber;
+    return this.#startLevel(getLevel(levelNumber), false);
+  }
+
+  /** Rebuild the selected practice level, irrespective of the saved checkpoint. */
+  retryReplay() {
+    return this.replayLevel === null
+      ? this.snapshot() : this.#startLevel(getLevel(this.replayLevel), false);
+  }
+
+  /** Return to the exact official scene/result that was paused for practice. */
+  exitReplay() {
+    if (this.officialState === null) return this.snapshot();
+    Object.assign(this, this.officialState);
+    this.officialState = null;
+    this.replayLevel = null;
     return this.snapshot();
   }
 
@@ -264,17 +304,20 @@ export class CampaignSession {
 
   #completeLevel() {
     const level = getLevel(this.levelNumber);
-    if (!this.progress.cleared.includes(level.number)) this.progress.cleared.push(level.number);
-    this.progress.cleared.sort((a, b) => a - b);
-    this.progress.completed = level.number === MAX_LEVEL;
-    if (!this.progress.completed) this.progress.currentLevel = level.number + 1;
-    this.phase = this.progress.completed ? 'completed' : 'cleared';
+    if (this.replayLevel === null) {
+      if (!this.progress.cleared.includes(level.number)) this.progress.cleared.push(level.number);
+      this.progress.cleared.sort((a, b) => a - b);
+      this.progress.completed = level.number === MAX_LEVEL;
+      if (!this.progress.completed) this.progress.currentLevel = level.number + 1;
+    }
+    this.phase = this.replayLevel !== null ? 'cleared'
+      : this.progress.completed ? 'completed' : 'cleared';
     this.combat.aftermath = false;
     this.aftermathUntilTick = null;
     this.combat.events.push({
       id: `${this.combat.tick}:level-clear`, type: 'level-clear', level: level.number,
     });
-    this.#save();
+    if (this.replayLevel === null) this.#save();
   }
 
   /** Advance one fixed 1/60-second tick. The light wave is campaign-only. */
@@ -341,14 +384,17 @@ export class CampaignSession {
     // Failure takes precedence even if the last blow knocked both sides out.
     if (player.hp <= 0) {
       this.failedLevel = this.levelNumber;
-      this.progress.deaths++;
-      this.progress.currentLevel = this.progress.checkpointLevel;
+      if (this.replayLevel === null) {
+        this.progress.deaths++;
+        this.progress.currentLevel = this.progress.checkpointLevel;
+      }
       this.phase = 'failed';
       this.combat.events.push({
         id: `${this.combat.tick}:campaign-fail`, type: 'campaign-fail',
-        failedLevel: this.failedLevel, checkpointLevel: this.progress.checkpointLevel,
+        failedLevel: this.failedLevel,
+        checkpointLevel: this.replayLevel ?? this.progress.checkpointLevel,
       });
-      this.#save();
+      if (this.replayLevel === null) this.#save();
     } else if (this.combat.fighters.every((fighter) => fighter.team === 0 || fighter.hp <= 0)) {
       const level = getLevel(this.levelNumber);
       if (this.waveIndex + 1 < level.waves.length) {
@@ -367,16 +413,20 @@ export class CampaignSession {
 
   /** Continue from a clear screen, activating a checkpoint on entry. */
   next() {
-    return this.phase === 'cleared' ? this.start() : this.snapshot();
+    return this.phase === 'cleared' && this.replayLevel === null
+      ? this.start() : this.snapshot();
   }
 
   /** A failed run always retries at the saved checkpoint, never the failed room. */
   retry() {
-    return this.phase === 'failed' ? this.start() : this.snapshot();
+    return this.phase !== 'failed' ? this.snapshot()
+      : this.replayLevel !== null ? this.retryReplay() : this.start();
   }
 
   /** Explicit new-game action; ordinary failure never erases achievement history. */
   reset() {
+    this.officialState = null;
+    this.replayLevel = null;
     this.progress = freshProgress();
     try { this.storage.removeItem(this.storageKey); } catch { /* #save below will use fallback */ }
     return this.start();
@@ -386,6 +436,8 @@ export class CampaignSession {
     const level = getLevel(this.levelNumber ?? this.progress.currentLevel);
     return {
       phase: this.phase,
+      replaying: this.replayLevel !== null,
+      replayLevel: this.replayLevel,
       level,
       combat: this.combat,
       events: this.combat?.events ?? [],

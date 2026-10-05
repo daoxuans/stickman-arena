@@ -18,6 +18,11 @@ class FakeNode {
     this.textContent = '';
     this.width = 960;
     this.height = 540;
+    this.videoWidth = 640;
+    this.videoHeight = 480;
+    this.files = [];
+    this.clicks = 0;
+    this.open = false;
     const classes = new Set();
     this.classList = {
       add: (name) => classes.add(name),
@@ -36,13 +41,21 @@ class FakeNode {
   }
 
   fire(type, details = {}) {
-    const event = { type, preventDefault() {}, pointerId: 0, ...details };
+    const event = { type, target: this, preventDefault() {}, pointerId: 0, ...details };
     for (const callback of this.listeners.get(type) ?? []) callback(event);
     return event;
   }
 
   setAttribute(name, value) { this.attributes.set(name, String(value)); }
+  removeAttribute(name) { this.attributes.delete(name); }
   setPointerCapture() {}
+  focus() { globalThis.document.activeElement = this; }
+  click() { this.clicks++; this.fire('click'); }
+  showModal() { this.open = true; this.hidden = false; }
+  close() { this.open = false; this.hidden = true; this.fire('close'); }
+  play() { return Promise.resolve(); }
+  pause() {}
+  toDataURL() { return 'data:image/png;base64,bG9jYWwtYXZhdGFy'; }
   querySelector(selector) { return selector === 'span' ? new FakeNode('label') : null; }
   replaceChildren(...nodes) { this.children = nodes.flatMap((node) => node.isFragment ? node.children : [node]); }
   append(...nodes) { this.children.push(...nodes); }
@@ -58,6 +71,21 @@ const fakeCanvasContext = new Proxy({
   set(target, property, value) { target[property] = value; return true; },
 });
 
+test('portrait setup exposes explicit local-only upload and camera fallback controls', () => {
+  const page = readFileSync(new URL('../public/index.html', import.meta.url), 'utf8');
+  assert.match(page, /<button id="avatar-open"[^>]*aria-label="[^"]*头像/);
+  assert.match(page, /<dialog id="avatar-dialog"[^>]*aria-labelledby="avatar-dialog-title"[^>]*aria-describedby="avatar-privacy"/);
+  assert.match(page, /id="avatar-privacy"[^>]*>[^<]*当前页面内存[^<]*不上传服务器[^<]*不传给对手[^<]*刷新页面后需重新选择/);
+  assert.match(page, /<input id="avatar-file"[^>]*type="file"[^>]*accept="[^"]*image\/jpeg[^"]*image\/png[^"]*image\/webp/);
+  assert.match(page, /<input id="avatar-camera-file"[^>]*type="file"[^>]*capture="user"/);
+  for (const id of ['avatar-upload', 'avatar-camera', 'avatar-camera-fallback',
+    'avatar-video', 'avatar-shutter', 'avatar-stop-camera', 'avatar-reset', 'avatar-close']) {
+    assert.match(page, new RegExp(`id="${id}"`), `${id} is present for the camera and consent flow`);
+  }
+  assert.match(page, /id="replay-exit"[^>]*hidden/);
+  assert.match(page, /已过可重打/);
+});
+
 test('browser controller boots, switches modes, starts a fight and renders a frame', async () => {
   const page = readFileSync(new URL('../public/index.html', import.meta.url), 'utf8');
   const ids = [...page.matchAll(/id="([^"]+)"/g)].map((match) => match[1]);
@@ -65,6 +93,8 @@ test('browser controller boots, switches modes, starts a fight and renders a fra
   assert.match(aimControlsMarkup, /<span id="spear-angle"/, 'touch aiming shows its own angle readout');
   const elements = new Map(ids.map((id) => [id, new FakeNode(id)]));
   elements.get('duel-theme').value = 'city';
+  for (const id of ['avatar-dialog', 'avatar-preview', 'avatar-chip-photo',
+    'avatar-camera-fallback', 'avatar-camera-view', 'replay-exit']) elements.get(id).hidden = true;
   const touchIds = { special: 'special-button', spear: 'spear-button', aimUp: 'aim-up-button',
     aimDown: 'aim-down-button', aimCancel: 'aim-cancel-button' };
   const buttons = ['left', 'right', 'attack', 'kick', 'jump', 'dodge', 'special', 'spear',
@@ -78,6 +108,21 @@ test('browser controller boots, switches modes, starts a fight and renders a fra
   const windowListeners = new Map();
   const sockets = [];
   const campaignInputs = [];
+  const savedItems = new Map();
+  let storageWrites = 0;
+  const localStorage = {
+    getItem(key) { return savedItems.get(key) ?? null; },
+    setItem(key, value) { storageWrites++; savedItems.set(key, String(value)); },
+    removeItem(key) { savedItems.delete(key); },
+  };
+  let cameraRequests = 0;
+  let cameraStops = 0;
+  const stream = { getTracks: () => [{ stop() { cameraStops++; } }] };
+  const navigator = { mediaDevices: { async getUserMedia() {
+    cameraRequests++;
+    if (cameraRequests === 1) throw new Error('permission denied');
+    return stream;
+  } } };
   const timers = new Map();
   let timerId = 0;
   const fireTimers = (delay) => {
@@ -178,6 +223,10 @@ test('browser controller boots, switches modes, starts a fight and renders a fra
     WebSocket: globalThis.WebSocket,
     matchMedia: globalThis.matchMedia,
   };
+  const browserGlobals = Object.fromEntries(['localStorage', 'navigator', 'Image']
+    .map((key) => [key, Object.getOwnPropertyDescriptor(globalThis, key)]));
+  Object.defineProperty(globalThis, 'localStorage', { value: localStorage, configurable: true });
+  Object.defineProperty(globalThis, 'navigator', { value: navigator, configurable: true });
   globalThis.document = {
     activeElement: null,
     hidden: false,
@@ -227,11 +276,82 @@ test('browser controller boots, switches modes, starts a fight and renders a fra
     document.fire('pointerdown');
     assert.equal(audio.contexts.length, 1, 'a user gesture unlocks one shared audio context');
     assert.equal(musicStarts(), 0, 'the start overlay does not autoplay the battle score');
+    assert.equal(elements.get('overlay-secondary').textContent, '设置头像',
+      'the first start screen offers portrait setup before the fight');
+    assert.equal(cameraRequests, 0, 'opening the page never requests camera permission');
+    const firstSave = savedItems.get('stickman-arena.campaign.v1');
+    const writesBeforeAvatar = storageWrites;
+    elements.get('overlay-secondary').focus();
+    elements.get('overlay-secondary').fire('click');
+    assert.equal(elements.get('avatar-dialog').open, true);
+    assert.equal(cameraRequests, 0, 'opening portrait setup also leaves camera permission untouched');
+
+    // Permission is requested only by the explicit camera action, and an
+    // unavailable/denied stream retains a native capture-file alternative.
+    elements.get('avatar-camera').fire('click');
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(cameraRequests, 1);
+    assert.equal(elements.get('avatar-camera-fallback').hidden, false);
+    elements.get('avatar-camera-fallback').fire('click');
+    assert.equal(elements.get('avatar-camera-file').clicks, 1);
+    elements.get('avatar-camera').fire('click');
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(cameraRequests, 2);
+    assert.equal(elements.get('avatar-video').srcObject, stream);
+    assert.equal(elements.get('avatar-camera-view').hidden, false);
+    elements.get('avatar-shutter').fire('click');
+    assert.match(elements.get('avatar-preview').src, /^data:image\/png;base64,/);
+    assert.equal(elements.get('avatar-preview').hidden, false);
+    const stopsAfterShutter = cameraStops;
+    assert.ok(stopsAfterShutter > 0, 'capturing a frame releases its video stream');
+    elements.get('avatar-camera').fire('click');
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(cameraRequests, 3);
+    assert.equal(elements.get('avatar-video').srcObject, stream);
+    elements.get('avatar-close').fire('click');
+    assert.equal(elements.get('avatar-dialog').open, false);
+    assert.ok(cameraStops > stopsAfterShutter, 'closing setup releases any live camera tracks');
+    assert.equal(globalThis.document.activeElement, elements.get('overlay-secondary'),
+      'closing setup returns keyboard focus to its opener');
+
+    // The same local preview path accepts a file, and can be reset without
+    // touching either the campaign save or any multiplayer message.
+    elements.get('avatar-open').fire('click');
+    elements.get('avatar-dialog').fire('close'); // A late close event from the previous opening.
+    assert.equal(elements.get('avatar-dialog').open, true);
+    assert.equal(elements.get('avatar-dialog').hidden, false,
+      'a queued native close event cannot hide a rapidly reopened setup');
+    navigator.mediaDevices = null;
+    elements.get('avatar-camera').fire('click');
+    assert.equal(cameraRequests, 3, 'unsupported devices do not attempt a permission request');
+    assert.equal(elements.get('avatar-camera-fallback').hidden, false,
+      'a device without getUserMedia still exposes the native capture picker');
+    elements.get('avatar-reset').fire('click');
+    assert.equal(elements.get('avatar-preview').hidden, true);
+    assert.equal(elements.get('avatar-chip-photo').hidden, true);
+    class DecodedImage {
+      naturalWidth = 640;
+      naturalHeight = 480;
+      set src(value) { this._src = value; queueMicrotask(() => this.onload?.()); }
+      get src() { return this._src; }
+    }
+    Object.defineProperty(globalThis, 'Image', { value: DecodedImage, configurable: true });
+    elements.get('avatar-upload').fire('click');
+    assert.equal(elements.get('avatar-file').clicks, 1, 'the visible upload control opens the native file picker');
+    elements.get('avatar-file').files = [new Blob(['private local photo'], { type: 'image/png' })];
+    elements.get('avatar-file').fire('change');
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.match(elements.get('avatar-preview').src, /^data:image\/png;base64,/);
+    assert.equal(elements.get('avatar-chip-photo').hidden, false);
+    assert.equal(savedItems.get('stickman-arena.campaign.v1'), firstSave);
+    assert.equal(storageWrites, writesBeforeAvatar, 'portrait choice never enters the campaign save');
+    elements.get('avatar-close').fire('click');
 
     elements.get('duel-button').fire('click');
     assert.equal(elements.get('campaign-panel').hidden, true);
     assert.equal(elements.get('duel-panel').hidden, false);
     assert.equal(elements.get('stage-label').textContent, '实时联机 1V1');
+    assert.equal(elements.get('avatar-open').disabled, false, 'the idle duel lobby can set a local portrait');
 
     elements.get('campaign-button').fire('click');
     elements.get('overlay-primary').fire('click');
@@ -255,6 +375,20 @@ test('browser controller boots, switches modes, starts a fight and renders a fra
     };
     const campaignHero = () => latestCampaignView.combat.fighters.find((fighter) => fighter.id === 'hero');
     advanceFrame(35);
+    const pausedTick = activeCampaign.combat.tick;
+    tapKey('KeyJ');
+    elements.get('avatar-open').fire('click');
+    assert.equal(elements.get('avatar-dialog').open, true);
+    advanceFrame(35);
+    assert.equal(activeCampaign.combat.tick, pausedTick, 'portrait setup pauses the live campaign');
+    elements.get('avatar-close').fire('click');
+    assert.equal(elements.get('screen-overlay').hidden, false,
+      'closing portrait setup asks before resuming the paused fight');
+    advanceFrame(35);
+    assert.equal(activeCampaign.combat.tick, pausedTick, 'the continue screen holds the fight still');
+    elements.get('overlay-primary').fire('click');
+    assert.equal(advanceFrame(35)[0].attack, false,
+      'an attack pressed before opening portrait setup cannot fire on resume');
     assert.equal(elements.get('spear-button').disabled, false, 'a player can aim from the first fight without a KO');
     assert.equal(elements.get('spear-button').attributes.get('aria-label'), '进入投矛瞄准，剩余 5 次');
     assert.match(elements.get('player-health-text').textContent, /100 \/ 100/);
@@ -549,6 +683,12 @@ test('browser controller boots, switches modes, starts a fight and renders a fra
     fireTimers(650);
     assert.equal(elements.get('screen-overlay').hidden, true);
 
+    document.fire('keydown', { code: 'KeyJ', repeat: false });
+    elements.get('avatar-open').fire('click');
+    assert.equal(elements.get('avatar-dialog').open, true);
+    document.fire('keyup', { code: 'KeyJ' }); // Released behind the modal dialog.
+    elements.get('avatar-close').fire('click');
+
     elements.get('create-room').fire('click');
     await new Promise((resolve) => setImmediate(resolve));
     const socket = sockets.at(-1);
@@ -558,6 +698,8 @@ test('browser controller boots, switches modes, starts a fight and renders a fra
     assert.equal(musicStarts(), musicBeforeRoom, 'waiting for an opponent has no battle score');
     socket.fire('message', { data: JSON.stringify({ type: 'start', code: '123456', role: 'p1', theme: 'city' }) });
     assert.ok(musicStarts() > musicBeforeRoom, 'server start begins the duel arrangement');
+    assert.equal(elements.get('avatar-open').disabled, true,
+      'portrait setup cannot interrupt a live server-authoritative duel');
     const musicStopsBeforeMute = musicStops();
     elements.get('sound-toggle').fire('click');
     assert.equal(elements.get('sound-toggle').attributes.get('aria-pressed'), 'false');
@@ -569,10 +711,14 @@ test('browser controller boots, switches modes, starts a fight and renders a fra
     assert.equal(elements.get('sound-toggle').attributes.get('aria-pressed'), 'true');
     assert.ok(musicStarts() > musicWhileMuted, 'unmuting an active duel resumes one score');
     assert.equal(socket.sent.at(-1).input.kick, false);
+    assert.equal(socket.sent.at(-1).input.attack, false,
+      'a duel-lobby key released during portrait setup cannot become a ghost attack');
     assert.equal('special' in socket.sent.at(-1).input, false);
     assert.equal('spear' in socket.sent.at(-1).input, false);
     assert.deepEqual(Object.keys(socket.sent.at(-1).input).sort(),
       ['attack', 'dodge', 'jump', 'kick', 'left', 'right']);
+    assert.doesNotMatch(JSON.stringify(socket.sent), /data:image|avatar|portrait/i,
+      'portrait pixels and metadata never travel with room or combat messages');
 
     document.fire('keydown', { code: 'KeyL', repeat: false });
     assert.equal('special' in socket.sent.at(-1).input, false, 'light wave is never sent to the duel server');
@@ -627,6 +773,8 @@ test('browser controller boots, switches modes, starts a fight and renders a fra
     fireTimers(650);
     assert.equal(elements.get('overlay-title').textContent, '你赢了！');
     assert.equal(musicStarts(), musicAfterFinish, 'the result overlay remains silent');
+    assert.equal(elements.get('avatar-open').disabled, false,
+      'the local portrait can be changed after a duel finishes');
 
     socket.fire('message', { data: JSON.stringify({ type: 'start', code: '123456', role: 'p1', theme: 'city' }) });
     assert.ok(musicStarts() > musicAfterFinish, 'a new duel round starts a fresh score');
@@ -653,6 +801,8 @@ test('browser controller boots, switches modes, starts a fight and renders a fra
     elements.get('leave-room').fire('click');
     fireTimers(300);
     assert.equal(elements.get('screen-overlay').hidden, true, 'leaving cancels the queued result');
+    assert.equal(elements.get('avatar-open').disabled, false,
+      'leaving the room restores local portrait setup in the waiting lobby');
 
     // A single-enemy room must stay walkable after the real final KO so the
     // player can pass the fallen enemy before the clear panel takes over.
@@ -686,8 +836,88 @@ test('browser controller boots, switches modes, starts a fight and renders a fra
     for (let frame = 0; frame < 65 && latestCampaignView.phase === 'aftermath'; frame++) advanceFrame(100);
     assert.equal(latestCampaignView.phase, 'cleared', 'the victory window eventually resolves');
     assert.equal(elements.get('overlay-title').textContent, '关卡突破');
+
+    // Clearing room one unlocks it for replay; the official second-room scene
+    // stays in memory and its save remains byte-for-byte untouched throughout
+    // a failed practice attempt, retry, and explicit return to the main route.
+    elements.get('overlay-primary').fire('click');
+    advanceFrame(35);
+    assert.equal(activeCampaign.snapshot().level.number, 2);
+    const officialScene = activeCampaign.combat;
+    const officialTick = officialScene.tick;
+    const savedAfterClear = savedItems.get('stickman-arena.campaign.v1');
+    const writesAfterClear = storageWrites;
+    const deathsAfterClear = activeCampaign.progress.deaths;
+    assert.equal(elements.get('map-grid').children[0].classList.contains('is-cleared'), true);
+    elements.get('map-grid').children[2].fire('click');
+    assert.equal(activeCampaign.snapshot().replaying, false, 'uncleared route nodes still cannot skip the main quest');
+    assert.equal(savedItems.get('stickman-arena.campaign.v1'), savedAfterClear);
+    tapKey('KeyJ');
+    elements.get('map-grid').children[0].fire('click');
+    assert.equal(activeCampaign.snapshot().replaying, true);
+    assert.equal(activeCampaign.snapshot().level.number, 1);
+    assert.equal(elements.get('map-grid').children[0].classList.contains('is-replaying'), true);
+    assert.equal(elements.get('replay-exit').hidden, false);
+    assert.match(elements.get('stage-label').textContent, /重打|练习/);
+    assert.match(elements.get('progress-label').textContent, /02/,
+      'the status keeps identifying the saved official progression');
+    if (!elements.get('screen-overlay').hidden) elements.get('overlay-primary').fire('click');
+    assert.equal(advanceFrame(35)[0].attack, false,
+      'an attack buffered in the official scene does not fire inside a replay');
+    assert.equal(activeCampaign.snapshot().replaying, true);
+    assert.equal(storageWrites, writesAfterClear);
+    const practiceTick = activeCampaign.combat.tick;
+    elements.get('avatar-open').fire('click');
+    advanceFrame(35);
+    assert.equal(activeCampaign.combat.tick, practiceTick, 'portrait setup also pauses a live replay');
+    elements.get('avatar-close').fire('click');
+    assert.equal(elements.get('overlay-title').textContent, '练习已暂停');
+    assert.equal(elements.get('overlay-primary').textContent, '继续重打');
+    assert.equal(elements.get('overlay-secondary').textContent, '返回主线');
+    assert.equal(activeCampaign.snapshot().replaying, true, 'portrait setup does not silently exit practice');
+    elements.get('overlay-primary').fire('click');
+    advanceFrame(35);
+    assert.ok(activeCampaign.combat.tick > practiceTick);
+
+    const replayHero = activeCampaign.combat.fighters.find((fighter) => fighter.team === 0);
+    replayHero.hp = 1;
+    replayHero.y = 620;
+    advanceFrame(35);
+    fireTimers(300); // Reduced-motion setting remains enabled from the duel KO test.
+    fireTimers(650);
+    assert.equal(activeCampaign.snapshot().phase, 'failed');
+    assert.match(elements.get('overlay-title').textContent, /重打|练习/);
+    assert.match(elements.get('overlay-primary').textContent, /再打|重试/);
+    assert.match(elements.get('overlay-secondary').textContent, /返回主线/);
+    assert.equal(activeCampaign.progress.deaths, deathsAfterClear);
+    assert.equal(savedItems.get('stickman-arena.campaign.v1'), savedAfterClear);
+    assert.equal(storageWrites, writesAfterClear);
+    elements.get('overlay-primary').fire('click');
+    assert.equal(activeCampaign.snapshot().replaying, true);
+    assert.equal(activeCampaign.snapshot().phase, 'playing');
+    assert.equal(activeCampaign.snapshot().level.number, 1);
+    assert.equal(activeCampaign.combat.fighters.find((fighter) => fighter.team === 0).hp, 100);
+    assert.equal(savedItems.get('stickman-arena.campaign.v1'), savedAfterClear);
+    elements.get('replay-exit').fire('click');
+    assert.equal(activeCampaign.snapshot().replaying, false);
+    assert.equal(activeCampaign.snapshot().level.number, 2);
+    assert.equal(activeCampaign.combat, officialScene, 'returning restores the exact official fight');
+    assert.equal(officialScene.tick, officialTick, 'the official fight was paused throughout replay');
+    assert.equal(elements.get('screen-overlay').hidden, false, 'returning shows a paused continue screen');
+    assert.equal(elements.get('replay-exit').hidden, true);
+    assert.equal(savedItems.get('stickman-arena.campaign.v1'), savedAfterClear);
+    assert.equal(storageWrites, writesAfterClear);
+    advanceFrame(100);
+    assert.equal(officialScene.tick, officialTick, 'the official scene does not advance behind its continue screen');
+    elements.get('overlay-primary').fire('click');
+    advanceFrame(35);
+    assert.ok(officialScene.tick > officialTick, 'the official fight advances after the player chooses to continue');
   } finally {
     CampaignSession.prototype.step = originalCampaignStep;
+    for (const [key, descriptor] of Object.entries(browserGlobals)) {
+      if (descriptor) Object.defineProperty(globalThis, key, descriptor);
+      else delete globalThis[key];
+    }
     for (const [key, value] of Object.entries(previous)) {
       if (value === undefined) delete globalThis[key];
       else globalThis[key] = value;

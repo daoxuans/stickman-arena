@@ -195,6 +195,179 @@ test('waves advance one by one, then clear unlocks exactly the next room', () =>
   assert.equal(new CampaignSession({ storage: store }).start().level.number, 3);
 });
 
+test('only cleared stages can be replayed, and a rejected selection changes no scene or save', () => {
+  const backing = seedProgress(11, 9, Array.from({ length: 10 }, (_, index) => index + 1));
+  let writes = 0;
+  const store = { ...backing, setItem(key, value) { writes++; backing.setItem(key, value); } };
+  const session = new CampaignSession({ storage: store });
+  assert.equal(session.replay(1).replaying, true, 'an unlocked stage can be chosen before starting');
+  assert.equal(session.exitReplay().phase, 'idle');
+  const official = session.start();
+  const combat = official.combat;
+  const saved = store.getItem(STORAGE_KEY);
+  const writesBefore = writes;
+  for (const invalid of [0, 11, 56, '1', null, undefined]) {
+    const result = session.replay(invalid);
+    assert.equal(result.replaying, false);
+    assert.equal(result.replayLevel, null);
+    assert.equal(result.phase, official.phase);
+    assert.equal(result.combat, combat);
+    assert.equal(result.level.number, 11);
+    assert.equal(store.getItem(STORAGE_KEY), saved);
+    assert.equal(writes, writesBefore, 'a rejected selection never writes the save');
+  }
+  assert.equal(session.exitReplay().combat, combat, 'exiting when not practicing is also a no-op');
+  assert.equal(session.retryReplay().combat, combat);
+});
+
+test('a practice failure retries the selected stage with fresh ammo and restores the paused official fight', () => {
+  const cleared = Array.from({ length: 10 }, (_, index) => index + 1);
+  const store = seedProgress(11, 9, cleared);
+  const session = new CampaignSession({ storage: store });
+  const official = session.start();
+  const officialCombat = official.combat;
+  const hero = officialCombat.fighters[0];
+  hero.hp = 73;
+  hero.x = 427;
+  officialCombat.spearRemaining = 2;
+  session.specialKills = 2;
+  session.specialCharges = 1;
+  const saved = store.getItem(STORAGE_KEY);
+
+  let practice = session.replay(7);
+  assert.equal(practice.replaying, true);
+  assert.equal(practice.replayLevel, 7);
+  assert.equal(practice.level.number, 7);
+  assert.equal(practice.combat.fighters[0].hp, 100);
+  assert.equal(practice.spearRemaining, 5);
+  assert.equal(practice.specialEligible, true);
+  assert.equal(practice.specialCharges, 0);
+  assert.equal(session.start().combat, practice.combat,
+    'the ordinary start action cannot overwrite official progress during practice');
+  practice.combat.spearRemaining = 3;
+  assert.equal(knockOutWave(session).waveNumber, 2);
+  assert.equal(session.snapshot().spearRemaining, 3, 'waves share the practice-stage allowance');
+  session.combat.fighters[0].hp = 0;
+  const failed = session.step();
+  assert.equal(failed.phase, 'failed');
+  assert.equal(failed.failedLevel, 7);
+  assert.equal(failed.progress.currentLevel, 11);
+  assert.equal(failed.progress.deaths, 0);
+  assert.equal(failed.events.find((event) => event.type === 'campaign-fail').checkpointLevel, 7);
+  assert.equal(store.getItem(STORAGE_KEY), saved);
+
+  practice = session.retry();
+  assert.equal(practice.phase, 'playing');
+  assert.equal(practice.level.number, 7);
+  assert.equal(practice.combat.tick, 0);
+  assert.equal(practice.combat.fighters[0].hp, 100);
+  assert.equal(practice.spearRemaining, 5);
+  assert.equal(store.getItem(STORAGE_KEY), saved);
+  assert.equal(session.replay(2).level.number, 2, 'switching practice stages is allowed');
+  const practiceCombat = session.combat;
+  assert.equal(session.replay(11).combat, practiceCombat,
+    'an invalid selection during practice does not replace the scene or official backup');
+  assert.equal(session.snapshot().replayLevel, 2);
+  const restored = session.exitReplay();
+  assert.equal(restored.replaying, false);
+  assert.equal(restored.replayLevel, null);
+  assert.equal(restored.phase, 'playing');
+  assert.equal(restored.level.number, 11);
+  assert.equal(restored.combat, officialCombat, 'the official battle is resumed, not rebuilt');
+  assert.equal(restored.combat.fighters[0], hero);
+  assert.equal(hero.hp, 73);
+  assert.equal(hero.x, 427);
+  assert.equal(restored.spearRemaining, 2);
+  assert.equal(restored.specialKills, 2);
+  assert.equal(restored.specialCharges, 1);
+  assert.equal(store.getItem(STORAGE_KEY), saved);
+  assert.equal(new CampaignSession({ storage: store }).start().level.number, 11,
+    'a refresh during practice only ever sees the official save');
+});
+
+test('practice victory never unlocks the next stage and next cannot leave practice', () => {
+  const store = seedProgress(6, 5, [1, 2, 3, 4, 5]);
+  const session = new CampaignSession({ storage: store });
+  const official = session.start();
+  const saved = store.getItem(STORAGE_KEY);
+  const practice = session.replay(2);
+  assert.equal(practice.waveCount, 2);
+  assert.equal(knockOutWave(session).phase, 'playing');
+  const won = knockOutWave(session);
+  assert.equal(won.phase, 'cleared');
+  assert.equal(won.replaying, true);
+  assert.deepEqual(won.progress.cleared, [1, 2, 3, 4, 5]);
+  assert.equal(won.progress.currentLevel, 6);
+  assert.equal(won.progress.completed, false);
+  assert.equal(session.next().combat, won.combat);
+  assert.equal(session.next().phase, 'cleared');
+  assert.equal(store.getItem(STORAGE_KEY), saved);
+  assert.equal(session.retryReplay().phase, 'playing', 'a finished practice can be restarted');
+  assert.equal(session.exitReplay().combat, official.combat);
+  assert.equal(session.snapshot().level.number, 6);
+  assert.equal(store.getItem(STORAGE_KEY), saved);
+});
+
+test('leaving practice restores official failed and aftermath states without replay side effects', () => {
+  const store = seedProgress(2, 1, [1]);
+  const failed = new CampaignSession({ storage: store });
+  failed.start();
+  failed.combat.fighters[0].hp = 0;
+  const officialFailure = failed.step();
+  const saved = store.getItem(STORAGE_KEY);
+  assert.equal(officialFailure.phase, 'failed');
+  assert.equal(failed.replay(1).phase, 'playing');
+  assert.equal(failed.exitReplay().combat, officialFailure.combat);
+  assert.equal(failed.snapshot().phase, 'failed');
+  assert.equal(failed.snapshot().failedLevel, 2);
+  assert.equal(failed.snapshot().progress.deaths, 1);
+  assert.equal(store.getItem(STORAGE_KEY), saved);
+  assert.equal(failed.retry().level.number, 1, 'the official retry still follows its checkpoint');
+
+  const finishing = new CampaignSession({ storage: seedProgress(2, 1, [1]) });
+  finishing.start();
+  assert.equal(knockOutWave(finishing).waveNumber, 2);
+  const aftermath = knockOutWithHero(finishing, 1);
+  assert.equal(aftermath.phase, 'aftermath');
+  const deadline = finishing.aftermathUntilTick;
+  finishing.replay(1);
+  const restored = finishing.exitReplay();
+  assert.equal(restored.phase, 'aftermath');
+  assert.equal(restored.combat, aftermath.combat);
+  assert.equal(finishing.aftermathUntilTick, deadline);
+  while (finishing.phase === 'aftermath') finishing.step();
+  assert.equal(finishing.snapshot().phase, 'cleared');
+  assert.equal(finishing.snapshot().progress.currentLevel, 3);
+});
+
+test('final-stage practice preserves a completed save, and reset deliberately discards practice', () => {
+  const complete = { currentLevel: 56, checkpointLevel: 55, deaths: 4,
+    completed: true, cleared: Array.from({ length: 56 }, (_, index) => index + 1) };
+  const store = storage({ [STORAGE_KEY]: JSON.stringify(complete) });
+  const session = new CampaignSession({ storage: store });
+  const official = session.start();
+  assert.equal(official.phase, 'completed');
+  const saved = store.getItem(STORAGE_KEY);
+  assert.equal(session.replay(56).level.number, 56);
+  assert.equal(knockOutWave(session).phase, 'playing');
+  const victory = knockOutWave(session);
+  assert.equal(victory.phase, 'cleared');
+  assert.equal(victory.replaying, true);
+  assert.equal(victory.progress.completed, true);
+  assert.equal(session.exitReplay().phase, 'completed');
+  assert.equal(store.getItem(STORAGE_KEY), saved);
+  assert.equal(new CampaignSession({ storage: store }).start().phase, 'completed');
+
+  session.replay(1);
+  const reset = session.reset();
+  assert.equal(reset.replaying, false);
+  assert.equal(reset.phase, 'playing');
+  assert.equal(reset.level.number, 1);
+  assert.equal(reset.progress.deaths, 0);
+  assert.deepEqual(reset.progress.cleared, []);
+  assert.equal(session.exitReplay().phase, 'playing', 'reset clears the old official backup');
+});
+
 test('a 1920px stage uses its far half and never spawns enemies on a ground hazard', () => {
   const opening = new CampaignSession({ storage: storage() }).start();
   assert.equal(opening.combat.arena.width, 1920);

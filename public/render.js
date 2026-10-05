@@ -1811,6 +1811,32 @@ function drawWandererFace(ctx, head, expression, palette, defeated, attackStage)
   }
 }
 
+function drawWandererAvatar(ctx, head, avatar) {
+  if (!avatar || avatar.complete === false) return;
+  const width = Number(avatar.naturalWidth ?? avatar.width);
+  const height = Number(avatar.naturalHeight ?? avatar.height);
+  if (!Number.isFinite(width) || !Number.isFinite(height) || width <= 0 || height <= 0) return;
+
+  // Cover the face rather than stretching a portrait. The small upward bias
+  // keeps eyes in the large head when a tall camera photo includes shoulders.
+  const sourceSize = Math.min(width, height);
+  const sourceX = (width - sourceSize) / 2;
+  const sourceY = (height - sourceSize) * .35;
+  const radius = HEAD_RADIUS - 4;
+  ctx.save();
+  try {
+    ctx.beginPath();
+    ctx.arc(head[0], head[1], radius, 0, TAU);
+    ctx.clip();
+    ctx.drawImage(avatar, sourceX, sourceY, sourceSize, sourceSize,
+      head[0] - radius, head[1] - radius, radius * 2, radius * 2);
+  } catch {
+    // A revoked or detached image falls back to the existing painted face.
+  } finally {
+    ctx.restore();
+  }
+}
+
 function drawWandererScarf(ctx, head, palette) {
   const [x, y] = head;
   // A short front wrap sits below the mouth; the separate back ribbon above
@@ -1881,7 +1907,7 @@ function drawWandererHat(ctx, head) {
 }
 
 function drawFighter(ctx, fighter, index, groundY, tick, reducedMotion = false,
-  knockout = null, time = 0, expression = 'neutral', corpsePose = null) {
+  knockout = null, time = 0, expression = 'neutral', corpsePose = null, avatar = null) {
   const x = number(fighter.x, index ? 684 : 284);
   const y = number(fighter.y, groundY);
   const vx = number(fighter.vx);
@@ -2065,6 +2091,9 @@ function drawFighter(ctx, fighter, index, groundY, tick, reducedMotion = false,
   ctx.fillStyle = wanderer ? hit ? '#314954' : '#15252e' : core;
   ctx.fill();
   if (wanderer) {
+    // The photo is purely local paint inside the existing head; the outline,
+    // expressive eyes/mouth, scarf, hat and KO tomato remain above it.
+    drawWandererAvatar(ctx, head, avatar);
     ctx.beginPath();
     ctx.arc(head[0], head[1], HEAD_RADIUS - 1, Math.PI * .52, Math.PI * 1.42);
     ctx.strokeStyle = WANDERER_HAT.weave;
@@ -2293,6 +2322,8 @@ export function createRenderer(canvas) {
   let lastFighters = new Map();
   let lastTick = -1;
   let lastScene = '';
+  let lastSceneToken;
+  let avatar = null;
   let sceneTheme = 'forest';
   let worldWidth = W;
   let cameraX = 0;
@@ -2329,6 +2360,12 @@ export function createRenderer(canvas) {
     if (entry.failed || !entry.image.complete || !entry.image.naturalWidth) return null;
     if (!entry.readyAt) entry.readyAt = now();
     return entry;
+  }
+
+  function setAvatar(imageOrNull) {
+    // Never place an avatar in a fighter snapshot or the multiplayer protocol.
+    // A caller can replace/clear this local-only image at any time.
+    avatar = imageOrNull ?? null;
   }
 
   function effect(event) {
@@ -2640,7 +2677,8 @@ export function createRenderer(canvas) {
     const tick = number(state.tick);
     const motionTick = number(state.motionTick, tick);
     const scene = `${meta.mode || ''}:${theme}:${level || ''}`;
-    const sceneChanged = lastTick >= 0 && (tick < lastTick || scene !== lastScene);
+    const sceneChanged = lastTick >= 0 && (tick < lastTick || scene !== lastScene
+      || meta.sceneToken !== lastSceneToken);
     if (sceneChanged) {
       seenIds.clear();
       seenOrder.length = 0;
@@ -2660,6 +2698,7 @@ export function createRenderer(canvas) {
     const firstFrame = lastTick < 0 || sceneChanged;
     lastTick = tick;
     lastScene = scene;
+    lastSceneToken = meta.sceneToken;
     sceneTheme = theme;
     worldWidth = Math.max(W, number(arena.width, W));
     if (firstFrame) {
@@ -2675,6 +2714,13 @@ export function createRenderer(canvas) {
       { x: 295, y: groundY, vx: 0, facing: 1, hp: 100, grounded: true },
       { x: 675, y: groundY, vx: 0, facing: -1, hp: 100, grounded: true },
     ];
+    // Only the explicitly selected fighter on this client receives its own
+    // photo. In particular, team/index and incoming fighter data cannot make
+    // another player's image appear on a remote opponent.
+    const localFighterId = (meta.mode === 'campaign' || meta.mode === 'duel')
+      && meta.localFighterId != null ? String(meta.localFighterId) : null;
+    const avatarFor = (fighter) => avatar && localFighterId != null
+      && fighter?.kind === 'hero' && String(fighter.id) === localFighterId ? avatar : null;
     const player = meta.mode === 'campaign'
       ? fighters.find((fighter) => fighter?.team === 0) ?? fighters[0] : null;
     const cameraTarget = player ? clamp(number(player.x) - W / 2, 0, worldWidth - W) : 0;
@@ -2761,7 +2807,7 @@ export function createRenderer(canvas) {
       ctx.save();
       ctx.globalAlpha *= .88 * clamp((TOMATO_LIFE_MS - (time - knockout.born)) / 360, 0, 1);
       drawFighter(ctx, knockout.fighter, knockout.index, groundY, tick, knockout.reducedMotion,
-        knockout, time, 'sad');
+        knockout, time, 'sad', null, avatarFor(knockout.fighter));
       ctx.restore();
     }
     fighters.forEach((fighter, index) => {
@@ -2771,7 +2817,7 @@ export function createRenderer(canvas) {
       const knockout = number(current.hp, 100) <= 0 ? knockouts.get(String(current.id)) : null;
       drawFighter(ctx, knockout?.fighter ?? current, index, groundY, tick,
         knockout?.reducedMotion ?? reducedMotion, knockout, time,
-        expressionFor(current, state, meta));
+        expressionFor(current, state, meta), null, avatarFor(current));
       if (meta.mode === 'campaign') {
         drawSpearWindup(ctx, current, tick, reducedMotion, groundY, cameraX, worldWidth);
       }
@@ -2790,5 +2836,5 @@ export function createRenderer(canvas) {
       : [String(fighter.id), { fighter: { ...fighter }, index }]).filter(Boolean));
   }
 
-  return { render, effect };
+  return { render, effect, setAvatar };
 }

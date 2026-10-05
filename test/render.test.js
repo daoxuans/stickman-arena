@@ -54,11 +54,13 @@ function recordingCanvas() {
       rects.push({ x, y, w, h, color: drawing.fillStyle,
         originX: drawing.offsetX, originY: drawing.offsetY, scaleX: drawing.scaleX });
     },
-    drawImage(_image, ...args) {
-      images.push({ args, originX: drawing.offsetX, scaleX: drawing.scaleX });
+    drawImage(image, ...args) {
+      images.push({ image, args, originX: drawing.offsetX, originY: drawing.offsetY,
+        scaleX: drawing.scaleX, clip: drawing.clip, order: drawOrder++ });
     },
     fillText(value, x, y) { labels.push({ value, x, y, originX: drawing.offsetX }); },
     beginPath() { path = []; },
+    clip() { drawing.clip = [...path]; },
     moveTo(x, y) { path.push([x, y]); },
     lineTo(x, y) { path.push([x, y]); },
     bezierCurveTo(cx1, cy1, cx2, cy2, x, y) {
@@ -230,6 +232,126 @@ test('boss and reduced-motion settings preserve readable facial expressions', ()
     assert.equal(mouthCurve(expression), 0);
     assert.equal(expression.scaleX, -1.28, 'the enlarged boss expression mirrors with the head');
   }
+});
+
+test('a loaded local avatar is square-cropped inside the large head under expression, scarf and hat', () => {
+  for (const reducedMotion of [false, true]) {
+    const recording = recordingRenderer(reducedMotion);
+    const portrait = { complete: true, naturalWidth: 640, naturalHeight: 960 };
+    recording.renderer.setAvatar(portrait);
+    const hero = { ...fighter('hero', 2, 8, -1), id: 'hero', team: 0,
+      x: 330, hurtFlash: 2 };
+    recording.renderer.render({ tick: 40,
+      arena: { theme: 'land', groundY: 430, platforms: [], hazards: [] },
+      fighters: [hero] }, { mode: 'campaign', theme: 'land', level: 3,
+      localFighterId: 'hero' });
+
+    assert.equal(recording.images.length, 1, 'one local portrait is drawn once per frame');
+    const image = recording.images[0];
+    assert.equal(image.image, portrait);
+    assert.equal(image.scaleX, -1, 'a flipped fighter carries the portrait with the head');
+    assert.deepEqual(image.args.slice(0, 4), [0, 112, 640, 640],
+      'portrait is square-cropped without stretching');
+    const circle = image.clip?.find(({ kind }) => kind === 'arc');
+    assert.equal(circle?.radius, 18, 'the photo uses a real circular Canvas clip');
+    assert.deepEqual(image.args.slice(4), [circle.x - 18, circle.y - 18, 36, 36],
+      'the clipped portrait tracks the animated head exactly');
+    const head = heroHead(recording.fills);
+    const eye = recording.fills.find(({ color }) => color === SHADOW_WANDERER.p1.eye);
+    const hat = recording.fills.find(({ color }) => color === SHADOW_WANDERER.hatOutline);
+    const scarf = recording.fills.filter(({ color }) => color === SHADOW_WANDERER.p1.scarf).at(-1);
+    assert.ok(head.order < image.order && image.order < eye.order
+      && image.order < scarf.order && image.order < hat.order,
+    'the original outline and effort face stay legible above the portrait');
+    assert.equal(mouthCurve(mouth(recording.strokes, SHADOW_WANDERER.p1.eye)), 0);
+    assert.ok(recording.fills.some(({ color }) => color === SHADOW_WANDERER.p1.capeEdge),
+      'the dynamic red cloak is unchanged even under reduced motion');
+
+    recording.images.length = 0;
+    recording.strokes.length = 0;
+    recording.renderer.setAvatar(null);
+    recording.renderer.render({ tick: 41,
+      arena: { theme: 'land', groundY: 430, platforms: [], hazards: [] },
+      fighters: [hero] }, { mode: 'campaign', theme: 'land', level: 3,
+      localFighterId: 'hero' });
+    assert.equal(recording.images.length, 0, 'clearing the in-memory image restores drawn-only heads');
+    assert.equal(mouthCurve(mouth(recording.strokes, SHADOW_WANDERER.p1.eye)), 0,
+      'existing effort expression remains exactly available without a photo');
+
+    recording.renderer.setAvatar({ complete: false, naturalWidth: 640, naturalHeight: 960 });
+    recording.renderer.render({ tick: 42,
+      arena: { theme: 'land', groundY: 430, platforms: [], hazards: [] },
+      fighters: [hero] }, { mode: 'campaign', theme: 'land', level: 3,
+      localFighterId: 'hero' });
+    assert.equal(recording.images.length, 0, 'an undecoded image also falls back safely');
+  }
+});
+
+test('only the fighter selected by this local client receives its avatar in a duel', () => {
+  const recording = recordingRenderer();
+  const portrait = { complete: true, width: 400, height: 400 };
+  const hostilePortrait = { complete: true, width: 200, height: 200 };
+  recording.renderer.setAvatar(portrait);
+  const fighters = [
+    { ...fighter('hero', 0, 0), id: 'p1', team: 0, x: 330,
+      avatar: hostilePortrait },
+    { ...fighter('hero', 0, 0, -1), id: 'p2', team: 1, x: 630 },
+  ];
+  const state = (tick) => ({ tick,
+    arena: { theme: 'city', groundY: 430, platforms: [], hazards: [] },
+    fighters });
+  recording.renderer.render(state(40), { mode: 'duel', theme: 'city', localFighterId: 'p2' });
+  assert.equal(recording.images.length, 1);
+  assert.equal(recording.images[0].image, portrait);
+  assert.equal(recording.images[0].originX, 630);
+  assert.equal(recording.images[0].scaleX, -1);
+  recording.images.length = 0;
+  recording.renderer.render(state(41), { mode: 'duel', theme: 'city', localFighterId: null });
+  assert.equal(recording.images.length, 0, 'waiting/unassigned clients show no local photo');
+  recording.renderer.render(state(42), { mode: 'duel', theme: 'city', localFighterId: 'p1' });
+  assert.equal(recording.images.length, 1);
+  assert.equal(recording.images[0].originX, 330, 'local identity, not team or slot, chooses the head');
+  assert.equal(recording.images[0].image, portrait,
+    'an avatar attached to an incoming fighter snapshot is never trusted');
+  recording.images.length = 0;
+  recording.renderer.setAvatar(null);
+  recording.renderer.render(state(43), { mode: 'duel', theme: 'city', localFighterId: 'p2' });
+  assert.equal(recording.images.length, 0, 'local deletion removes photos from both duel heads');
+});
+
+test('the own KO echo keeps its avatar and tomato, then sceneToken clears old echoes', () => {
+  withClock((advance) => {
+    const recording = recordingRenderer(true);
+    const portrait = { complete: true, naturalWidth: 512, naturalHeight: 512 };
+    recording.renderer.setAvatar(portrait);
+    const hero = { ...fighter('hero', 0, 0), id: 'hero', team: 0 };
+    const arena = { theme: 'land', groundY: 430, platforms: [], hazards: [] };
+    const meta = { mode: 'campaign', theme: 'land', level: 3,
+      localFighterId: 'hero', sceneToken: 1 };
+    recording.renderer.render({ tick: 40, arena, fighters: [hero] }, meta);
+    recording.renderer.effect({ id: 'avatar-ko', type: 'ko', target: 'hero',
+      x: hero.x, y: hero.y - 40 });
+    advance(420);
+    recording.images.length = 0;
+    recording.fills.length = 0;
+    recording.renderer.render({ tick: 40, arena, fighters: [] }, meta);
+    assert.equal(recording.images.length, 1, 'our KO ghost still wears the chosen face');
+    const portraitPaint = recording.images[0];
+    const stain = recording.fills.find(({ color }) => color === '#702d2a');
+    assert.ok(stain && stain.order > portraitPaint.order,
+      'the rotten tomato remains on top of the fallen portrait and hat');
+
+    recording.images.length = 0;
+    recording.fills.length = 0;
+    recording.renderer.render({ tick: 40, arena, fighters: [] },
+      { ...meta, sceneToken: 2 });
+    assert.equal(recording.images.length, 0, 'a new run clears the previous avatar KO ghost');
+    assert.ok(!recording.fills.some(({ color }) => color === '#702d2a'),
+      'same level and tick still reset its stale tomato when the scene epoch advances');
+    recording.renderer.render({ tick: 41, arena, fighters: [hero] },
+      { ...meta, sceneToken: 2 });
+    assert.equal(recording.images.length, 1, 'clearing the scene does not erase the local selection');
+  });
 });
 
 function scrollingState(playerX, extras = {}) {

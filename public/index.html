@@ -35,6 +35,10 @@
 
       <div class="masthead-tools">
         <span id="session-status" class="session-status" role="status"><span class="status-dot" aria-hidden="true"></span>准备就绪</span>
+        <button id="avatar-open" class="icon-button avatar-button" type="button" aria-label="设置我的侠客头像，上传照片或拍照" title="设置我的侠客头像">
+          <span class="avatar-chip"><span id="avatar-chip-default">侠</span><img id="avatar-chip-photo" alt="" hidden></span>
+          <span class="avatar-button-text">我的头像</span>
+        </button>
         <button id="sound-toggle" class="icon-button sound-button" type="button" aria-label="切换声音（背景音乐与战斗音效）" aria-pressed="true" title="切换声音（背景音乐与战斗音效）">
           <svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M4 9v6h4l5 4V5L8 9H4Z"/><path d="M16 8.5a5 5 0 0 1 0 7M18.7 5.8a8.8 8.8 0 0 1 0 12.4"/></svg>
           <span>声音</span>
@@ -127,8 +131,9 @@
           <div id="map-grid" class="map-grid" role="group" aria-label="56关关卡选择">
             <p class="map-loading">关卡路线载入中…</p>
           </div>
-          <div class="map-legend"><span><i class="legend-dot legend-dot--current"></i>当前</span><span><i class="legend-dot legend-dot--checkpoint"></i>存档</span><span><i class="legend-dot legend-dot--locked"></i>未解锁</span></div>
-          <p class="panel-note">失败后会回到最近激活的存档原点。闯关进度不会被联机战绩改写。</p>
+          <div class="map-legend"><span><i class="legend-dot legend-dot--current"></i>主线当前</span><span><i class="legend-dot legend-dot--cleared"></i>已过可重打</span><span><i class="legend-dot legend-dot--checkpoint"></i>存档</span><span><i class="legend-dot legend-dot--locked"></i>未解锁</span></div>
+          <button id="replay-exit" class="button button--quiet button--wide replay-exit" type="button" hidden>退出重打 · 返回主线</button>
+          <p class="panel-note">点击已通过的关卡可重打一遍，不改变主线进度。主线失败仍回到最近存档原点；联机战绩不影响存档。</p>
         </div>
 
         <div id="duel-panel" class="panel-body duel-panel" hidden>
@@ -162,6 +167,34 @@
 
     <footer class="site-footer"><span>线斗 / STICK ARENA</span><span>按住方向键移动，找准时机出手。</span><span>闯关存档保存在本机</span></footer>
     <div id="toast" class="toast" role="status" aria-live="polite" hidden></div>
+    <dialog id="avatar-dialog" class="avatar-dialog" aria-labelledby="avatar-dialog-title" aria-describedby="avatar-privacy" hidden>
+      <div class="avatar-dialog__body">
+        <button id="avatar-close" class="avatar-dialog__close" type="button" aria-label="关闭头像设置">×</button>
+        <span class="avatar-dialog__eyebrow">YOUR WARRIOR</span>
+        <h2 id="avatar-dialog-title">我的侠客头像</h2>
+        <p id="avatar-privacy">上传照片或用相机拍一张，头像只保留在当前页面内存，不上传服务器、不传给对手；刷新页面后需重新选择。</p>
+        <div class="avatar-dialog__preview" aria-label="头像预览">
+          <span id="avatar-preview-default" aria-hidden="true">侠</span>
+          <img id="avatar-preview" alt="当前选择的头像" hidden>
+        </div>
+        <div class="avatar-dialog__actions">
+          <button id="avatar-upload" class="button button--signal" type="button">上传照片</button>
+          <button id="avatar-camera" class="button button--outline" type="button">打开相机拍照</button>
+          <button id="avatar-camera-fallback" class="button button--outline" type="button" hidden>改用系统相机或相册</button>
+          <input id="avatar-file" type="file" accept="image/jpeg,image/png,image/webp,image/heic,image/heif" aria-label="选择本地头像照片" hidden>
+          <input id="avatar-camera-file" type="file" accept="image/*" capture="user" aria-label="用系统相机拍摄头像" hidden>
+        </div>
+        <div id="avatar-camera-view" class="avatar-camera-view" hidden>
+          <video id="avatar-video" autoplay muted playsinline aria-label="相机实时预览"></video>
+          <div class="avatar-camera-view__actions">
+            <button id="avatar-shutter" class="button button--signal" type="button">拍照并使用</button>
+            <button id="avatar-stop-camera" class="button button--outline" type="button">关闭相机</button>
+          </div>
+        </div>
+        <p id="avatar-message" class="avatar-dialog__message" role="status" aria-live="polite">选择 JPG、PNG、WebP 或浏览器支持的 HEIC，最大 8 MB。</p>
+        <button id="avatar-reset" class="button button--outline avatar-reset" type="button">恢复默认头像</button>
+      </div>
+    </dialog>
   </div>
 </body>
 </html>
