@@ -1,9 +1,13 @@
 import { aiInput, cancelSpearAim, createCombatState, createFighter, stepCombat } from '../shared/combat.js';
+import { BOSS_EQUIPMENT, equipmentForBoss, getEquipment } from '../shared/equipment.js';
 import { MAX_LEVEL, checkpointFor, getLevel, isCheckpoint } from '../shared/levels.js';
 
 export const STORAGE_KEY = 'stickman-arena.campaign.v1';
 const SPECIAL_INVULNERABLE_TICKS = 36;
 const SCATTER_FINISH_TICKS = 36;
+const EQUIPMENT_PICKUP_DELAY_TICKS = 14;
+const EQUIPMENT_PICKUP_DISTANCE_X = 54;
+const EQUIPMENT_PICKUP_DISTANCE_Y = 42;
 
 const memoryValues = new Map();
 const memoryStorage = {
@@ -22,7 +26,25 @@ function defaultStorage() {
 }
 
 function freshProgress() {
-  return { currentLevel: 1, checkpointLevel: 1, deaths: 0, completed: false, cleared: [] };
+  return {
+    currentLevel: 1, checkpointLevel: 1, deaths: 0, completed: false, cleared: [],
+    equipment: [], checkpointEquipment: [], equippedEquipmentId: null,
+  };
+}
+
+function validEquipmentIds(value) {
+  if (!Array.isArray(value)) return [];
+  return [...new Set(value.filter((id) => getEquipment(id)))];
+}
+
+function legacyEquipment(cleared, beforeLevel, includeFinalBoss = false) {
+  return BOSS_EQUIPMENT.filter((item) => cleared.includes(item.bossLevel)
+    && (item.bossLevel < beforeLevel || (includeFinalBoss && item.bossLevel === MAX_LEVEL)))
+    .map((item) => item.id);
+}
+
+function availableSelection(id, equipment) {
+  return equipment.includes(id) ? id : equipment[0] ?? null;
 }
 
 function validProgress(value) {
@@ -34,12 +56,28 @@ function validProgress(value) {
   const cleared = Array.isArray(value.cleared)
     ? [...new Set(value.cleared.filter((number) => getLevel(number)))].sort((a, b) => a - b)
     : [];
+  const completed = value.completed === true && cleared.includes(MAX_LEVEL);
+  // Older saves predate equipment. Backfill only Bosses on the current formal
+  // route: cleared also remembers stages beyond a failed checkpoint rollback.
+  const equipment = Object.hasOwn(value, 'equipment')
+    ? validEquipmentIds(value.equipment).filter((id) => {
+      const bossLevel = getEquipment(id).bossLevel;
+      return cleared.includes(bossLevel) && (bossLevel < currentLevel || completed);
+    })
+    : legacyEquipment(cleared, currentLevel, completed);
+  const checkpointEquipment = Object.hasOwn(value, 'checkpointEquipment')
+    ? validEquipmentIds(value.checkpointEquipment).filter((id) => equipment.includes(id)
+      && getEquipment(id).bossLevel < checkpointLevel)
+    : legacyEquipment(cleared, checkpointLevel).filter((id) => equipment.includes(id));
   return {
     currentLevel,
     checkpointLevel,
     deaths: Number.isSafeInteger(value.deaths) && value.deaths >= 0 ? value.deaths : 0,
-    completed: value.completed === true && cleared.includes(MAX_LEVEL),
+    completed,
     cleared,
+    equipment,
+    checkpointEquipment,
+    equippedEquipmentId: availableSelection(value.equippedEquipmentId, equipment),
   };
 }
 
@@ -88,6 +126,9 @@ export class CampaignSession {
     this.replayLevel = null;
     this.officialState = null;
     this.#load();
+    this.inventory = [...this.progress.equipment];
+    this.equippedEquipmentId = this.progress.equippedEquipmentId;
+    this.droppedBossIds = new Set();
   }
 
   #load() {
@@ -125,7 +166,10 @@ export class CampaignSession {
       return this.snapshot();
     }
     const level = getLevel(this.progress.currentLevel);
-    if (isCheckpoint(level.number)) this.progress.checkpointLevel = level.number;
+    if (isCheckpoint(level.number) && this.progress.checkpointLevel !== level.number) {
+      this.progress.checkpointLevel = level.number;
+      this.progress.checkpointEquipment = [...this.inventory];
+    }
     return this.#startLevel(level, true);
   }
 
@@ -138,6 +182,7 @@ export class CampaignSession {
     this.specialCharges = 0;
     this.specialHeld = false;
     this.aftermathUntilTick = null;
+    this.droppedBossIds = new Set();
     this.phase = 'playing';
     const player = createFighter({
       id: 'hero', name: '火柴斗士', x: 170, y: level.groundY, team: 0, kind: 'hero', maxHp: 100,
@@ -145,6 +190,8 @@ export class CampaignSession {
     this.combat = createCombatState({
       mode: 'campaign', arena: copyArena(level), fighters: [player],
     });
+    this.combat.equipmentDrops = [];
+    this.combat.equippedEquipmentId = this.equippedEquipmentId;
     this.#spawnWave();
     if (saveProgress) this.#save();
     return this.snapshot();
@@ -160,16 +207,24 @@ export class CampaignSession {
         specialEligible: this.specialEligible, specialKills: this.specialKills,
         specialCharges: this.specialCharges, specialHeld: this.specialHeld,
         aftermathUntilTick: this.aftermathUntilTick,
+        inventory: this.inventory, equippedEquipmentId: this.equippedEquipmentId,
+        droppedBossIds: this.droppedBossIds,
       };
     }
+    // Switching between practice stages always starts with the same formal
+    // loadout, never a reward earned in another temporary replay.
+    this.inventory = [...this.officialState.inventory];
+    this.equippedEquipmentId = this.officialState.equippedEquipmentId;
     this.replayLevel = levelNumber;
     return this.#startLevel(getLevel(levelNumber), false);
   }
 
   /** Rebuild the selected practice level, irrespective of the saved checkpoint. */
   retryReplay() {
-    return this.replayLevel === null
-      ? this.snapshot() : this.#startLevel(getLevel(this.replayLevel), false);
+    if (this.replayLevel === null) return this.snapshot();
+    this.inventory = [...this.officialState.inventory];
+    this.equippedEquipmentId = this.officialState.equippedEquipmentId;
+    return this.#startLevel(getLevel(this.replayLevel), false);
   }
 
   /** Return to the exact official scene/result that was paused for practice. */
@@ -179,6 +234,88 @@ export class CampaignSession {
     this.officialState = null;
     this.replayLevel = null;
     return this.snapshot();
+  }
+
+  /** Select only a catalog item actually held in this run's backpack. */
+  selectEquipment(id) {
+    if (!this.inventory.includes(id) || !getEquipment(id)) return this.snapshot();
+    if (this.equippedEquipmentId === id) return this.snapshot();
+    this.equippedEquipmentId = id;
+    if (this.combat) this.combat.equippedEquipmentId = id;
+    // A newly picked item is still provisional until this stage is cleared.
+    // Selecting an already committed item can safely survive a page refresh.
+    if (this.replayLevel === null && this.progress.equipment.includes(id)) {
+      this.progress.equippedEquipmentId = id;
+      this.#save();
+    }
+    return this.snapshot();
+  }
+
+  #dropBossEquipment() {
+    const reward = equipmentForBoss(this.levelNumber);
+    if (!reward) return;
+    for (const outcome of this.combat.events) {
+      if (outcome.type !== 'ko' || this.droppedBossIds.has(outcome.target)) continue;
+      const boss = this.combat.fighters.find((fighter) => fighter.id === outcome.target);
+      if (!boss || boss.team !== 1 || boss.kind !== 'boss' || boss.hp > 0) continue;
+      this.droppedBossIds.add(boss.id);
+      const corpse = this.combat.corpses.find((body) => body.id === boss.id);
+      const drop = {
+        id: boss.id,
+        equipmentId: reward.id,
+        x: corpse?.x ?? boss.x,
+        y: corpse?.y ?? this.combat.arena.groundY,
+        spawnedTick: this.combat.motionTick,
+      };
+      this.combat.equipmentDrops.push(drop);
+      this.combat.events.push({
+        id: `${this.combat.tick}:equipment-drop:${boss.id}`, type: 'equipment-drop',
+        dropId: drop.id, equipmentId: drop.equipmentId, x: drop.x, y: drop.y,
+      });
+    }
+  }
+
+  #moveEquipmentDrops() {
+    for (const drop of this.combat.equipmentDrops) {
+      const corpse = this.combat.corpses.find((body) => body.id === drop.id);
+      if (corpse) {
+        // A Boss defeated on a moving plank takes its loot along until the
+        // body scatters or disappears; world-space drawing stays aligned.
+        drop.x = corpse.x;
+        drop.y = corpse.y;
+      } else if (drop.y < this.combat.arena.groundY) {
+        // Once its support is gone, the reward falls toward reachable ground.
+        drop.y = Math.min(this.combat.arena.groundY, drop.y + 7);
+      }
+    }
+  }
+
+  #collectEquipment(drop, auto = false) {
+    if (!this.combat.equipmentDrops.some((item) => item.id === drop.id)) return;
+    this.combat.equipmentDrops = this.combat.equipmentDrops.filter((item) => item.id !== drop.id);
+    const duplicate = this.inventory.includes(drop.equipmentId);
+    if (!duplicate) {
+      this.inventory.push(drop.equipmentId);
+      if (this.equippedEquipmentId === null) {
+        this.equippedEquipmentId = drop.equipmentId;
+        this.combat.equippedEquipmentId = drop.equipmentId;
+      }
+    }
+    this.combat.events.push({
+      id: `${this.combat.tick}:equipment-pickup:${drop.id}`, type: 'equipment-pickup',
+      dropId: drop.id, equipmentId: drop.equipmentId, x: drop.x, y: drop.y,
+      duplicate, auto,
+    });
+  }
+
+  #pickupNearby(player) {
+    if (player.hp <= 0) return;
+    for (const drop of [...this.combat.equipmentDrops]) {
+      if (this.combat.motionTick - drop.spawnedTick < EQUIPMENT_PICKUP_DELAY_TICKS
+        || Math.abs(player.x - drop.x) > EQUIPMENT_PICKUP_DISTANCE_X
+        || Math.abs(player.y - drop.y) > EQUIPMENT_PICKUP_DISTANCE_Y) continue;
+      this.#collectEquipment(drop);
+    }
   }
 
   #spawnWave() {
@@ -245,6 +382,9 @@ export class CampaignSession {
     player.spearAimY = null;
     player.attackBuffered = false;
     player.comboWindow = 0;
+    player.equipmentAttackId = null;
+    player.equipmentTick = 0;
+    player.equipmentHit = false;
     player.dodgeTicks = 0;
     player.invulnerable = Math.max(player.invulnerable, SPECIAL_INVULNERABLE_TICKS + 1);
     player.specialWaveTicks = SPECIAL_INVULNERABLE_TICKS;
@@ -294,6 +434,9 @@ export class CampaignSession {
     player.comboWindow = 0;
     player.kickType = null;
     player.kickTick = 0;
+    player.equipmentAttackId = null;
+    player.equipmentTick = 0;
+    player.equipmentHit = false;
     player.dodgeTicks = 0;
     player.jumpBuffer = 0;
     for (const fighter of this.combat.fighters) {
@@ -304,11 +447,16 @@ export class CampaignSession {
 
   #completeLevel() {
     const level = getLevel(this.levelNumber);
+    // The Boss's guaranteed reward cannot be missed just because it landed
+    // beyond the short walkable victory aftermath in the wide arena.
+    for (const drop of [...this.combat.equipmentDrops]) this.#collectEquipment(drop, true);
     if (this.replayLevel === null) {
       if (!this.progress.cleared.includes(level.number)) this.progress.cleared.push(level.number);
       this.progress.cleared.sort((a, b) => a - b);
       this.progress.completed = level.number === MAX_LEVEL;
       if (!this.progress.completed) this.progress.currentLevel = level.number + 1;
+      this.progress.equipment = [...this.inventory];
+      this.progress.equippedEquipmentId = this.equippedEquipmentId;
     }
     this.phase = this.replayLevel !== null ? 'cleared'
       : this.progress.completed ? 'completed' : 'cleared';
@@ -329,6 +477,8 @@ export class CampaignSession {
       stepCombat(this.combat, { [player.id]: {
         left: input.left === true, right: input.right === true, jump: input.jump === true,
       } });
+      if (this.combat.motionTick > beforeTick) this.#moveEquipmentDrops();
+      this.#pickupNearby(player);
       if (this.combat.motionTick > beforeTick && player.specialWaveTicks > 0) {
         player.specialWaveTicks--;
       }
@@ -348,11 +498,13 @@ export class CampaignSession {
       ? this.#castSpecial(player) : null;
     if (samplingInput) this.specialHeld = specialDown;
     const inputsById = { [player.id]: special
-      ? { ...input, attack: false, kick: false, dodge: false, spear: false } : input };
+      ? { ...input, attack: false, kick: false, dodge: false, spear: false, equipment: false } : input };
     for (const enemy of this.combat.fighters) {
       if (enemy.team === 1 && enemy.hp > 0) inputsById[enemy.id] = aiInput(enemy, player, this.combat);
     }
+    const beforeMotionTick = this.combat.motionTick;
     stepCombat(this.combat, inputsById);
+    if (this.combat.motionTick > beforeMotionTick) this.#moveEquipmentDrops();
     if (samplingInput && player.specialWaveTicks > 0) player.specialWaveTicks--;
     if (special) {
       this.combat.events.push({
@@ -387,7 +539,13 @@ export class CampaignSession {
       if (this.replayLevel === null) {
         this.progress.deaths++;
         this.progress.currentLevel = this.progress.checkpointLevel;
+        this.inventory = [...this.progress.checkpointEquipment];
+        this.equippedEquipmentId = availableSelection(this.progress.equippedEquipmentId, this.inventory);
+        this.progress.equipment = [...this.inventory];
+        this.progress.equippedEquipmentId = this.equippedEquipmentId;
       }
+      this.combat.equipmentDrops = [];
+      this.combat.equippedEquipmentId = this.equippedEquipmentId;
       this.phase = 'failed';
       this.combat.events.push({
         id: `${this.combat.tick}:campaign-fail`, type: 'campaign-fail',
@@ -395,18 +553,24 @@ export class CampaignSession {
         checkpointLevel: this.replayLevel ?? this.progress.checkpointLevel,
       });
       if (this.replayLevel === null) this.#save();
-    } else if (this.combat.fighters.every((fighter) => fighter.team === 0 || fighter.hp <= 0)) {
-      const level = getLevel(this.levelNumber);
-      if (this.waveIndex + 1 < level.waves.length) {
-        const nextWave = level.waves[this.waveIndex + 1];
-        const bossEntering = nextWave.groups.some((group) => group.kind === 'boss');
-        this.waveIndex++;
-        player.hp = Math.min(player.maxHp, player.hp + (bossEntering ? 30 : 12));
-        this.#spawnWave();
-      } else if (this.combat.events.some((outcome) => outcome.type === 'ko'
-        && this.combat.fighters.some((fighter) => fighter.id === outcome.target && fighter.team === 1))) {
-        this.#beginAftermath(player);
-      } else this.#completeLevel();
+    } else {
+      // A Boss may fall while its summoned minions remain alive. Reward the
+      // actual KO once, then leave ordinary wave progression to the live foes.
+      this.#dropBossEquipment();
+      this.#pickupNearby(player);
+      if (this.combat.fighters.every((fighter) => fighter.team === 0 || fighter.hp <= 0)) {
+        const level = getLevel(this.levelNumber);
+        if (this.waveIndex + 1 < level.waves.length) {
+          const nextWave = level.waves[this.waveIndex + 1];
+          const bossEntering = nextWave.groups.some((group) => group.kind === 'boss');
+          this.waveIndex++;
+          player.hp = Math.min(player.maxHp, player.hp + (bossEntering ? 30 : 12));
+          this.#spawnWave();
+        } else if (this.combat.events.some((outcome) => outcome.type === 'ko'
+          && this.combat.fighters.some((fighter) => fighter.id === outcome.target && fighter.team === 1))) {
+          this.#beginAftermath(player);
+        } else this.#completeLevel();
+      }
     }
     return this.snapshot();
   }
@@ -428,6 +592,9 @@ export class CampaignSession {
     this.officialState = null;
     this.replayLevel = null;
     this.progress = freshProgress();
+    this.inventory = [];
+    this.equippedEquipmentId = null;
+    this.droppedBossIds = new Set();
     try { this.storage.removeItem(this.storageKey); } catch { /* #save below will use fallback */ }
     return this.start();
   }
@@ -449,9 +616,15 @@ export class CampaignSession {
       specialKills: this.specialKills,
       specialCharges: this.specialCharges,
       spearRemaining: this.combat?.spearRemaining ?? 0,
+      inventory: [...this.inventory],
+      equippedEquipmentId: this.equippedEquipmentId,
       aftermathRemainingTicks: this.phase === 'aftermath'
         ? Math.max(0, this.aftermathUntilTick - this.combat.motionTick) : 0,
-      progress: { ...this.progress, cleared: [...this.progress.cleared] },
+      progress: {
+        ...this.progress, cleared: [...this.progress.cleared],
+        equipment: [...this.progress.equipment],
+        checkpointEquipment: [...this.progress.checkpointEquipment],
+      },
     };
   }
 }

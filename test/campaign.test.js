@@ -1,6 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { CampaignSession, STORAGE_KEY } from '../public/campaign.js';
+import { BOSS_EQUIPMENT, equipmentForBoss } from '../shared/equipment.js';
 import { MAX_LEVEL, THEMES, LEVELS, checkpointFor, getLevel, isCheckpoint } from '../shared/levels.js';
 import { createFighter } from '../shared/combat.js';
 
@@ -50,6 +51,47 @@ function knockOutWithHero(session, count) {
 
 function finishHitstop(session) {
   while (session.combat.hitstop > 0) session.step();
+}
+
+function enterBossWave(session) {
+  for (let wave = 0; wave < session.snapshot().waveCount; wave++) {
+    const boss = session.combat.fighters.find((fighter) => fighter.kind === 'boss' && fighter.hp > 0);
+    if (boss) return boss;
+    assert.equal(session.snapshot().phase, 'playing');
+    knockOutWave(session);
+  }
+  assert.fail('expected a live Boss in the final wave');
+}
+
+function knockOutBossWithHero(session) {
+  const boss = enterBossWave(session);
+  const hero = session.combat.fighters.find((fighter) => fighter.id === 'hero');
+  boss.x = hero.x + 40;
+  boss.y = hero.y;
+  boss.hp = 1;
+  boss.vx = boss.vy = 0;
+  boss.stun = 500;
+  boss.invulnerable = 0;
+  boss.wardTicks = 0;
+  boss.bossCast = null;
+  boss.grounded = true;
+  hero.attackStage = 1;
+  hero.attackTick = 4;
+  hero.hitIds = [];
+  hero.facing = 1;
+  hero.stun = 0;
+  const result = session.step();
+  assert.ok(result.events.some((event) => event.type === 'ko' && event.target === boss.id));
+  return { boss, hero, result };
+}
+
+function finishAftermath(session) {
+  let result;
+  for (let frame = 0; frame < 400 && session.phase === 'aftermath'; frame++) {
+    result = session.step();
+  }
+  assert.notEqual(session.phase, 'aftermath', 'victory aftermath eventually settles');
+  return result ?? session.snapshot();
 }
 
 test('all 56 stages have four ordered themes, unique scenes, valid waves and nine bosses', () => {
@@ -947,4 +989,300 @@ test('a real same-frame double KO still fails before starting an aftermath', () 
   assert.equal(result.phase, 'failed');
   assert.equal(result.combat.aftermath, false);
   assert.equal(result.progress.deaths, 1);
+});
+
+test('all nine Bosses drop their deterministic catalog reward on a real KO, before the wave settles', () => {
+  const bossLevels = [10, 14, 20, 28, 30, 40, 42, 50, 56];
+  assert.deepEqual(BOSS_EQUIPMENT.map((item) => item.bossLevel), bossLevels);
+  for (const levelNumber of bossLevels) {
+    const session = new CampaignSession({ storage: seedProgress(levelNumber, checkpointFor(levelNumber)) });
+    session.start();
+    const { boss, result } = knockOutBossWithHero(session);
+    const reward = equipmentForBoss(levelNumber);
+    assert.equal(result.phase, 'aftermath', `level ${levelNumber} pauses for the real KO`);
+    assert.equal(result.combat.equipmentDrops.length, 1, `level ${levelNumber} has a guaranteed drop`);
+    const [drop] = result.combat.equipmentDrops;
+    assert.equal(drop.equipmentId, reward.id);
+    assert.equal(drop.spawnedTick, result.combat.motionTick);
+    assert.equal(drop.x, boss.x);
+    assert.ok(result.events.some((event) => event.type === 'equipment-drop'
+      && event.equipmentId === reward.id && event.dropId === drop.id));
+    assert.deepEqual(result.inventory, [], 'the reward is not instantly granted before collection');
+    assert.deepEqual(result.progress.equipment, [], 'a KO alone does not write the save');
+    session.step();
+    assert.equal(session.combat.equipmentDrops.length, 1, 'hitstop does not duplicate the drop');
+  }
+});
+
+test('nearby pickup waits 14 effective ticks, equips the first reward and commits only on clear', () => {
+  const store = seedProgress(10, 9);
+  const session = new CampaignSession({ storage: store });
+  session.start();
+  const { result } = knockOutBossWithHero(session);
+  const [drop] = result.combat.equipmentDrops;
+  const reward = equipmentForBoss(10);
+  let collected;
+  while (session.combat.motionTick - drop.spawnedTick < 13) {
+    collected = session.step();
+    assert.deepEqual(collected.inventory, []);
+  }
+  collected = session.step();
+  assert.equal(collected.combat.motionTick - drop.spawnedTick, 14);
+  assert.deepEqual(collected.inventory, [reward.id]);
+  assert.equal(collected.equippedEquipmentId, reward.id);
+  assert.equal(collected.combat.equippedEquipmentId, reward.id);
+  assert.equal(collected.combat.equipmentDrops.length, 0);
+  assert.ok(collected.events.some((event) => event.type === 'equipment-pickup'
+    && event.equipmentId === reward.id && event.auto === false && event.duplicate === false));
+  assert.deepEqual(JSON.parse(store.getItem(STORAGE_KEY)).equipment, [],
+    'pickup is provisional until the stage finishes');
+  const clear = finishAftermath(session);
+  assert.equal(clear.phase, 'cleared');
+  assert.deepEqual(clear.progress.equipment, [reward.id]);
+  assert.deepEqual(new CampaignSession({ storage: store }).start().inventory, [reward.id]);
+});
+
+test('the Boss reward is automatically collected at clear if the player cannot cross the wide arena in time', () => {
+  const store = seedProgress(10, 9);
+  const session = new CampaignSession({ storage: store });
+  session.start();
+  const { hero, result } = knockOutBossWithHero(session);
+  assert.equal(result.combat.equipmentDrops.length, 1);
+  hero.x = 20;
+  const clear = finishAftermath(session);
+  assert.equal(clear.phase, 'cleared');
+  assert.deepEqual(clear.inventory, [equipmentForBoss(10).id]);
+  assert.equal(clear.combat.equipmentDrops.length, 0);
+  assert.ok(clear.events.some((event) => event.type === 'equipment-pickup'
+    && event.auto === true && event.duplicate === false));
+  assert.deepEqual(JSON.parse(store.getItem(STORAGE_KEY)).equipment, clear.inventory);
+});
+
+test('uncollected gear follows a Boss corpse on a moving platform, then falls after its support vanishes', () => {
+  const session = new CampaignSession({ storage: seedProgress(28, 27) });
+  session.start();
+  const { result } = knockOutBossWithHero(session);
+  const [drop] = result.combat.equipmentDrops;
+  const corpse = result.combat.corpses.find((body) => body.id === drop.id);
+  const platformIndex = result.combat.arena.platforms.findIndex((platform) =>
+    platform.motion === 'float' && platform.axis === 'x');
+  assert.ok(platformIndex >= 0);
+  corpse.platformIndex = platformIndex;
+  corpse.supportT = 0.5;
+  while (session.combat.motionTick < drop.spawnedTick + 8) session.step();
+  assert.equal(drop.x, corpse.x);
+  assert.equal(drop.y, corpse.y);
+  assert.ok(drop.x > 1000, 'the platform takes the world-space reward with it');
+  session.combat.corpses = [];
+  const formerY = drop.y;
+  session.combat.hitstop = 2;
+  session.step();
+  session.step();
+  assert.equal(drop.y, formerY, 'hitstop cannot advance the reward fall');
+  session.step();
+  assert.equal(drop.y, formerY + 7);
+});
+
+test('Boss KO drops equipment while its summoned minion still blocks completion; failure rolls it back', () => {
+  const store = seedProgress(20, 19);
+  const session = new CampaignSession({ storage: store });
+  session.start();
+  const boss = enterBossWave(session);
+  const hero = session.combat.fighters.find((fighter) => fighter.id === 'hero');
+  const minion = createFighter({
+    id: 'remaining-summon', name: '援兵', team: 1, kind: 'grunt',
+    x: hero.x + 500, y: hero.y, summonedBy: boss.id,
+  });
+  minion.stun = 500;
+  session.combat.fighters.push(minion);
+  const { result } = knockOutBossWithHero(session);
+  assert.equal(result.phase, 'playing');
+  assert.ok(result.combat.fighters.some((fighter) => fighter.id === minion.id && fighter.hp > 0));
+  assert.equal(result.combat.equipmentDrops.length, 1);
+  assert.ok(result.events.some((event) => event.type === 'equipment-drop'));
+  let picked = result;
+  for (let tick = 0; tick < 30 && session.combat.equipmentDrops.length; tick++) picked = session.step();
+  assert.deepEqual(picked.inventory, [equipmentForBoss(20).id]);
+  assert.equal(picked.phase, 'playing');
+  assert.deepEqual(JSON.parse(store.getItem(STORAGE_KEY)).equipment, []);
+  hero.hp = 0;
+  const failure = session.step();
+  assert.equal(failure.phase, 'failed');
+  assert.deepEqual(failure.inventory, []);
+  assert.deepEqual(failure.combat.equipmentDrops, []);
+  assert.deepEqual(failure.progress.equipment, []);
+  assert.equal(failure.progress.currentLevel, 19);
+  assert.deepEqual(session.retry().inventory, []);
+});
+
+test('same-frame Boss and hero KO fails without generating persistent or collectible loot', () => {
+  const store = seedProgress(10, 9);
+  const session = new CampaignSession({ storage: store });
+  session.start();
+  const boss = enterBossWave(session);
+  const hero = session.combat.fighters.find((fighter) => fighter.id === 'hero');
+  boss.x = hero.x + 40;
+  boss.y = hero.y;
+  boss.hp = 1;
+  boss.stun = 500;
+  boss.invulnerable = 0;
+  boss.wardTicks = 0;
+  hero.hp = 1;
+  hero.invulnerable = 0;
+  hero.hazardCooldown = 0;
+  hero.attackStage = 1;
+  hero.attackTick = 4;
+  hero.hitIds = [];
+  hero.facing = 1;
+  session.combat.arena.hazards.push({
+    x: hero.x - 20, y: hero.y - 14, w: 40, h: 14, damage: 10, type: 'test',
+  });
+  const failure = session.step();
+  assert.ok(failure.events.some((event) => event.type === 'ko' && event.target === boss.id));
+  assert.ok(failure.events.some((event) => event.type === 'ko' && event.target === hero.id));
+  assert.equal(failure.phase, 'failed');
+  assert.ok(!failure.events.some((event) => event.type === 'equipment-drop'));
+  assert.deepEqual(failure.combat.equipmentDrops, []);
+  assert.deepEqual(failure.inventory, []);
+  assert.deepEqual(JSON.parse(store.getItem(STORAGE_KEY)).equipment, []);
+});
+
+test('Boss equipment after a checkpoint is lost on failure, while entry to the next checkpoint secures it', () => {
+  const store = seedProgress(10, 9);
+  const session = new CampaignSession({ storage: store });
+  session.start();
+  knockOutBossWithHero(session);
+  assert.equal(finishAftermath(session).phase, 'cleared');
+  const levelTenReward = equipmentForBoss(10).id;
+  assert.deepEqual(session.snapshot().progress.equipment, [levelTenReward]);
+  assert.deepEqual(session.snapshot().progress.checkpointEquipment, []);
+  assert.equal(session.next().level.number, 11);
+  session.combat.fighters[0].hp = 0;
+  const failed = session.step();
+  assert.equal(failed.progress.currentLevel, 9);
+  assert.deepEqual(failed.inventory, []);
+  assert.deepEqual(failed.progress.equipment, []);
+  assert.equal(failed.equippedEquipmentId, null);
+  assert.deepEqual(new CampaignSession({ storage: store }).start().inventory, []);
+  const retry = session.retry();
+  assert.equal(retry.level.number, 9);
+  for (let wave = 0; wave < retry.waveCount; wave++) knockOutWave(session);
+  assert.equal(session.snapshot().phase, 'cleared');
+  assert.equal(session.next().level.number, 10);
+  const secondVictory = knockOutBossWithHero(session).result;
+  assert.equal(secondVictory.combat.equipmentDrops[0].equipmentId, levelTenReward,
+    'replaying the checkpoint route can earn back the lost unique item');
+
+  const laterStore = seedProgress(14, 13, Array.from({ length: 13 }, (_, index) => index + 1));
+  const later = new CampaignSession({ storage: laterStore });
+  later.start();
+  knockOutBossWithHero(later);
+  assert.equal(finishAftermath(later).phase, 'cleared');
+  const chapterReward = equipmentForBoss(14).id;
+  assert.ok(later.snapshot().inventory.includes(chapterReward));
+  const enteringCheckpoint = later.next();
+  assert.equal(enteringCheckpoint.level.number, 15);
+  assert.ok(enteringCheckpoint.progress.checkpointEquipment.includes(chapterReward));
+  later.combat.fighters[0].hp = 0;
+  const checkpointFailure = later.step();
+  assert.equal(checkpointFailure.progress.currentLevel, 15);
+  assert.ok(checkpointFailure.inventory.includes(chapterReward));
+  assert.ok(new CampaignSession({ storage: laterStore }).start().inventory.includes(chapterReward));
+});
+
+test('Boss practice may try equipment without changing the official backpack, selection, scene or save', () => {
+  const owned = equipmentForBoss(10).id;
+  const practiceReward = equipmentForBoss(14).id;
+  const cleared = Array.from({ length: 14 }, (_, index) => index + 1);
+  const store = storage({ [STORAGE_KEY]: JSON.stringify({
+    currentLevel: 15, checkpointLevel: 15, deaths: 0, completed: false, cleared,
+    equipment: [owned], checkpointEquipment: [owned], equippedEquipmentId: owned,
+  }) });
+  const session = new CampaignSession({ storage: store });
+  const official = session.start();
+  const originalCombat = official.combat;
+  const originalBackpack = session.inventory;
+  const saved = store.getItem(STORAGE_KEY);
+  const practice = session.replay(14);
+  assert.deepEqual(practice.inventory, [owned]);
+  assert.equal(practice.combat.equippedEquipmentId, owned);
+  const loot = knockOutBossWithHero(session).result;
+  assert.equal(loot.replaying, true);
+  assert.equal(loot.combat.equipmentDrops[0].equipmentId, practiceReward);
+  assert.equal(finishAftermath(session).phase, 'cleared');
+  assert.deepEqual(session.snapshot().inventory, [owned, practiceReward]);
+  assert.equal(session.selectEquipment(practiceReward).equippedEquipmentId, practiceReward);
+  assert.equal(session.snapshot().combat.equippedEquipmentId, practiceReward);
+  assert.equal(store.getItem(STORAGE_KEY), saved, 'practice never commits its picked item');
+  const retryPractice = session.retryReplay();
+  assert.deepEqual(retryPractice.inventory, [owned], 'retry drops gear earned in the previous practice attempt');
+  assert.equal(retryPractice.equippedEquipmentId, owned);
+  knockOutBossWithHero(session);
+  finishAftermath(session);
+  assert.ok(session.snapshot().inventory.includes(practiceReward));
+  assert.deepEqual(session.replay(10).inventory, [owned],
+    'switching practice stages cannot carry a temporary Boss reward');
+  const officialAgain = session.exitReplay();
+  assert.equal(officialAgain.combat, originalCombat);
+  assert.equal(session.inventory, originalBackpack, 'restore the original backpack object');
+  assert.deepEqual(officialAgain.inventory, [owned]);
+  assert.equal(officialAgain.equippedEquipmentId, owned);
+  assert.equal(officialAgain.combat.equippedEquipmentId, owned);
+  assert.equal(store.getItem(STORAGE_KEY), saved);
+});
+
+test('equipment selection rejects unknown gear, and an owned selection survives a reload', () => {
+  const first = equipmentForBoss(10).id;
+  const second = equipmentForBoss(14).id;
+  const cleared = Array.from({ length: 14 }, (_, index) => index + 1);
+  const store = storage({ [STORAGE_KEY]: JSON.stringify({
+    currentLevel: 15, checkpointLevel: 15, deaths: 0, completed: false, cleared,
+    equipment: [first, second], checkpointEquipment: [first, second], equippedEquipmentId: first,
+  }) });
+  const session = new CampaignSession({ storage: store });
+  session.start();
+  const before = store.getItem(STORAGE_KEY);
+  assert.equal(session.selectEquipment('earth-seal').equippedEquipmentId, first);
+  assert.equal(session.selectEquipment('not-real').equippedEquipmentId, first);
+  assert.equal(store.getItem(STORAGE_KEY), before);
+  assert.equal(session.selectEquipment(second).equippedEquipmentId, second);
+  assert.equal(session.combat.equippedEquipmentId, second);
+  assert.equal(new CampaignSession({ storage: store }).start().equippedEquipmentId, second);
+});
+
+test('legacy saves backfill only cleared Bosses still on the formal route; corrupted equipment is ignored', () => {
+  const throughThirty = Array.from({ length: 30 }, (_, index) => index + 1);
+  const saved = seedProgress(31, 29, throughThirty);
+  const backfilled = new CampaignSession({ storage: saved }).start();
+  assert.deepEqual(backfilled.inventory, BOSS_EQUIPMENT.filter((item) => item.bossLevel <= 30)
+    .map((item) => item.id));
+  assert.deepEqual(backfilled.progress.checkpointEquipment,
+    BOSS_EQUIPMENT.filter((item) => item.bossLevel < 29).map((item) => item.id));
+  assert.deepEqual(JSON.parse(saved.getItem(STORAGE_KEY)).equipment, backfilled.inventory,
+    'an old save is upgraded without permanently withholding earlier rewards');
+
+  const rolledBack = seedProgress(29, 29, throughThirty);
+  const restored = new CampaignSession({ storage: rolledBack }).start();
+  assert.ok(!restored.inventory.includes(equipmentForBoss(30).id),
+    'cleared remembers the former win but the checkpoint rollback does not keep its gear');
+  const finished = storage({ [STORAGE_KEY]: JSON.stringify({
+    currentLevel: 56, checkpointLevel: 55, deaths: 0, completed: true,
+    cleared: Array.from({ length: 56 }, (_, index) => index + 1),
+  }) });
+  const completed = new CampaignSession({ storage: finished }).start();
+  assert.equal(completed.phase, 'completed');
+  assert.equal(completed.inventory.length, 9);
+  assert.ok(completed.inventory.includes(equipmentForBoss(56).id));
+
+  const corrupt = storage({ [STORAGE_KEY]: JSON.stringify({
+    currentLevel: 11, checkpointLevel: 9, deaths: 0, completed: false,
+    cleared: Array.from({ length: 10 }, (_, index) => index + 1),
+    equipment: ['fake-item', equipmentForBoss(56).id, equipmentForBoss(10).id, equipmentForBoss(10).id],
+    checkpointEquipment: [equipmentForBoss(10).id, 'fake-item'],
+    equippedEquipmentId: equipmentForBoss(56).id,
+  }) });
+  const sanitized = new CampaignSession({ storage: corrupt }).start();
+  assert.deepEqual(sanitized.inventory, [equipmentForBoss(10).id]);
+  assert.deepEqual(sanitized.progress.checkpointEquipment, []);
+  assert.equal(sanitized.equippedEquipmentId, equipmentForBoss(10).id);
 });

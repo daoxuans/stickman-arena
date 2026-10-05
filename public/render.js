@@ -1,6 +1,7 @@
 import { attackOf, kickOf, TICK_RATE, SPEAR_GRAVITY, SPEAR_MAX_ANGLE, SPEAR_MIN_ANGLE,
   SPEAR_WINDUP_TICKS, spearAimedFlight, spearFlight, spearOrigin,
   spearTrajectoryPoint } from '../shared/combat.js';
+import { getEquipment } from '../shared/equipment.js';
 import { platformPose } from '../shared/platforms.js';
 
 // The viewport is 960 × 540, while campaign world coordinates may span 1920px.
@@ -751,6 +752,122 @@ function drawRock(ctx, projectile, reducedMotion) {
     [radius * .4, -radius * .48], [radius * .62, radius * .13],
     [radius * .06, radius * .48]], face);
   line(ctx, [[-radius * .28, -radius * .34], [radius * .28, -radius * .29]], '#f8dfb8', 1.5);
+  ctx.restore();
+}
+
+function drawEquipmentMark(ctx, equipment, x, y) {
+  const color = equipment.color;
+  if (equipment.style === 'pierce') {
+    line(ctx, [[x - 7, y + 7], [x + 5, y - 5]], color, 2.8);
+    polygon(ctx, [[x + 3, y - 9], [x + 10, y - 10], [x + 9, y - 3], [x + 5, y - 5]], '#f7f6df');
+  } else if (equipment.style === 'pulse') {
+    ctx.beginPath();
+    ctx.arc(x, y, 7, 0, TAU);
+    ctx.strokeStyle = color;
+    ctx.lineWidth = 2.8;
+    ctx.stroke();
+    ellipse(ctx, x, y, 2.4, 2.4, '#f7f6df');
+  } else {
+    ctx.beginPath();
+    ctx.moveTo(x - 8, y + 6);
+    ctx.bezierCurveTo(x - 1, y - 10, x + 5, y - 8, x + 9, y - 5);
+    ctx.strokeStyle = color;
+    ctx.lineWidth = 3.5;
+    ctx.lineCap = 'round';
+    ctx.stroke();
+    line(ctx, [[x - 8, y + 5], [x - 3, y + 9]], '#f7f6df', 2);
+  }
+}
+
+function drawEquipmentDrop(ctx, drop, motionTick, reducedMotion) {
+  const equipment = getEquipment(drop?.equipmentId);
+  if (!equipment || !Number.isFinite(drop?.x) || !Number.isFinite(drop?.y)) return;
+  const x = drop.x;
+  const floorY = drop.y;
+  // The saved drop uses a walkable-surface coordinate. Its icon stays just
+  // above that surface, so platforms and camera movement never detach it.
+  const bob = reducedMotion ? 0 : Math.sin((motionTick - number(drop.spawnedTick)) * .13) * 2.3;
+  ellipse(ctx, x, floorY + 2, 19, 4, 'rgba(15,36,35,.5)');
+  ctx.save();
+  ctx.translate(x, floorY - 18 + bob);
+  polygon(ctx, [[0, -17], [15, -9], [17, 7], [0, 15], [-17, 7], [-15, -9]], '#173739');
+  polygon(ctx, [[0, -14], [12, -7], [14, 5], [0, 12], [-14, 5], [-12, -7]], equipment.color);
+  ellipse(ctx, 0, -1, 10.5, 9, '#234143');
+  drawEquipmentMark(ctx, equipment, 0, -1);
+  const tier = clamp(Math.floor(number(equipment.tier, 1)), 1, 5);
+  for (let index = 0; index < tier; index++) {
+    const tickX = (index - (tier - 1) / 2) * 5;
+    line(ctx, [[tickX, 17], [tickX, 19]], equipment.color, 1.7);
+  }
+  if (!reducedMotion) {
+    // Tiny fixed-frame glints help a drop stand out over photos without a
+    // flashing halo or a misleading extra hazard warning.
+    const glint = Math.sin((motionTick - number(drop.spawnedTick)) * .08);
+    ctx.globalAlpha = .35 + .18 * glint;
+    line(ctx, [[-22, -4], [-19, -4]], '#f7f6df', 1.5);
+    line(ctx, [[20, 0], [23, 0]], '#f7f6df', 1.5);
+  }
+  ctx.restore();
+}
+
+function drawEquipmentAttack(ctx, hand, equipment, tick, reducedMotion) {
+  const active = tick >= equipment.activeFrom && tick <= equipment.activeTo;
+  const color = equipment.color;
+  const x = hand[0];
+  const y = hand[1];
+  const extension = active ? 1 : tick < equipment.activeFrom ? .58 : .76;
+  ctx.save();
+  if (equipment.style === 'pierce') {
+    // At contact, the tip reaches the same forward edge used by combat. Keep
+    // the shorter pose during windup/recovery so it reads as a committed thrust.
+    const tipX = active ? Math.max(x + 30, equipment.reach - 4) : x + 30 * extension;
+    line(ctx, [[x - 13, y + 3], [tipX - 7, y - 4]], '#15373a', 6);
+    line(ctx, [[x - 11, y + 2], [tipX + 1, y - 5]], color, 2.8);
+    polygon(ctx, [[tipX - 9, y - 10], [tipX + 4, y - 5], [tipX - 9, y + 1], [tipX - 5, y - 5]],
+      '#f7f6df');
+    if (active && !reducedMotion) line(ctx, [[tipX - 6, y - 14], [tipX + 4, y - 14]], color, 1.6);
+  } else if (equipment.style === 'pulse') {
+    // The active ring touches an enemy at the farthest legal contact point;
+    // its focus stays attached to the hand rather than flying as a projectile.
+    const focusX = active ? Math.max(x + 26, equipment.reach - 13) : x + 26 * extension;
+    line(ctx, [[x - 3, y + 1], [focusX - 10, y]], '#173739', 5);
+    line(ctx, [[x, y], [focusX - 10, y]], color, 2.4);
+    ctx.beginPath();
+    ctx.arc(focusX, y, active ? 13 : 9, 0, TAU);
+    ctx.strokeStyle = color;
+    ctx.lineWidth = active ? 3.1 : 2.2;
+    ctx.stroke();
+    ellipse(ctx, focusX, y, active ? 4 : 3, active ? 4 : 3, '#f7f6df');
+    if (active && !reducedMotion) {
+      ctx.globalAlpha = .48;
+      ctx.beginPath();
+      ctx.arc(focusX, y, 18, -1.05, 1.05);
+      ctx.strokeStyle = color;
+      ctx.lineWidth = 2.3;
+      ctx.stroke();
+    }
+  } else {
+    const bladeX = active ? Math.max(x + 19, equipment.reach - 20) : x + 19 * extension;
+    line(ctx, [[x - 8, y + 7], [bladeX - 3, y - 2]], '#173739', 5.8);
+    line(ctx, [[x - 6, y + 6], [bladeX - 3, y - 2]], color, 2.6);
+    ctx.beginPath();
+    ctx.moveTo(bladeX - 3, y - 3);
+    ctx.bezierCurveTo(bladeX + 7, y - 18, bladeX + 19, y - 12, bladeX + 20, y - 1);
+    ctx.strokeStyle = '#f7f6df';
+    ctx.lineWidth = 4.5;
+    ctx.stroke();
+    ctx.strokeStyle = color;
+    ctx.lineWidth = 2.2;
+    ctx.stroke();
+    if (active && !reducedMotion) {
+      ctx.globalAlpha = .52;
+      ctx.beginPath();
+      ctx.arc(x + 11, y + 1, 31, -.95, .38);
+      ctx.strokeStyle = color;
+      ctx.lineWidth = 2.5;
+      ctx.stroke();
+    }
+  }
   ctx.restore();
 }
 
@@ -1910,7 +2027,8 @@ function drawWandererHat(ctx, head) {
 }
 
 function drawFighter(ctx, fighter, index, groundY, tick, reducedMotion = false,
-  knockout = null, time = 0, expression = 'neutral', corpsePose = null, avatar = null) {
+  knockout = null, time = 0, expression = 'neutral', corpsePose = null, avatar = null,
+  campaignEquipment = false) {
   const x = number(fighter.x, index ? 684 : 284);
   const y = number(fighter.y, groundY);
   const vx = number(fighter.vx);
@@ -1938,6 +2056,13 @@ function drawFighter(ctx, fighter, index, groundY, tick, reducedMotion = false,
   const figureScale = boss ? 1.28 : 1;
   const invulnerable = Boolean(fighter.invulnerable) || dodge;
   const defeated = number(fighter.hp, 100) <= 0;
+  const equipmentTick = number(fighter.equipmentTick);
+  const equipment = campaignEquipment && wanderer && !defeated && equipmentTick > 0
+    ? getEquipment(fighter.equipmentAttackId) : null;
+  const equipping = Boolean(equipment);
+  const equipmentActive = equipping && equipmentTick >= equipment.activeFrom
+    && equipmentTick <= equipment.activeTo;
+  const equipmentWindup = equipping && equipmentTick < equipment.activeFrom;
   const spearing = (number(fighter.spearWindup) > 0 || fighter.spearAiming === true) && !defeated;
   const waveCasting = number(fighter.specialWaveTicks) > 19 && !defeated;
   const bossWindup = boss && attacking
@@ -1972,7 +2097,8 @@ function drawFighter(ctx, fighter, index, groundY, tick, reducedMotion = false,
 
   const stride = grounded && !stun ? Math.sin(tick * .29 + index) * clamp(Math.abs(vx) / 3.2, 0, 1) : 0;
   const bob = grounded && !defeated ? Math.abs(stride) * 2 + Math.sin(tick * .065 + index) * 1.2 : 0;
-  const lean = dodge ? 13 : waveCasting ? -4 : bossWindup ? -7 : airKick ? 11 : kicking ? -5
+  const lean = dodge ? 13 : waveCasting ? -4 : bossWindup ? -7 : equipping ? (equipmentWindup ? -4 : 8)
+    : airKick ? 11 : kicking ? -5
     : attacking ? 6 : stun ? -9 : clamp(vx * 1.05, -6, 6);
   const hip = [lean * .45, -(leaper ? 40 : 36) - bob];
   const shoulder = [lean, -68 - bob];
@@ -2014,9 +2140,11 @@ function drawFighter(ctx, fighter, index, groundY, tick, reducedMotion = false,
 
   const rearElbow = waveCasting ? [10 + lean * .4, -61 - bob]
     : slinger && !attacking && !kicking ? [-15 + lean * .4, -68 - bob]
+    : equipping ? [-14 + lean * .4, -63 - bob]
     : kicking ? [-13 + lean * .5, -65 - bob] : [-13 + lean * .5, -55 - bob];
   const rearHand = waveCasting ? [31 + lean * .3, -49 - bob]
     : slinger && !attacking && !kicking ? [-22 + lean * .3, -79 - bob]
+    : equipping ? [-23 + lean * .4, -46 - bob]
     : kicking ? [-8 + lean * .4, -75 - bob]
     : [-19 + lean * .42, attacking ? -36 - bob : -39 - bob];
   bone(ctx, [shoulder, rearElbow, rearHand], outline, core, 4.2);
@@ -2129,12 +2257,16 @@ function drawFighter(ctx, fighter, index, groundY, tick, reducedMotion = false,
   const reach = strikeActive ? 25 + 25 * clamp((attackTick - strike.activeFrom + 1) / 2, 0, 1)
     : recovery ? 50 - 28 * recovery : 12;
   const armHeight = attackStage === 2 ? -4 : attackStage === 3 ? 5 : 0;
+  const equipmentExtension = equipmentActive ? 1 : equipmentWindup ? .05 : .57;
+  const equipmentHandX = equipping ? 20 + clamp(equipment.reach * .32, 24, 40) * equipmentExtension : 0;
   const frontElbow = waveCasting ? [22 + lean * .3, -63 - bob]
+    : equipping ? [equipmentWindup ? 5 : 22 + equipmentHandX * .25, -70 - bob]
     : kicking ? [15 + lean * .3, -64 - bob]
     : spearing ? [14 + lean * .3, -68 - bob]
     : bossWindup ? [-3 + lean * .5, -72 - bob]
     : attacking ? [12 + reach * .23 + lean * .35, -68 - bob + armHeight * .5] : [15 + lean * .5, -55 - bob];
   const frontHand = waveCasting ? [41 + lean * .2, -50 - bob]
+    : equipping ? [equipmentHandX, (equipmentWindup ? -82 : equipment.style === 'pulse' ? -55 : -66) - bob]
     : kicking ? [20 + lean * .25, -80 - bob]
     : spearing ? [26 + lean * .2, -65 - bob]
     : bossWindup ? [-12 + lean * .5, -57 - bob]
@@ -2154,6 +2286,7 @@ function drawFighter(ctx, fighter, index, groundY, tick, reducedMotion = false,
     ellipse(ctx, rearHand[0] - 2, rearHand[1] - 5, 7.5, 6.2, '#3d4c4e');
     ellipse(ctx, rearHand[0] - 3, rearHand[1] - 7, 3.5, 2.1, '#e1caa5');
   }
+  if (equipping) drawEquipmentAttack(ctx, frontHand, equipment, equipmentTick, reducedMotion);
 
   if (bossWindup) {
     drawBossWindup(ctx, {
@@ -2161,7 +2294,9 @@ function drawFighter(ctx, fighter, index, groundY, tick, reducedMotion = false,
       activeFrom: strike.activeFrom, stage: attackStage, bob, reducedMotion,
     });
   }
-  if (strikeActive && !defeated) drawPunchWind(ctx, frontHand, strike, attackStage, attackTick, index, reducedMotion, boss);
+  if (strikeActive && !defeated && !equipping) {
+    drawPunchWind(ctx, frontHand, strike, attackStage, attackTick, index, reducedMotion, boss);
+  }
   if (number(fighter.specialWaveTicks) > 0 && !defeated) {
     const pulse = reducedMotion ? 0 : Math.sin(tick * .4) * 2;
     ctx.save();
@@ -2379,9 +2514,12 @@ export function createRenderer(canvas) {
     const type = String(event.type || '').toLowerCase();
     if (!['hit', 'dodge', 'land', 'ko', 'bones-scatter', 'kick', 'jump-kick', 'special-wave', 'fall-impact',
       'spear-windup', 'spear-throw', 'spear-impact',
+      'equipment-swing', 'equipment-pickup',
       'rock-windup', 'rock-throw', 'rock-impact', 'boss-rock-windup', 'boss-rock-throw',
       'boss-summon-windup', 'boss-summon', 'boss-quake-windup', 'boss-quake',
       'boss-ward-windup', 'boss-ward', 'boss-ward-hit'].includes(type)) return;
+    if (lastScene.startsWith('duel:') && (type.startsWith('equipment-')
+      || type === 'hit' && event.delivery === 'equipment')) return;
 
     const stamp = now();
     const stableId = event.id ?? event.eventId ?? event.uid;
@@ -2449,6 +2587,20 @@ export function createRenderer(canvas) {
           (seed * 31 + character.charCodeAt(0)) % 997, 0),
       });
       if (boneBursts.size > 24) boneBursts.delete(boneBursts.keys().next().value);
+      return;
+    }
+    if (type === 'equipment-swing') {
+      // The weapon is drawn from the fixed-frame fighter pose, so a duplicate
+      // wall-clock slash would continue moving through hitstop and pauses.
+      return;
+    }
+    if (type === 'equipment-pickup') {
+      const equipment = getEquipment(event.equipmentId);
+      if (!equipment) return;
+      rings.push({ x: clamp(number(event.x, x), -50, Math.max(worldWidth + 50, 4096)),
+        y: number(event.y, y) - 18, born: stamp, life: 360,
+        radius: 29, color: equipment.color, type, calm: reducedMotion });
+      if (rings.length > 45) rings.splice(0, rings.length - 45);
       return;
     }
     if (type === 'special-wave') {
@@ -2547,12 +2699,14 @@ export function createRenderer(canvas) {
     const ultimate = type === 'jump-kick';
     const heavy = type === 'hit' && Boolean(event.heavy);
     const specialHit = type === 'hit' && event.special === true;
+    const equipmentHit = type === 'hit' && event.delivery === 'equipment';
     const fallingImpact = type === 'fall-impact';
-    const targetX = specialHit ? clamp(number(event.x, x), -50, Math.max(worldWidth + 50, 4096)) : x;
+    const targetX = specialHit || equipmentHit
+      ? clamp(number(event.x, x), -50, Math.max(worldWidth + 50, 4096)) : x;
     const source = specialHit ? lastFighters.get(String(event.source))?.fighter : null;
     const facing = specialHit ? targetX < number(source?.x, targetX) ? -1 : 1
       : number(event.facing, 1) < 0 ? -1 : 1;
-    if (type === 'hit' && !specialHit && !['spear', 'rock', 'quake'].includes(event.delivery)
+    if (type === 'hit' && !specialHit && !['spear', 'rock', 'quake', 'equipment'].includes(event.delivery)
       && !String(event.source ?? '').startsWith('hazard:')) {
       const source = lastFighters.get(String(event.source))?.fighter;
       const direction = number(event.facing, number(source?.facing, 1)) < 0 ? -1 : 1;
@@ -2568,12 +2722,13 @@ export function createRenderer(canvas) {
     // is the fighter's torso, so shift only the decoration toward the foot.
     const fx = ultimate ? clamp(x + facing * 84, 0, worldWidth) : targetX;
     const fy = ultimate ? clamp(y + 10, 0, H) : y;
-    const count = reducedMotion ? 5 : ultimate ? 20
+    const count = equipmentHit ? 0 : reducedMotion ? 5 : ultimate ? 20
       : specialHit ? 11 : fallingImpact ? 8 : heavy ? 18
         : type === 'hit' ? 12 : type === 'land' ? 10 : type === 'kick' ? 7 : 9;
     const speed = ultimate ? 205 : fallingImpact ? 75 : type === 'hit' ? 180
       : type === 'dodge' ? 80 : 60;
-    const palette = ultimate ? ['#eaffec', '#8de9df', '#f5d995']
+    const palette = equipmentHit ? [getEquipment(event.equipmentId)?.color ?? '#b5edb0']
+      : ultimate ? ['#eaffec', '#8de9df', '#f5d995']
       : specialHit ? ['#eafff4', '#80e4df', '#d9f8ed']
         : fallingImpact ? ['#f8e7c7', '#cbd7ca', '#a6bdba']
       : type === 'dodge' ? ['#e9f9df', '#8bbec0', '#c1e6d6']
@@ -2593,12 +2748,12 @@ export function createRenderer(canvas) {
         dust: type === 'land' || type === 'dodge' || fallingImpact });
     }
     rings.push({ x: fx, y: fy, born: stamp,
-      life: ultimate ? 320 : fallingImpact ? 220 : type === 'kick' ? 190 : type === 'hit' ? 250 : 300,
-      radius: ultimate ? 66 : fallingImpact ? 28 : heavy ? 57 : type === 'hit' ? 43 : type === 'kick' ? 25 : 34,
-      color: palette[0], type: specialHit ? 'special-hit' : type, facing,
+      life: equipmentHit ? 220 : ultimate ? 320 : fallingImpact ? 220 : type === 'kick' ? 190 : type === 'hit' ? 250 : 300,
+      radius: equipmentHit ? 28 : ultimate ? 66 : fallingImpact ? 28 : heavy ? 57 : type === 'hit' ? 43 : type === 'kick' ? 25 : 34,
+      color: palette[0], type: equipmentHit ? 'equipment-hit' : specialHit ? 'special-hit' : type, facing,
       tint: specialHit ? SPIRIT_TINTS[sceneTheme] : undefined,
       calm: specialHit && reducedMotion });
-    if (!reducedMotion && (type === 'hit' || ultimate)) {
+    if (!reducedMotion && ((type === 'hit' && !equipmentHit) || ultimate)) {
       shakeStrength = ultimate ? 4 : clamp(3 + number(event.damage) * .13, 3, heavy ? 8 : 7);
       shakeUntil = stamp + (ultimate ? 150 : 220);
     }
@@ -2607,18 +2762,20 @@ export function createRenderer(canvas) {
     if (rings.length > 45) rings.splice(0, rings.length - 45);
   }
 
-  function drawEffects(time) {
+  function drawEffects(time, mode) {
     for (let i = rings.length - 1; i >= 0; i--) {
       const item = rings[i];
       const progress = (time - item.born) / item.life;
       if (progress >= 1) { rings.splice(i, 1); continue; }
+      if (mode !== 'campaign' && item.type.startsWith('equipment-')) continue;
       if (item.type === 'special-wave') {
         drawSpiritWave(ctx, item, clamp(progress, 0, 1), worldWidth, reducedMotion);
         continue;
       }
       if (drawBossEffect(ctx, item, clamp(progress, 0, 1), reducedMotion, worldWidth)) continue;
       ctx.save();
-      ctx.globalAlpha = (1 - progress) * (item.type === 'hit' || item.type === 'jump-kick' ? .74 : .45);
+      ctx.globalAlpha = (1 - progress) * (item.type === 'hit' || item.type === 'jump-kick'
+        || item.type === 'equipment-pickup' ? .74 : .45);
       ctx.beginPath();
       // Under the system's reduced-motion preference, keep one fixed ring
       // rather than expanding it across the figure while the cue fades.
@@ -2778,6 +2935,13 @@ export function createRenderer(canvas) {
     drawTiledWorld(ctx, worldWidth, () => drawGround(ctx, theme, groundY, tick, seed,
       Boolean(photo) && theme === 'land'));
     drawPlatforms(ctx, arena.platforms, theme, motionTick);
+    if (meta.mode === 'campaign') {
+      for (const drop of Array.isArray(state.equipmentDrops) ? state.equipmentDrops : []) {
+        drawEquipmentDrop(ctx, drop, motionTick, reducedMotion);
+      }
+    }
+    // Hazards and their warnings remain readable even when a Boss drops loot
+    // nearby; neither the collectible nor its badge obscures a dangerous edge.
     drawHazards(ctx, arena.hazards, theme, tick);
     if (meta.mode === 'campaign') drawFallingWarning(ctx, state.fallingObject, tick, reducedMotion, worldWidth);
 
@@ -2822,7 +2986,7 @@ export function createRenderer(canvas) {
       const knockout = number(current.hp, 100) <= 0 ? knockouts.get(String(current.id)) : null;
       drawFighter(ctx, knockout?.fighter ?? current, index, groundY, tick,
         knockout?.reducedMotion ?? reducedMotion, knockout, time,
-        expressionFor(current, state, meta), null, avatarFor(current));
+        expressionFor(current, state, meta), null, avatarFor(current), meta.mode === 'campaign');
       if (meta.mode === 'campaign') {
         drawSpearWindup(ctx, current, tick, reducedMotion, groundY, cameraX, worldWidth);
       }
@@ -2833,7 +2997,7 @@ export function createRenderer(canvas) {
     }
     if (meta.mode === 'campaign') drawFallingObject(ctx, state.fallingObject, tick, reducedMotion);
     for (const knockout of knockouts.values()) drawTomatoBurst(ctx, knockout, time, knockout.reducedMotion);
-    drawEffects(time);
+    drawEffects(time, meta.mode);
     ctx.restore();
     ctx.restore();
     drawAtmosphere(ctx, theme, tick, level);

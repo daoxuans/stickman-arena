@@ -1,5 +1,6 @@
 import { cancelSpearAim, createDuelState, SPEARS_PER_LEVEL, SPEAR_MAX_ANGLE, SPEAR_MIN_ANGLE,
   TICK_RATE } from '../shared/combat.js';
+import { BOSS_EQUIPMENT, getEquipment } from '../shared/equipment.js';
 import { LEVELS, MAX_LEVEL, THEMES, getLevel } from '../shared/levels.js';
 import { avatarFromCamera, avatarFromFile } from './avatar.js';
 import { CampaignSession } from './campaign.js';
@@ -18,6 +19,9 @@ const IDS = [
   'spear-status', 'spear-key-guide', 'spear-guide-remaining',
   'spear-button', 'spear-aim-controls', 'spear-angle',
   'aim-up-button', 'aim-down-button', 'aim-cancel-button', 'touch-tip',
+  'equipment-status', 'equipment-brief', 'equipment-count', 'equipment-key-guide',
+  'equipment-button', 'backpack-open', 'backpack-dialog', 'backpack-close',
+  'backpack-list', 'backpack-message',
   'replay-exit', 'avatar-open', 'avatar-chip-default', 'avatar-chip-photo',
   'avatar-dialog', 'avatar-close', 'avatar-preview-default', 'avatar-preview',
   'avatar-upload', 'avatar-camera', 'avatar-camera-fallback', 'avatar-file',
@@ -45,6 +49,9 @@ let sceneToken = 0;
 let avatarDialogOpen = false;
 let avatarPausedCampaign = false;
 let avatarPreviousFocus = null;
+let backpackDialogOpen = false;
+let backpackPausedCampaign = false;
+let backpackPreviousFocus = null;
 let avatarRequestId = 0;
 let cameraRequestId = 0;
 let cameraStream = null;
@@ -55,14 +62,16 @@ const campaignPresses = new Set();
 let pendingSpearPresses = 0;
 let spearNeedsReleaseTick = false;
 const campaignActions = new Set([
-  'jump', 'attack', 'kick', 'dodge', 'special', 'spear', 'aimUp', 'aimDown', 'aimCancel',
+  'jump', 'attack', 'kick', 'dodge', 'special', 'spear', 'equipment',
+  'aimUp', 'aimDown', 'aimCancel',
 ]);
 const keyBindings = new Map([
   ['KeyA', 'left'], ['ArrowLeft', 'left'],
   ['KeyD', 'right'], ['ArrowRight', 'right'],
   ['KeyW', 'aimUp'], ['ArrowUp', 'aimUp'],
   ['KeyS', 'aimDown'], ['ArrowDown', 'aimDown'],
-  ['KeyJ', 'attack'], ['KeyK', 'kick'], ['KeyL', 'special'], ['KeyI', 'spear'], ['Space', 'jump'],
+  ['KeyJ', 'attack'], ['KeyK', 'kick'], ['KeyL', 'special'], ['KeyI', 'spear'],
+  ['KeyE', 'equipment'], ['Space', 'jump'],
   ['Escape', 'aimCancel'],
   ['ShiftLeft', 'dodge'], ['ShiftRight', 'dodge'],
 ]);
@@ -469,6 +478,22 @@ class SoundEffects {
           effect.heavy ? 0.18 : 0.115, effect.heavy ? 0.145 : 0.105, 'sine');
         this.tone(effect.heavy ? 266 : 310, effect.heavy ? 74 : 116,
           effect.heavy ? 0.105 : 0.075, effect.heavy ? 0.055 : 0.035, 'triangle');
+        if (effect.delivery === 'equipment') this.tone(760, 280, 0.11, 0.027, 'triangle');
+        break;
+      case 'equipment-swing':
+        // A quiet metallic sweep announces the selected weapon; only a real
+        // contact receives the foreground impact sound above.
+        this.noise(0.09, 0.022, 1700, 'highpass');
+        this.tone(540, 340, 0.1, 0.025, 'triangle');
+        break;
+      case 'equipment-drop':
+        this.tone(720, 960, 0.17, 0.021, 'sine');
+        break;
+      case 'equipment-pickup':
+        if (!effect.duplicate) {
+          this.tone(490, 735, 0.15, 0.041, 'triangle');
+          this.tone(820, 1120, 0.2, 0.026, 'sine');
+        }
         break;
       case 'special-wave':
         this.tone(170, 540, 0.28, 0.08, 'sawtooth', 1);
@@ -650,6 +675,7 @@ function currentInput() {
     attack: held.has('attack'), kick: held.has('kick'),
     jump: held.has('jump'), dodge: held.has('dodge'),
     special: held.has('special'), spear: held.has('spear'),
+    equipment: held.has('equipment'),
     aimUp: held.has('aimUp'), aimDown: held.has('aimDown'),
     aimCancel: held.has('aimCancel'),
   };
@@ -665,7 +691,7 @@ function queueCampaignPress(button) {
     } else {
       // A cancellation must also discard a second I tap still waiting behind
       // the release tick, otherwise it can silently start a new aim afterward.
-      if (['aimCancel', 'jump', 'attack', 'kick', 'dodge'].includes(button)) pendingSpearPresses = 0;
+      if (['aimCancel', 'jump', 'attack', 'kick', 'dodge', 'equipment'].includes(button)) pendingSpearPresses = 0;
       campaignPresses.add(button);
     }
   }
@@ -707,6 +733,12 @@ function sendInput(force = false) {
 }
 
 document.addEventListener('keydown', (event) => {
+  if (event.code === 'KeyB' && mode === 'campaign' && !avatarDialogOpen) {
+    event.preventDefault();
+    if (!event.repeat) backpackDialogOpen ? closeBackpackDialog() : openBackpackDialog();
+    return;
+  }
+  if (backpackDialogOpen) return;
   if (avatarDialogOpen) return;
   const button = keyBindings.get(event.code);
   if (!button) return;
@@ -719,7 +751,7 @@ document.addEventListener('keydown', (event) => {
   }
 });
 document.addEventListener('keyup', (event) => {
-  if (avatarDialogOpen) return;
+  if (avatarDialogOpen || backpackDialogOpen) return;
   const button = keyBindings.get(event.code);
   if (!button) return;
   event.preventDefault();
@@ -793,7 +825,10 @@ function releaseInput(cancelAim = false) {
     if (hero?.spearAiming) cancelSpearAim(hero);
     // A blur/mode change can happen between ticks. Clear the sampled I edge so
     // the first fresh press after returning is not mistaken for a held key.
-    if (hero?.prevInput) hero.prevInput.spear = false;
+    if (hero?.prevInput) {
+      hero.prevInput.spear = false;
+      hero.prevInput.equipment = false;
+    }
     updateCampaignHud();
   }
   sendInput(true);
@@ -842,7 +877,7 @@ function closeAvatarDialog() {
 }
 
 function openAvatarDialog() {
-  if (avatarDialogOpen || ui['avatar-open'].disabled) return;
+  if (avatarDialogOpen || backpackDialogOpen || ui['avatar-open'].disabled) return;
   avatarPreviousFocus = document.activeElement ?? ui['avatar-open'];
   avatarPausedCampaign = mode === 'campaign' && !campaignPaused
     && ['playing', 'aftermath'].includes(campaignView.phase);
@@ -981,6 +1016,112 @@ ui['avatar-reset'].addEventListener('click', () => {
   setAvatar(null);
   ui['avatar-message'].textContent = '已恢复默认侠客表情；刷新页面也不会保存照片。';
 });
+
+const EQUIPMENT_GLYPHS = Object.freeze({
+  sweep: '刃', pierce: '刺', pulse: '印',
+});
+
+function renderBackpackList() {
+  const items = (campaignView.inventory ?? []).map(getEquipment).filter(Boolean);
+  const fragment = document.createDocumentFragment();
+  if (!items.length) {
+    const empty = document.createElement('p');
+    empty.className = 'backpack-empty';
+    empty.textContent = '背包还是空的。第 10 关起击败首领会掉落装备；走近自动拾取，过关前没走到也会收纳。';
+    fragment.append(empty);
+  }
+  for (const item of items) {
+    const selected = item.id === campaignView.equippedEquipmentId;
+    const button = document.createElement('button');
+    button.type = 'button';
+    button.className = 'backpack-item';
+    button.style.setProperty('--equipment-color', item.color);
+    button.setAttribute('aria-pressed', String(selected));
+    button.setAttribute('aria-label', `${item.name}，${item.tier} 阶，伤害 ${item.damage}，射程 ${item.reach}，冷却 ${(item.cooldown / TICK_RATE).toFixed(1)} 秒，${selected ? '当前装备' : '点击装备'}`);
+    const mark = document.createElement('span');
+    mark.className = 'backpack-item__mark';
+    mark.setAttribute('aria-hidden', 'true');
+    mark.textContent = EQUIPMENT_GLYPHS[item.style] ?? '器';
+    const copy = document.createElement('span');
+    copy.className = 'backpack-item__copy';
+    const name = document.createElement('strong');
+    name.textContent = item.name;
+    const stats = document.createElement('small');
+    stats.textContent = `${item.tier} 阶 · 伤害 ${item.damage} · 射程 ${item.reach} · 间隔 ${(item.cooldown / TICK_RATE).toFixed(1)} 秒`;
+    copy.append(name, stats);
+    const choice = document.createElement('span');
+    choice.className = 'backpack-item__choice';
+    choice.textContent = selected ? '已装备' : '装备';
+    button.append(mark, copy, choice);
+    button.addEventListener('click', () => {
+      campaignView = campaign.selectEquipment(item.id);
+      ui['backpack-message'].textContent = `${item.name}已装备。关闭背包后按 E 或点“装备技”使用。`;
+      renderBackpackList();
+      updateCampaignHud();
+      ui['backpack-list'].querySelector('[aria-pressed="true"]')?.focus?.();
+    });
+    fragment.append(button);
+  }
+  ui['backpack-list'].replaceChildren(fragment);
+  if (!backpackDialogOpen) ui['backpack-message'].textContent = items.length
+    ? '不同装备的伤害、射程与冷却各有取舍；每次出招最多命中一名敌人。'
+    : '目前还没有装备；第 10 关开始可从首领身上获得。';
+}
+
+function finishBackpackDialog() {
+  if (!backpackDialogOpen) return;
+  backpackDialogOpen = false;
+  ui['backpack-dialog'].hidden = true;
+  backpackPreviousFocus?.focus?.();
+  backpackPreviousFocus = null;
+  if (backpackPausedCampaign && mode === 'campaign') resumeCampaign();
+  backpackPausedCampaign = false;
+}
+
+function closeBackpackDialog() {
+  if (!backpackDialogOpen) return;
+  if (ui['backpack-dialog'].open && typeof ui['backpack-dialog'].close === 'function') {
+    ui['backpack-dialog'].close();
+  } else {
+    ui['backpack-dialog'].removeAttribute?.('open');
+  }
+  finishBackpackDialog();
+}
+
+function openBackpackDialog() {
+  if (mode !== 'campaign' || backpackDialogOpen || avatarDialogOpen) return;
+  backpackPreviousFocus = document.activeElement ?? ui['backpack-open'];
+  backpackPausedCampaign = !campaignPaused
+    && ['playing', 'aftermath'].includes(campaignView.phase);
+  if (backpackPausedCampaign) campaignPaused = true;
+  releaseInput(true);
+  if (backpackPausedCampaign) syncMusic();
+  renderBackpackList();
+  ui['backpack-dialog'].hidden = false;
+  backpackDialogOpen = true;
+  try {
+    if (typeof ui['backpack-dialog'].showModal === 'function') ui['backpack-dialog'].showModal();
+    else ui['backpack-dialog'].setAttribute('open', '');
+  } catch {
+    ui['backpack-dialog'].setAttribute('open', '');
+  }
+  (ui['backpack-list'].querySelector('[aria-pressed="true"]')
+    ?? ui['backpack-close']).focus?.();
+}
+
+ui['backpack-open'].addEventListener('click', openBackpackDialog);
+ui['backpack-close'].addEventListener('click', closeBackpackDialog);
+ui['backpack-dialog'].addEventListener('close', () => {
+  // A close event from an earlier opening must not dismiss a newly opened bag.
+  if (!ui['backpack-dialog'].open) finishBackpackDialog();
+});
+ui['backpack-dialog'].addEventListener('cancel', (event) => {
+  event.preventDefault();
+  closeBackpackDialog();
+});
+ui['backpack-dialog'].addEventListener('click', (event) => {
+  if (event.target === ui['backpack-dialog']) closeBackpackDialog();
+});
 window.addEventListener('blur', () => {
   releaseInput(true);
   if (cameraStream) stopCamera();
@@ -1048,7 +1189,8 @@ function drawMap() {
 
 function updateCampaignHud() {
   const { level, combat, progress, waveNumber, waveCount,
-    specialEligible, specialCharges, specialKills, spearRemaining } = campaignView;
+    specialEligible, specialCharges, specialKills, spearRemaining,
+    inventory = [], equippedEquipmentId } = campaignView;
   const hero = combat?.fighters.find((fighter) => fighter.team === 0);
   const opponents = combat?.fighters.filter((fighter) => fighter.team === 1 && fighter.hp > 0) ?? [];
   const opponent = opponents[0];
@@ -1078,13 +1220,23 @@ function updateCampaignHud() {
   ui['spear-status'].hidden = false;
   ui['spear-key-guide'].hidden = false;
   ui['spear-button'].hidden = false;
+  ui['equipment-status'].hidden = false;
+  ui['equipment-key-guide'].hidden = false;
+  const equipment = getEquipment(equippedEquipmentId);
+  const equipmentCooldown = hero?.equipmentCooldown ?? 0;
+  ui['equipment-count'].textContent = String(inventory.length);
+  ui['backpack-open'].disabled = false;
+  ui['equipment-brief'].textContent = equipment
+    ? `${equipment.name} · ${equipment.tier} 阶 / 伤害 ${equipment.damage}${equipmentCooldown > 0 ? ` · 冷却 ${(equipmentCooldown / TICK_RATE).toFixed(1)} 秒` : ' · E 使用'}`
+    : inventory.length ? '背包有装备 · 按 B 选择' : '背包空 · 击败首领获得装备';
+  ui['equipment-status'].classList.toggle('is-equipped', Boolean(equipment));
   const count = `${spearRemaining}/${SPEARS_PER_LEVEL}`;
   if (ui['spear-guide-remaining'].textContent !== count) ui['spear-guide-remaining'].textContent = count;
   const active = campaignView.phase === 'playing' && !campaignPaused && hero?.hp > 0;
   const aiming = active && hero.spearAiming === true;
   const winding = active && hero.spearWindup > 0;
   const busy = hero && (hero.stun > 0 || hero.attackStage > 0 || hero.kickType
-    || hero.dodgeTicks > 0);
+    || hero.dodgeTicks > 0 || hero.equipmentAttackId);
   const spearText = campaignView.phase === 'aftermath'
     ? `胜利收尾 · 投矛剩余 ${count}，退开再走过倒地敌人`
     : aiming
@@ -1107,13 +1259,20 @@ function updateCampaignHud() {
   if (aiming) updateAimAngle(hero);
   for (const id of ['aim-up-button', 'aim-down-button', 'aim-cancel-button']) ui[id].disabled = !aiming;
   ui['game-canvas'].classList.toggle('is-aiming', aiming);
+  ui['equipment-button'].hidden = !equipment;
+  ui['equipment-button'].disabled = !active || !equipment || equipmentCooldown > 0
+    || Boolean(busy) || aiming || winding;
+  ui['equipment-button'].textContent = equipment ? `${equipment.name} · 技` : '装备技';
+  ui['equipment-button'].setAttribute('aria-label', equipment
+    ? `使用${equipment.name}攻击，伤害 ${equipment.damage}${equipmentCooldown > 0 ? `，冷却还需 ${(equipmentCooldown / TICK_RATE).toFixed(1)} 秒` : ''}`
+    : '尚未装备武器，击败首领后在背包中选择');
   ui['touch-tip'].textContent = campaignView.phase === 'aftermath'
-    ? '左右走动 · 退开再走过倒地敌人可触发散骨'
+    ? '左右走动 · 走近掉落装备自动拾取，退开再走过倒地敌人可触发散骨'
     : aiming
     ? `投矛剩余 ${count} · 上下拖动或按「抬高/压低」调角，点「发射」确认`
     : winding ? `投矛剩余 ${count} · 蓄势中，被击中会打断且不扣次`
       : spearRemaining === 0 ? `投矛已用尽（${count}）· 空中按「踢腿」释放跳踢大招`
-        : `投矛剩余 ${count} · 空中按「踢腿」释放跳踢大招，投矛先瞄准再发射`;
+        : `投矛剩余 ${count} · 空中按「踢腿」释放跳踢大招${equipment ? ' · 装备技可出招' : ' · Boss 掉落可装进背包'}`;
   for (const button of aftermathActionButtons) button.disabled = campaignView.phase === 'aftermath';
   if (specialEligible) {
     const needed = 2 - (specialKills % 2);
@@ -1135,7 +1294,7 @@ function campaignOverlay() {
     if (phase === 'failed' || phase === 'cleared') {
       showOverlay({
         title: phase === 'failed' ? '练习失利' : '重打成功',
-        body: `${levelLabel}${phase === 'failed' ? '挑战失利' : '已经完成'}。这是独立练习，主线进度、存档与失败次数均未改变。`,
+        body: `${levelLabel}${phase === 'failed' ? '挑战失利' : '已经完成'}。这是独立练习，战利品与装备选择不会带回主线；进度、存档与失败次数均未改变。`,
         primary: '再打这一关', onPrimary: retryReplay,
         secondary: '返回主线', onSecondary: exitReplay,
       });
@@ -1149,7 +1308,7 @@ function campaignOverlay() {
     } else {
       showOverlay({
         title: `重打第 ${String(level.number).padStart(2, '0')} 关`,
-        body: `${levelLabel}从起点开始独立练习。胜负不会解锁新关或改变正式存档；可随时从右侧返回主线。`,
+        body: `${levelLabel}从起点开始独立练习。可试用已有装备，练习战利品不会带回主线；可随时从右侧返回主线。`,
         primary: '开始重打', onPrimary: () => { resumeCampaign(); hideOverlay(); },
         secondary: '返回主线', onSecondary: exitReplay,
       });
@@ -1159,12 +1318,12 @@ function campaignOverlay() {
   const bossTier = level.waves.flatMap((wave) => wave.groups)
     .find((group) => group.kind === 'boss' && group.bossTier > 0)?.bossTier ?? 0;
   const bossHint = bossTier
-    ? ` 本关首领逐级叠加${MILESTONE_BOSS_SKILLS.slice(0, bossTier).join('、')}；召唤援兵同时最多 5 名。光波对首领只扣当前血量的三分之一。`
-    : level.isBoss ? ' 光波对首领只扣当前血量的三分之一。' : '';
+    ? ` 本关首领逐级叠加${MILESTONE_BOSS_SKILLS.slice(0, bossTier).join('、')}；召唤援兵同时最多 5 名。光波对首领只扣当前血量的三分之一。击败首领必掉装备。`
+    : level.isBoss ? ' 光波对首领只扣当前血量的三分之一；击败后必掉装备。' : '';
   if (phase === 'failed') {
     showOverlay({
       title: '挑战失败',
-      body: `第 ${failedLevel} 关失利。已回到第 ${progress.checkpointLevel} 关存档原点；血量、敌人和机关会全部重置。`,
+      body: `第 ${failedLevel} 关失利。已回到第 ${progress.checkpointLevel} 关存档原点；血量、敌人、机关及上次存档后取得的装备会回滚。`,
       primary: `从第 ${progress.checkpointLevel} 关重试`,
       onPrimary: () => {
         campaignView = campaign.retry();
@@ -1178,7 +1337,7 @@ function campaignOverlay() {
   } else if (phase === 'cleared') {
     showOverlay({
       title: '关卡突破',
-      body: `第 ${level.number} 关「${level.name}」完成。下一站：第 ${progress.currentLevel} 关「${getLevel(progress.currentLevel).name}」。`,
+      body: `第 ${level.number} 关「${level.name}」完成。${level.isBoss ? '首领战利品已收进背包。' : ''}下一站：第 ${progress.currentLevel} 关「${getLevel(progress.currentLevel).name}」。`,
       primary: '进入下一关',
       onPrimary: () => {
         campaignView = campaign.next();
@@ -1192,7 +1351,7 @@ function campaignOverlay() {
   } else if (phase === 'completed') {
     showOverlay({
       title: '56 关全部突破',
-      body: '森林、城市、海洋与陆地的九场首领战均已突破。通关记录保存在这台浏览器；点击右侧已通过的关卡可随时重打。',
+      body: '森林、城市、海洋与陆地的九场首领战均已突破，战利品已收进背包。通关记录保存在这台浏览器；点击右侧已通过的关卡可随时重打。',
       primary: '开启新的征程',
       onPrimary: () => {
         if (!window.confirm('重新开始将清除当前的 56 关通关进度，确定继续吗？')) return;
@@ -1207,13 +1366,13 @@ function campaignOverlay() {
   } else if (phase === 'aftermath') {
     showOverlay({
       title: '胜利收尾',
-      body: '敌人已经倒下。退开后，从同一层走过倒地敌人可触发散骨；落稳后约 3 秒自动结算，本段不会再受到机关伤害。',
+      body: '敌人已经倒下。走近首领掉落可拾取，未拾到的装备过关时自动收纳；从同一层走过倒地敌人可触发散骨。落稳后约 3 秒自动结算，本段不会再受到机关伤害。',
       primary: '继续走动', onPrimary: () => { resumeCampaign(); hideOverlay(); },
     });
   } else {
     showOverlay({
       title: level.number === 1 && progress.cleared.length === 0 ? '准备开战' : '继续征程',
-      body: `第 ${level.number} / ${MAX_LEVEL} 关 · ${level.themeName}「${level.name}」。A/D 移动，J 攻击，空格跳跃，Shift 闪避。每关最多投矛 ${SPEARS_PER_LEVEL} 次；按 I 预览弧线，↑↓ 调角，再按 I 确认发射，真正投出才扣次；Esc 取消。${campaignView.specialEligible ? '每击倒两名敌人可按 L 释放一次无敌光波。' : ''}${bossHint}`,
+      body: `第 ${level.number} / ${MAX_LEVEL} 关 · ${level.themeName}「${level.name}」。A/D 移动，J 攻击，空格跳跃，Shift 闪避。每关最多投矛 ${SPEARS_PER_LEVEL} 次；按 I 预览弧线，↑↓ 调角，再按 I 确认发射，真正投出才扣次；Esc 取消。B 打开背包，选装备后按 E 攻击。${campaignView.specialEligible ? '每击倒两名敌人可按 L 释放一次无敌光波。' : ''}${bossHint}`,
       primary: '开始挑战',
       onPrimary: () => { resumeCampaign(); hideOverlay(); },
       secondary: '设置头像', onSecondary: openAvatarDialog,
@@ -1324,7 +1483,20 @@ function consumeEvents(events) {
       notify(`光波已充能 ${effect.charges} 次，按 L 或点击光波发动`);
       updateCampaignHud();
     }
-    if (mode === 'campaign' && ['spear-aim', 'spear-aim-cancel', 'spear-windup', 'spear-throw', 'special-wave', 'wave']
+    if (mode === 'campaign' && effect.type === 'equipment-drop') {
+      const item = getEquipment(effect.equipmentId);
+      if (item) notify(`${item.name}掉落！靠近自动拾取；过关时未拾取也会收入背包。`);
+    }
+    if (mode === 'campaign' && effect.type === 'equipment-pickup') {
+      const item = getEquipment(effect.equipmentId);
+      if (item) notify(effect.duplicate
+        ? `${item.name}已在背包，不会重复叠加。`
+        : `${item.name}已收入背包${effect.auto ? '（过关自动收纳）' : ''}，按 B 选择、E 出招。`);
+      updateCampaignHud();
+      if (backpackDialogOpen) renderBackpackList();
+    }
+    if (mode === 'campaign' && ['spear-aim', 'spear-aim-cancel', 'spear-windup', 'spear-throw',
+      'equipment-swing', 'special-wave', 'wave']
       .includes(effect.type)) updateCampaignHud();
   }
 }
@@ -1354,6 +1526,11 @@ function updateDuelHud() {
   ui['special-button'].disabled = true;
   for (const button of aftermathActionButtons) button.disabled = false;
   ui['touch-tip'].textContent = '空中按「踢腿」释放跳踢大招';
+  ui['equipment-status'].hidden = true;
+  ui['equipment-key-guide'].hidden = true;
+  ui['equipment-button'].hidden = true;
+  ui['equipment-button'].disabled = true;
+  ui['backpack-open'].disabled = true;
   ui['spear-status'].hidden = true;
   ui['spear-key-guide'].hidden = true;
   ui['spear-button'].hidden = true;
@@ -1621,6 +1798,7 @@ themeSelect?.addEventListener('change', () => {
 
 function switchMode(next) {
   if (mode === next) return;
+  closeBackpackDialog();
   closeAvatarDialog();
   if (mode === 'campaign' && campaignView.replaying) exitReplay({ showResult: false });
   cancelResultOverlay();

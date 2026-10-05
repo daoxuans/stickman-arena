@@ -96,7 +96,11 @@
           <div class="checkpoint-status"><span class="checkpoint-diamond" aria-hidden="true"></span><span id="checkpoint-label">最近存档 · 第 01 关</span><span class="tail-separator" aria-hidden="true"></span><span id="progress-label">征途 01 / 56</span></div>
           <span id="special-status" class="special-status" role="status" aria-live="polite" hidden>光波充能</span>
           <span id="spear-status" class="spear-status" role="status" aria-live="polite" hidden>投矛剩余 5/5 · 按 I 瞄准，再按 I 发射</span>
-          <div class="keyboard-guide" aria-label="键盘操作说明"><span><kbd>A</kbd><kbd>D</kbd> 移动</span><span><kbd>J</kbd> 攻击</span><span><kbd>K</kbd> 踢腿 / 空中跳踢</span><span><kbd>SPACE</kbd> 跳跃</span><span><kbd>SHIFT</kbd> 闪避</span><span id="spear-key-guide" hidden><kbd>I</kbd> 投矛 <span id="spear-guide-remaining">5/5</span> · 瞄准/发射 <kbd>↑</kbd><kbd>↓</kbd> 调角</span><span id="special-key-guide" hidden><kbd>L</kbd> 光波</span></div>
+          <div id="equipment-status" class="equipment-status" hidden>
+            <span id="equipment-brief">背包空 · 击败首领获得装备</span>
+            <button id="backpack-open" class="equipment-status__open" type="button" aria-label="打开装备背包，按 B">背包 <span id="equipment-count">0</span>/9</button>
+          </div>
+          <div class="keyboard-guide" aria-label="键盘操作说明"><span><kbd>A</kbd><kbd>D</kbd> 移动</span><span><kbd>J</kbd> 攻击</span><span><kbd>K</kbd> 踢腿 / 空中跳踢</span><span><kbd>SPACE</kbd> 跳跃</span><span><kbd>SHIFT</kbd> 闪避</span><span id="spear-key-guide" hidden><kbd>I</kbd> 投矛 <span id="spear-guide-remaining">5/5</span> · 瞄准/发射 <kbd>↑</kbd><kbd>↓</kbd> 调角</span><span id="equipment-key-guide" hidden><kbd>B</kbd> 背包 <kbd>E</kbd> 装备攻击</span><span id="special-key-guide" hidden><kbd>L</kbd> 光波</span></div>
         </div>
 
         <div class="touch-controls" aria-label="触控操作">
@@ -110,6 +114,7 @@
             <button class="touch-key touch-key--kick" data-key="kick" type="button" aria-label="踢腿，空中使用可释放跳踢大招">踢腿</button>
             <button class="touch-key touch-key--attack" data-key="attack" type="button">攻击</button>
             <button id="spear-button" class="touch-key touch-key--spear" data-key="spear" type="button" aria-label="投矛，剩余 5 次" disabled hidden>投矛 ×5</button>
+            <button id="equipment-button" class="touch-key touch-key--equipment" data-key="equipment" type="button" aria-label="使用当前装备攻击" disabled hidden>装备技</button>
             <button id="special-button" class="touch-key touch-key--special" data-key="special" type="button" aria-label="无敌光波" disabled hidden>光波</button>
           </div>
           <div id="spear-aim-controls" class="spear-aim-controls" aria-label="投矛仰角调节" hidden>
@@ -193,6 +198,16 @@
         </div>
         <p id="avatar-message" class="avatar-dialog__message" role="status" aria-live="polite">选择 JPG、PNG、WebP 或浏览器支持的 HEIC，最大 8 MB。</p>
         <button id="avatar-reset" class="button button--outline avatar-reset" type="button">恢复默认头像</button>
+      </div>
+    </dialog>
+    <dialog id="backpack-dialog" class="backpack-dialog" aria-labelledby="backpack-title" aria-describedby="backpack-help" hidden>
+      <div class="backpack-dialog__body">
+        <button id="backpack-close" class="backpack-dialog__close" type="button" aria-label="关闭背包">×</button>
+        <span class="backpack-dialog__eyebrow">BOSS RELICS / CAMPAIGN ONLY</span>
+        <h2 id="backpack-title">侠客背包</h2>
+        <p id="backpack-help">击败首领会掉落装备，走近即可拾取；过关时未拾到的掉落会自动收纳。选择一件后，战斗中按 E 或点“装备技”出招。</p>
+        <div id="backpack-list" class="backpack-list" role="group" aria-label="已收集装备"></div>
+        <p id="backpack-message" class="backpack-dialog__message" role="status" aria-live="polite">目前还没有装备；第 10 关开始可从首领身上获得。</p>
       </div>
     </dialog>
   </div>

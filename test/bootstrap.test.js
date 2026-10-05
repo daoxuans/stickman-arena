@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import { CampaignSession } from '../public/campaign.js';
 import { createDuelState } from '../shared/combat.js';
+import { BOSS_EQUIPMENT } from '../shared/equipment.js';
 
 class FakeNode {
   constructor(id = '') {
@@ -12,7 +13,7 @@ class FakeNode {
     this.children = [];
     this.listeners = new Map();
     this.attributes = new Map();
-    this.style = {};
+    this.style = { setProperty(name, value) { this[name] = value; } };
     this.dataset = {};
     this.value = '';
     this.textContent = '';
@@ -56,7 +57,12 @@ class FakeNode {
   play() { return Promise.resolve(); }
   pause() {}
   toDataURL() { return 'data:image/png;base64,bG9jYWwtYXZhdGFy'; }
-  querySelector(selector) { return selector === 'span' ? new FakeNode('label') : null; }
+  querySelector(selector) {
+    if (selector === 'span') return new FakeNode('label');
+    if (selector === '[aria-pressed="true"]') return this.children.find((child) =>
+      child.attributes?.get('aria-pressed') === 'true') ?? null;
+    return null;
+  }
   replaceChildren(...nodes) { this.children = nodes.flatMap((node) => node.isFragment ? node.children : [node]); }
   append(...nodes) { this.children.push(...nodes); }
   getContext() { return fakeCanvasContext; }
@@ -84,6 +90,12 @@ test('portrait setup exposes explicit local-only upload and camera fallback cont
   }
   assert.match(page, /id="replay-exit"[^>]*hidden/);
   assert.match(page, /已过可重打/);
+  for (const id of ['equipment-status', 'backpack-open', 'equipment-button',
+    'backpack-dialog', 'backpack-close', 'backpack-list']) {
+    assert.match(page, new RegExp(`id="${id}"`), `${id} is a visible or accessible equipment entry`);
+  }
+  assert.match(page, /<dialog id="backpack-dialog"[^>]*aria-labelledby="backpack-title"/);
+  assert.match(page, /data-key="equipment"/);
 });
 
 test('browser controller boots, switches modes, starts a fight and renders a frame', async () => {
@@ -93,12 +105,12 @@ test('browser controller boots, switches modes, starts a fight and renders a fra
   assert.match(aimControlsMarkup, /<span id="spear-angle"/, 'touch aiming shows its own angle readout');
   const elements = new Map(ids.map((id) => [id, new FakeNode(id)]));
   elements.get('duel-theme').value = 'city';
-  for (const id of ['avatar-dialog', 'avatar-preview', 'avatar-chip-photo',
+  for (const id of ['avatar-dialog', 'avatar-preview', 'avatar-chip-photo', 'backpack-dialog',
     'avatar-camera-fallback', 'avatar-camera-view', 'replay-exit']) elements.get(id).hidden = true;
   const touchIds = { special: 'special-button', spear: 'spear-button', aimUp: 'aim-up-button',
-    aimDown: 'aim-down-button', aimCancel: 'aim-cancel-button' };
+    aimDown: 'aim-down-button', aimCancel: 'aim-cancel-button', equipment: 'equipment-button' };
   const buttons = ['left', 'right', 'attack', 'kick', 'jump', 'dodge', 'special', 'spear',
-    'aimUp', 'aimDown', 'aimCancel'].map((key) => {
+    'equipment', 'aimUp', 'aimDown', 'aimCancel'].map((key) => {
     const node = touchIds[key] ? elements.get(touchIds[key]) : new FakeNode();
     node.dataset.key = key;
     return node;
@@ -375,6 +387,24 @@ test('browser controller boots, switches modes, starts a fight and renders a fra
     };
     const campaignHero = () => latestCampaignView.combat.fighters.find((fighter) => fighter.id === 'hero');
     advanceFrame(35);
+    assert.equal(elements.get('equipment-status').hidden, false);
+    assert.equal(elements.get('equipment-count').textContent, '0');
+    assert.equal(elements.get('equipment-button').hidden, true,
+      'a new player does not see an unusable equipment attack control');
+    const bagTick = activeCampaign.combat.tick;
+    tapKey('KeyB');
+    assert.equal(elements.get('backpack-dialog').open, true);
+    assert.match(elements.get('backpack-list').children[0].textContent, /背包还是空的/);
+    advanceFrame(35);
+    assert.equal(activeCampaign.combat.tick, bagTick, 'opening the backpack pauses live combat');
+    elements.get('backpack-dialog').fire('cancel');
+    assert.equal(elements.get('backpack-dialog').open, false, 'Escape cancel closes the modal');
+    tapKey('KeyB');
+    assert.equal(elements.get('backpack-dialog').open, true, 'the bag can reopen after Escape');
+    tapKey('KeyB');
+    assert.equal(elements.get('backpack-dialog').open, false);
+    advanceFrame(35);
+    assert.ok(activeCampaign.combat.tick > bagTick, 'closing the backpack resumes the fight');
     const pausedTick = activeCampaign.combat.tick;
     tapKey('KeyJ');
     elements.get('avatar-open').fire('click');
@@ -715,6 +745,7 @@ test('browser controller boots, switches modes, starts a fight and renders a fra
       'a duel-lobby key released during portrait setup cannot become a ghost attack');
     assert.equal('special' in socket.sent.at(-1).input, false);
     assert.equal('spear' in socket.sent.at(-1).input, false);
+    assert.equal('equipment' in socket.sent.at(-1).input, false);
     assert.deepEqual(Object.keys(socket.sent.at(-1).input).sort(),
       ['attack', 'dodge', 'jump', 'kick', 'left', 'right']);
     assert.doesNotMatch(JSON.stringify(socket.sent), /data:image|avatar|portrait/i,
@@ -732,6 +763,14 @@ test('browser controller boots, switches modes, starts a fight and renders a fra
     document.fire('keyup', { code: 'ArrowUp' });
     assert.equal(elements.get('spear-button').hidden, true, 'duels do not show the spear button');
     assert.equal(elements.get('spear-aim-controls').hidden, true);
+    assert.equal(elements.get('equipment-status').hidden, true, 'the backpack is campaign-only');
+    assert.equal(elements.get('equipment-button').hidden, true);
+    document.fire('keydown', { code: 'KeyE', repeat: false });
+    assert.equal('equipment' in socket.sent.at(-1).input, false,
+      'equipment attacks never enter the duel protocol');
+    document.fire('keyup', { code: 'KeyE' });
+    tapKey('KeyB');
+    assert.equal(elements.get('backpack-dialog').open, false, 'B cannot open a campaign bag in PvP');
 
     document.fire('keydown', { code: 'KeyK', repeat: false });
     assert.equal(socket.sent.at(-1).input.kick, true);
@@ -912,6 +951,36 @@ test('browser controller boots, switches modes, starts a fight and renders a fra
     elements.get('overlay-primary').fire('click');
     advanceFrame(35);
     assert.ok(officialScene.tick > officialTick, 'the official fight advances after the player chooses to continue');
+
+    // Drive the inventory UI with two already-earned catalog IDs. Loot/persistence
+    // rules are covered separately by CampaignSession tests; this checks the
+    // keyboard/touch presentation and a real equipment input tick.
+    const [blade, staff] = BOSS_EQUIPMENT;
+    activeCampaign.inventory = [blade.id, staff.id];
+    activeCampaign.equippedEquipmentId = blade.id;
+    activeCampaign.combat.equippedEquipmentId = blade.id;
+    const armedHero = activeCampaign.combat.fighters.find((fighter) => fighter.id === 'hero');
+    armedHero.stun = 0;
+    armedHero.attackStage = 0;
+    armedHero.kickType = null;
+    armedHero.spearWindup = 0;
+    armedHero.dodgeTicks = 0;
+    for (const enemy of activeCampaign.combat.fighters.filter((fighter) => fighter.team === 1)) enemy.stun = 1000;
+    advanceFrame(100);
+    assert.equal(elements.get('equipment-count').textContent, '2');
+    assert.equal(elements.get('equipment-button').hidden, false);
+    elements.get('backpack-open').fire('click');
+    assert.equal(elements.get('backpack-dialog').open, true);
+    assert.equal(elements.get('backpack-list').children.length, 2);
+    elements.get('backpack-list').children[1].fire('click');
+    assert.equal(activeCampaign.snapshot().equippedEquipmentId, staff.id);
+    assert.equal(elements.get('backpack-list').children[1].attributes.get('aria-pressed'), 'true');
+    elements.get('backpack-close').fire('click');
+    assert.equal(elements.get('backpack-dialog').open, false);
+    tapKey('KeyE');
+    assert.equal(advanceFrame(35)[0].equipment, true);
+    assert.equal(armedHero.equipmentAttackId, staff.id, 'E starts the selected gear move');
+    assert.equal(elements.get('equipment-button').disabled, true, 'the gear has a visible cooldown');
   } finally {
     CampaignSession.prototype.step = originalCampaignStep;
     for (const [key, descriptor] of Object.entries(browserGlobals)) {

@@ -5,6 +5,7 @@
  * Every call to stepCombat advances exactly one 1/60-second simulation tick.
  */
 import { platformPose, platformSurfaceY } from './platforms.js';
+import { getEquipment } from './equipment.js';
 
 export const TICK_RATE = 60;
 export const WORLD_WIDTH = 960;
@@ -71,7 +72,7 @@ const KICKS = Object.freeze({
 });
 
 const BUTTONS = ['left', 'right', 'jump', 'attack', 'kick', 'dodge', 'spear',
-  'aimUp', 'aimDown', 'aimCancel'];
+  'aimUp', 'aimDown', 'aimCancel', 'equipment'];
 
 function inputOf(value) {
   const input = {};
@@ -125,6 +126,7 @@ export function createFighter({
     dodgeTicks: 0, dodgeCooldown: 0,
     attackStage: 0, attackTick: 0, comboStage: 0, comboWindow: 0,
     kickType: null, kickTick: 0, airKickUsed: false,
+    equipmentAttackId: null, equipmentTick: 0, equipmentCooldown: 0, equipmentHit: false,
     spearEnabled: spearEnabled === true,
     spearWindup: 0, spearCooldown: 0, spearAimX: null, spearAimY: null,
     spearAiming: false, spearAimAngle: SPEAR_DEFAULT_ANGLE, spearLaunchFacing: null,
@@ -133,7 +135,8 @@ export function createFighter({
     bossSkillIndex: 0, wardTicks: 0,
     attackBuffered: false, hitIds: [],
     prevInput: { left: false, right: false, jump: false, attack: false, kick: false,
-      dodge: false, spear: false, aimUp: false, aimDown: false, aimCancel: false, aimAngle: null },
+      dodge: false, spear: false, aimUp: false, aimDown: false, aimCancel: false,
+      equipment: false, aimAngle: null },
   };
 }
 
@@ -161,7 +164,9 @@ export function createCombatState({ mode = 'campaign', arena = {}, fighters = []
     projectiles: [],
     projectileSerial: 0,
     summonSerial: 0,
-    ...(mode === 'campaign' ? { spearRemaining: SPEARS_PER_LEVEL } : {}),
+    ...(mode === 'campaign' ? {
+      spearRemaining: SPEARS_PER_LEVEL, equippedEquipmentId: null, equipmentDrops: [],
+    } : {}),
     corpses: [],
     aftermath: false,
     status: 'playing',
@@ -230,6 +235,24 @@ function emitKickEvent(state, fighter, type) {
   event(state, type === 'air' ? 'jump-kick' : 'kick', {
     x: fighter.x, y: fighter.y - fighter.height * (type === 'air' ? 0.55 : 0.4),
     source: fighter.id, facing: fighter.facing,
+  });
+}
+
+function startEquipmentAttack(state, fighter, equipment) {
+  fighter.equipmentAttackId = equipment.id;
+  fighter.equipmentTick = 0;
+  fighter.equipmentHit = false;
+  fighter.equipmentCooldown = equipment.cooldown;
+  fighter.comboStage = 0;
+  fighter.comboWindow = 0;
+  fighter.attackBuffered = false;
+  fighter.jumpBuffer = 0;
+  event(state, 'equipment-swing', {
+    x: fighter.x + fighter.facing * 18,
+    y: fighter.y - fighter.height * 0.54,
+    source: fighter.id, facing: fighter.facing,
+    equipmentId: equipment.id, style: equipment.style,
+    color: equipment.color, tier: equipment.tier, duration: equipment.duration,
   });
 }
 
@@ -733,7 +756,7 @@ function advanceBossCast(state, fighter) {
 }
 
 function applyDamage(state, target, { amount, direction, knockback, stun, invulnerable = 9,
-  source = null, heavy = false, delivery = null }) {
+  source = null, heavy = false, delivery = null, equipmentId = null }) {
   if (target.hp <= 0 || target.invulnerable > 0 || target.dodgeTicks > 0) return false;
   const rawDamage = Math.max(1, Math.round(amount));
   const warded = state.mode === 'campaign' && target.kind === 'boss' && target.wardTicks > 0;
@@ -746,6 +769,9 @@ function applyDamage(state, target, { amount, direction, knockback, stun, invuln
   target.attackTick = 0;
   target.kickType = null;
   target.kickTick = 0;
+  target.equipmentAttackId = null;
+  target.equipmentTick = 0;
+  target.equipmentHit = false;
   target.bossCast = null;
   cancelSpear(state, target);
   target.attackBuffered = false;
@@ -757,6 +783,7 @@ function applyDamage(state, target, { amount, direction, knockback, stun, invuln
     x: target.x, y: target.y - target.height * 0.57,
     damage, target: target.id, source, heavy,
     ...(delivery ? { delivery } : {}),
+    ...(delivery === 'equipment' && equipmentId ? { equipmentId } : {}),
   });
   if (warded) event(state, 'boss-ward-hit', {
     x: target.x, y: target.y - target.height * 0.57,
@@ -780,6 +807,33 @@ function verticalHitOverlap(attacker, target, kickType = null) {
 function collectAttacks(state) {
   const intents = [];
   for (const attacker of state.fighters) {
+    if (state.mode === 'campaign' && attacker.team === 0 && attacker.kind === 'hero'
+        && attacker.equipmentAttackId !== null) {
+      const equipment = getEquipment(attacker.equipmentAttackId);
+      if (equipment && attacker.hp > 0 && !attacker.equipmentHit
+          && attacker.equipmentTick >= equipment.activeFrom
+          && attacker.equipmentTick <= equipment.activeTo) {
+        // A weapon blow chooses the nearest valid foe in its facing direction.
+        // It never turns its larger reach into a full-wave multi-target strike.
+        const target = state.fighters.filter((other) => other.team !== attacker.team
+          && other.hp > 0 && verticalHitOverlap(attacker, other)
+          && (other.x - attacker.x) * attacker.facing >= -other.width * 0.35
+          && (other.x - attacker.x) * attacker.facing <= equipment.reach + other.width * 0.45)
+          .sort((a, b) => (a.x - attacker.x) * attacker.facing
+            - (b.x - attacker.x) * attacker.facing
+            || (a.id < b.id ? -1 : a.id > b.id ? 1 : 0))[0];
+        if (target) {
+          attacker.equipmentHit = true;
+          intents.push({
+            source: attacker.id, target, strike: equipment,
+            amount: equipment.damage * attacker.damageScale,
+            direction: attacker.facing, heavy: equipment.tier >= 4,
+            delivery: 'equipment', equipmentId: equipment.id,
+          });
+        }
+      }
+      continue;
+    }
     if ((attacker.attackStage === 0 && !attacker.kickType) || attacker.hp <= 0) continue;
     const strike = attacker.kickType ? kickOf(attacker) : attackOf(attacker);
     const moveTick = attacker.kickType ? attacker.kickTick : attacker.attackTick;
@@ -817,6 +871,7 @@ function resolveAttacks(state) {
     if (applyDamage(state, target, {
       amount: intent.amount, direction: intent.direction, knockback: strike.knockback,
       stun: strike.stun, source: intent.source, heavy: intent.heavy,
+      delivery: intent.delivery, equipmentId: intent.equipmentId,
     })) {
       state.hitstop = Math.max(state.hitstop, strike.freeze);
     }
@@ -1062,15 +1117,23 @@ function advanceFallingHazard(state) {
 
 function moveFighter(state, fighter, input) {
   const was = fighter.prevInput;
+  const actionBusyAtTickStart = fighter.attackStage > 0 || fighter.kickType !== null
+    || fighter.dodgeTicks > 0 || fighter.spearWindup > 0 || fighter.equipmentAttackId !== null;
   const jumpPressed = input.jump && !was.jump;
   const attackPressed = input.attack && !was.attack;
   const kickPressed = input.kick && !was.kick;
   const dodgePressed = input.dodge && !was.dodge;
   const spearPressed = input.spear && !was.spear;
+  const equipped = state.mode === 'campaign' && fighter.team === 0 && fighter.kind === 'hero'
+    ? getEquipment(state.equippedEquipmentId) : null;
+  const equipmentPressed = Boolean(equipped && input.equipment && !was.equipment);
   fighter.prevInput = input;
 
   if (fighter.hp <= 0) {
     cancelSpear(state, fighter);
+    fighter.equipmentAttackId = null;
+    fighter.equipmentTick = 0;
+    fighter.equipmentHit = false;
     fighter.bossCast = null;
     fighter.vx *= 0.89;
     fighter.vy = Math.min(MAX_FALL_SPEED, fighter.vy + GRAVITY);
@@ -1084,6 +1147,7 @@ function moveFighter(state, fighter, input) {
   if (fighter.hazardCooldown > 0) fighter.hazardCooldown--;
   if (fighter.dodgeCooldown > 0) fighter.dodgeCooldown--;
   if (fighter.spearCooldown > 0) fighter.spearCooldown--;
+  if (fighter.equipmentCooldown > 0) fighter.equipmentCooldown--;
   if (fighter.bossAbilityCooldown > 0) fighter.bossAbilityCooldown--;
   if (fighter.wardTicks > 0) fighter.wardTicks--;
   if (fighter.comboWindow > 0) {
@@ -1098,17 +1162,20 @@ function moveFighter(state, fighter, input) {
   if (fighter.grounded) fighter.coyote = 6;
   else if (fighter.coyote > 0) fighter.coyote--;
   if (fighter.jumpBuffer > 0) fighter.jumpBuffer--;
-  const otherActionPressed = jumpPressed || attackPressed || kickPressed || dodgePressed;
+  const otherActionPressed = jumpPressed || attackPressed || kickPressed || dodgePressed
+    || equipmentPressed;
   if (fighter.spearAiming && (input.aimCancel || otherActionPressed)) cancelSpear(state, fighter);
   if (fighter.spearAiming) {
     const nextAngle = input.aimAngle ?? fighter.spearAimAngle
       + (Number(input.aimUp) - Number(input.aimDown)) * SPEAR_AIM_STEP;
     fighter.spearAimAngle = clamp(nextAngle, SPEAR_MIN_ANGLE, SPEAR_MAX_ANGLE);
   }
-  if (jumpPressed && fighter.kickType === null && !fighter.bossCast) fighter.jumpBuffer = 8;
+  if (jumpPressed && fighter.kickType === null && !fighter.bossCast
+      && fighter.equipmentAttackId === null) fighter.jumpBuffer = 8;
 
   if (dodgePressed && !fighter.bossCast && fighter.stun === 0 && fighter.attackStage === 0
-      && fighter.kickType === null && fighter.spearWindup === 0
+      && fighter.kickType === null && fighter.equipmentAttackId === null
+      && fighter.spearWindup === 0
       && fighter.dodgeCooldown === 0 && fighter.dodgeTicks === 0) {
     const direction = Number(input.right) - Number(input.left);
     if (direction !== 0) fighter.facing = direction;
@@ -1126,8 +1193,10 @@ function moveFighter(state, fighter, input) {
   } else if (fighter.stun === 0) {
     const direction = Number(input.right) - Number(input.left);
     if (direction !== 0) {
-      if (fighter.attackStage === 0 && fighter.kickType === null) fighter.facing = direction;
-      const moveScale = fighter.kickType ? 0.38 : fighter.attackStage ? 0.42 : 1;
+      if (fighter.attackStage === 0 && fighter.kickType === null
+          && fighter.equipmentAttackId === null) fighter.facing = direction;
+      const moveScale = fighter.kickType ? 0.38
+        : fighter.attackStage || fighter.equipmentAttackId ? 0.42 : 1;
       fighter.vx = approach(fighter.vx, direction * fighter.speed * moveScale, fighter.grounded ? 0.9 : 0.52);
     } else {
       fighter.vx *= fighter.grounded ? 0.72 : 0.88;
@@ -1139,7 +1208,8 @@ function moveFighter(state, fighter, input) {
 
   if (fighter.jumpBuffer > 0 && fighter.coyote > 0 && fighter.stun === 0
       && !fighter.bossCast && fighter.dodgeTicks === 0
-      && fighter.kickType === null && fighter.spearWindup === 0) {
+      && fighter.kickType === null && fighter.equipmentAttackId === null
+      && fighter.spearWindup === 0) {
     fighter.vy = JUMP_SPEED;
     fighter.grounded = false;
     fighter.coyote = 0;
@@ -1149,13 +1219,15 @@ function moveFighter(state, fighter, input) {
 
   // Jump resolves first, so jump+kick in the same simulation tick is an air kick.
   if (kickPressed && !fighter.bossCast && fighter.stun === 0 && fighter.dodgeTicks === 0
-      && fighter.attackStage === 0 && fighter.kickType === null && fighter.spearWindup === 0
+      && fighter.attackStage === 0 && fighter.kickType === null
+      && fighter.equipmentAttackId === null && fighter.spearWindup === 0
       && (fighter.grounded || !fighter.airKickUsed)) {
     startKick(state, fighter, fighter.grounded ? 'ground' : 'air');
   }
 
   if (attackPressed && !fighter.bossCast && fighter.stun === 0 && fighter.dodgeTicks === 0
-      && fighter.kickType === null && fighter.spearWindup === 0) {
+      && fighter.kickType === null && fighter.equipmentAttackId === null
+      && fighter.spearWindup === 0) {
     if (fighter.attackStage > 0) fighter.attackBuffered = fighter.attackStage < 3;
     else startAttack(state, fighter, fighter.comboWindow > 0 ? Math.min(3, fighter.comboStage + 1) : 1);
   }
@@ -1185,11 +1257,32 @@ function moveFighter(state, fighter, input) {
     }
   }
 
+  // Equipment is a committed single-target move, not a projectile or an
+  // extension of the punch combo. A held button cannot repeat it.
+  const equipmentBusyThisTick = fighter.equipmentAttackId !== null;
+  if (equipmentPressed && !jumpPressed && !attackPressed && !kickPressed && !dodgePressed
+      && !actionBusyAtTickStart && fighter.stun === 0 && fighter.dodgeTicks === 0
+      && fighter.attackStage === 0 && fighter.kickType === null
+      && fighter.equipmentAttackId === null && fighter.equipmentCooldown === 0
+      && fighter.spearWindup === 0 && !fighter.spearAiming && !fighter.bossCast) {
+    startEquipmentAttack(state, fighter, equipped);
+  }
+  if (fighter.equipmentAttackId !== null) {
+    fighter.equipmentTick++;
+    const equipment = getEquipment(fighter.equipmentAttackId);
+    if (!equipment || fighter.equipmentTick >= equipment.duration) {
+      fighter.equipmentAttackId = null;
+      fighter.equipmentTick = 0;
+      fighter.equipmentHit = false;
+    }
+  }
+
   if (state.mode === 'campaign' && !fighter.bossCast && spearPressed
       && (fighter.team !== 0 || (!input.aimCancel && !otherActionPressed))
       && fighter.stun === 0
       && fighter.dodgeTicks === 0 && fighter.attackStage === 0
-      && fighter.kickType === null && fighter.spearWindup === 0 && fighter.spearCooldown === 0
+      && fighter.kickType === null && fighter.equipmentAttackId === null
+      && !equipmentBusyThisTick && fighter.spearWindup === 0 && fighter.spearCooldown === 0
       && (fighter.team !== 0 || state.spearRemaining > 0)
       && (fighter.team === 0 || fighter.spearEnabled)) {
     if (fighter.team === 0) {
@@ -1289,6 +1382,9 @@ function moveFighter(state, fighter, input) {
   if (fighter.y > WORLD_HEIGHT + 70) {
     fighter.hp = 0;
     fighter.bossCast = null;
+    fighter.equipmentAttackId = null;
+    fighter.equipmentTick = 0;
+    fighter.equipmentHit = false;
     cancelSpear(state, fighter);
     event(state, 'ko', { x: fighter.x, y: WORLD_HEIGHT - 10, target: fighter.id, source: 'fall' });
   }

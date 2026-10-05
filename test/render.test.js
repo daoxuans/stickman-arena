@@ -1,6 +1,8 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { attackOf, spearAimedFlight, spearFlight, spearOrigin, spearTrajectoryPoint } from '../shared/combat.js';
+import { attackOf, createCombatState, createFighter, spearAimedFlight, spearFlight,
+  spearOrigin, spearTrajectoryPoint, stepCombat } from '../shared/combat.js';
+import { BOSS_EQUIPMENT, equipmentForBoss } from '../shared/equipment.js';
 import { platformPose } from '../shared/platforms.js';
 import { createRenderer } from '../public/render.js';
 
@@ -2114,4 +2116,197 @@ test('rock and quake damage never draw punch ink, and campaign casts never leak 
     'a copied campaign stone snapshot is ignored in multiplayer');
   assert.ok(!recording.strokes.some(({ color }) => color === '#ffc29b'),
     'Boss-only telegraphs never enter a multiplayer match');
+});
+
+test('Boss equipment rests above its actual world surface behind the campaign camera', () => {
+  const equipment = equipmentForBoss(42);
+  const drop = { id: 'boss-42:loot', equipmentId: equipment.id,
+    x: 1510, y: 322, spawnedTick: 40 };
+  const recording = recordingRenderer(true);
+  const state = scrollingState(1370, { equipmentDrops: [drop],
+    arena: { theme: 'land', width: 1920, groundY: 430,
+      platforms: [{ x: 1460, y: 322, w: 120, h: 12 }], hazards: [] } });
+  recording.renderer.render(state, { mode: 'campaign', theme: 'land', level: 43 });
+  const crest = recording.fills.find(({ color }) => color === equipment.color);
+  assert.ok(crest, 'the ground item carries its own tier colour, not a hazard warning');
+  assert.equal(crest.originX, 620, 'world x=1510 follows the same 890px camera as the hero');
+  assert.equal(crest.originY, 304, 'the emblem floats 18px above its platform top');
+  assert.ok(crest.order < heroHead(recording.fills).order,
+    'the drop sits behind the fighter rather than covering their face and attack');
+  assert.equal(recording.strokes.filter(({ color, width }) => color === equipment.color
+    && width === 1.7).length, equipment.tier, 'small pips distinguish equipment tiers');
+  assert.deepEqual(drop, { id: 'boss-42:loot', equipmentId: equipment.id,
+    x: 1510, y: 322, spawnedTick: 40 }, 'rendering never moves the saved drop');
+});
+
+test('sweep, pierce and pulse equipment have fixed-frame windup and mirrored active poses', () => {
+  const meta = { mode: 'campaign', theme: 'land', level: 50 };
+  for (const bossLevel of [10, 14, 42]) {
+    const equipment = equipmentForBoss(bossLevel);
+    const hero = { ...fighter('hero', 0, 0), id: 'hero', team: 0,
+      x: 1370, equipmentAttackId: equipment.id };
+    const stateAt = (tick, facing = 1) => scrollingState(1370, {
+      fighters: [{ ...hero, facing, equipmentTick: tick }],
+    });
+    const weaponStrokes = (strokes) => strokes.filter(({ color, originX }) =>
+      color === equipment.color && originX === 480);
+    const farthestPoint = (strokes) => Math.max(...weaponStrokes(strokes)
+      .flatMap(({ points }) => points.filter(Array.isArray).map(([x]) => x)));
+    const recording = recordingRenderer();
+    recording.renderer.render(stateAt(equipment.activeFrom - 1), meta);
+    const windupEnd = farthestPoint(recording.strokes);
+    recording.strokes.length = 0;
+    recording.renderer.render({ ...stateAt(equipment.activeFrom), tick: 41 }, meta);
+    assert.ok(farthestPoint(recording.strokes) > windupEnd + 10,
+      `${equipment.name} visibly extends its held weapon on the first active frame`);
+    assert.ok(weaponStrokes(recording.strokes).every(({ scaleX }) => scaleX === 1),
+      'the attack is anchored to the hero rather than travelling across the arena');
+    const calm = recordingRenderer(true);
+    calm.renderer.render(stateAt(equipment.activeFrom), meta);
+    assert.ok(weaponStrokes(calm.strokes).length > 0,
+      `${equipment.name} remains legible under reduced motion`);
+    assert.ok(weaponStrokes(recording.strokes).length > weaponStrokes(calm.strokes).length,
+      'low-motion mode removes the flourish, not the weapon silhouette');
+    const mirrored = recordingRenderer(true);
+    mirrored.renderer.render(stateAt(equipment.activeFrom, -1), meta);
+    assert.ok(weaponStrokes(mirrored.strokes).some(({ scaleX }) => scaleX === -1),
+      `${equipment.name} follows the hero's actual left-facing pose`);
+    const resting = recordingRenderer(true);
+    resting.renderer.render(stateAt(0), meta);
+    assert.equal(weaponStrokes(resting.strokes).length, 0,
+      'no attack weapon is falsely shown when the equipment skill is idle');
+  }
+});
+
+test('every weapon visibly reaches a Boss at the farthest legal contact edge', () => {
+  function paintedForwardEdge(recording, equipment, facing) {
+    // The weapon is painted in fighter-local coordinates; mirrored paths keep
+    // their positive forward x while the canvas transform flips their side.
+    const paint = [...recording.strokes, ...recording.fills].filter(({ color, originX, scaleX }) =>
+      originX === 480 && scaleX === facing
+      && (color === equipment.color || color === '#f7f6df'));
+    return Math.max(...paint.flatMap(({ points }) => points.flatMap((point) => {
+      if (Array.isArray(point)) return [point[0]];
+      if (point.kind === 'bezier') return [point.cx1, point.cx2, point.x];
+      if (point.kind === 'arc') return [point.x + point.radius];
+      if (point.kind === 'ellipse') return [point.x + point.rx];
+      return [];
+    })));
+  }
+
+  for (const equipment of BOSS_EQUIPMENT) {
+    for (const facing of [-1, 1]) {
+      for (const reducedMotion of [false, true]) {
+        const hero = createFighter({ id: 'hero', x: 1370, y: 430, team: 0, kind: 'hero' });
+        hero.facing = facing;
+        const boss = createFighter({ id: 'far-boss', x: 1370, y: 430,
+          team: 1, kind: 'boss' });
+        boss.x += facing * (equipment.reach + boss.width * .45 - .25);
+        boss.stun = 1000;
+        const state = createCombatState({ mode: 'campaign',
+          arena: { theme: 'land', width: 1920, groundY: 430 }, fighters: [hero, boss] });
+        state.equippedEquipmentId = equipment.id;
+        for (let tick = 0; tick < equipment.activeFrom; tick++) {
+          stepCombat(state, { hero: { equipment: tick === 0 } });
+        }
+        const hit = state.events.find((event) => event.type === 'hit'
+          && event.delivery === 'equipment' && event.target === boss.id);
+        assert.equal(hit?.damage, equipment.damage,
+          `${equipment.name} actually hits the outer edge facing ${facing}`);
+        const recording = recordingRenderer(reducedMotion);
+        recording.renderer.render(state, { mode: 'campaign', theme: 'land',
+          level: equipment.bossLevel });
+        const visibleEdge = paintedForwardEdge(recording, equipment, facing);
+        const bossNearEdge = Math.abs(boss.x - hero.x) - boss.width / 2;
+        assert.ok(visibleEdge >= bossNearEdge - 2,
+          `${equipment.name} must touch the outer Boss silhouette, not deal invisible damage`);
+        assert.ok(visibleEdge <= equipment.reach + 8,
+          `${equipment.name} must not suggest a longer projectile-like attack`);
+      }
+    }
+  }
+});
+
+test('pickup makes one short world-space ring, stays calm in reduced motion and clears on the next scene', () => {
+  withClock((advance) => {
+    const equipment = equipmentForBoss(30);
+    const meta = { mode: 'campaign', theme: 'land', level: 43, sceneToken: 1 };
+    const state = scrollingState(1370);
+    const event = { id: 'pickup:30', type: 'equipment-pickup', equipmentId: equipment.id,
+      source: 'hero', x: 1510, y: 430 };
+    const normal = recordingRenderer();
+    const calm = recordingRenderer(true);
+    for (const recording of [normal, calm]) {
+      recording.renderer.effect(event); // An event can precede its first wide-world frame.
+      recording.renderer.effect({ ...event });
+      recording.renderer.render(state, meta);
+    }
+    const rings = (recording) => recording.strokes.filter(({ color, points }) =>
+      color === equipment.color && points.some((point) => point.kind === 'arc'
+        && point.x === 1510 && point.y === 412));
+    assert.equal(rings(normal).length, 1, 'replayed pickup is not painted twice');
+    assert.equal(rings(normal)[0].originX + 1510, 620,
+      'the pickup ring shares the drop camera transform');
+    const radius = (recording) => rings(recording)[0].points.find((point) => point.kind === 'arc').radius;
+    const firstNormal = radius(normal);
+    const firstCalm = radius(calm);
+    advance(90);
+    for (const recording of [normal, calm]) {
+      recording.strokes.length = 0;
+      recording.renderer.render({ ...state, tick: 41 }, meta);
+    }
+    assert.ok(radius(normal) > firstNormal, 'regular pickup has one brief expanding confirmation');
+    assert.equal(radius(calm), firstCalm, 'low-motion pickup fades at a fixed radius');
+    normal.strokes.length = 0;
+    normal.renderer.render({ ...state, tick: 42 }, { ...meta, sceneToken: 2 });
+    assert.equal(rings(normal).length, 0, 'a new attempt cannot inherit an old pickup ring');
+  });
+});
+
+test('equipment hits use confirmed contact only without fist brush or screen shake', () => {
+  withClock(() => {
+    const equipment = equipmentForBoss(20);
+    const recording = recordingRenderer();
+    const meta = { mode: 'campaign', theme: 'land', level: 43 };
+    const state = scrollingState(1370, { tick: 39 });
+    recording.renderer.render(state, meta);
+    recording.renderer.effect({ id: 'equip-hit', type: 'hit', delivery: 'equipment',
+      equipmentId: equipment.id, source: 'hero', target: 'enemy',
+      x: 1510, y: 350, damage: equipment.damage, heavy: true });
+    recording.strokes.length = 0;
+    recording.fills.length = 0;
+    recording.renderer.render({ ...state, tick: 40 }, meta);
+    assert.equal(recording.strokes.filter(({ color }) => color === '#fff9e9').length, 0,
+      'weapon contact never paints the close-range fist brush');
+    const hitRing = recording.strokes.filter(({ color, points }) => color === equipment.color
+      && points.some((point) => point.kind === 'arc' && point.x === 1510));
+    assert.equal(hitRing.length, 1, 'one restrained cue marks the authoritative target');
+    assert.equal(hitRing[0].originX + 1510, 620, 'the confirmed hit stays at its world position');
+    assert.equal(heroHead(recording.fills).originX, 480,
+      'equipment damage adds no screen shake or displacement');
+  });
+});
+
+test('copied equipment drops, poses and pickup events never enter a PvP scene', () => {
+  const equipment = equipmentForBoss(50);
+  const state = scrollingState(520, {
+    arena: { theme: 'land', width: 960, groundY: 430, platforms: [], hazards: [] },
+    fighters: [{ ...fighter('hero', 0, 0), id: 'p1', team: 0, x: 520,
+      equipmentAttackId: equipment.id, equipmentTick: equipment.activeFrom }],
+    equipmentDrops: [{ id: 'spoof-drop', equipmentId: equipment.id,
+      x: 560, y: 430, spawnedTick: 40 }],
+  });
+  const recording = recordingRenderer(true);
+  const meta = { mode: 'duel', theme: 'land' };
+  recording.renderer.effect({ id: 'early-duel-pickup', type: 'equipment-pickup',
+    equipmentId: equipment.id, x: 560, y: 430 });
+  recording.renderer.render(state, meta);
+  recording.renderer.effect({ id: 'duel-equip-hit', type: 'hit', delivery: 'equipment',
+    equipmentId: equipment.id, x: 560, y: 350 });
+  recording.strokes.length = 0;
+  recording.fills.length = 0;
+  recording.renderer.render({ ...state, tick: 41 }, meta);
+  assert.equal(recording.fills.filter(({ color }) => color === equipment.color).length, 0);
+  assert.equal(recording.strokes.filter(({ color }) => color === equipment.color).length, 0,
+    'PvP retains its existing plain hero even if a copied state/event has campaign-only fields');
 });

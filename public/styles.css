@@ -179,6 +179,11 @@ button:focus-visible, input:focus-visible, .map-stage:focus-visible {
 .spear-status { max-width: 100%; padding: 6px 9px; border: 1px solid #9c8061; color: #f0d6af; background: rgba(93,65,41,.27); font-size: 10px; font-weight: 800; letter-spacing: .02em; line-height: 1.4; font-variant-numeric: tabular-nums; }
 .spear-status.is-ready { border-color: #f3c985; color: #fff4dc; background: rgba(151,102,51,.39); box-shadow: 0 0 15px rgba(245,182,109,.2); }
 .spear-status.is-aiming { border-color: #8fe5d3; color: #e1fff3; background: rgba(47,106,91,.45); }
+.equipment-status { display: inline-flex; align-items: center; gap: 9px; max-width: 100%; min-height: 32px; padding: 3px 4px 3px 10px; border: 1px solid #738e83; color: #e5f6dd; background: rgba(45,84,72,.38); font-size: 10px; font-weight: 800; line-height: 1.4; }
+.equipment-status.is-equipped { border-color: #c9dba0; box-shadow: 0 0 14px rgba(198,239,160,.12); }
+#equipment-brief { min-width: 0; overflow: hidden; text-overflow: ellipsis; }
+.equipment-status__open { flex: none; min-height: 30px; padding: 4px 9px; border: 1px solid #a9c5ac; color: #17352e; background: #d9e6bd; font-size: 10px; font-weight: 900; font-variant-numeric: tabular-nums; }
+.equipment-status__open:hover { background: #eff2d3; }
 .keyboard-guide { display: flex; flex-wrap: wrap; gap: 6px clamp(7px,1.3vw,18px); color: #adbfb7; font-size: 10px; }
 .keyboard-guide > span { display: inline-flex; align-items: center; gap: 3px; white-space: nowrap; }
 kbd { display: inline-block; min-width: 20px; padding: 3px 5px; border: 1px solid #5b7270; border-bottom-width: 2px; color: #eef0e3; font: 700 9px/1 "Bahnschrift", "Arial Narrow", sans-serif; text-align: center; }
@@ -188,6 +193,7 @@ kbd { display: inline-block; min-width: 20px; padding: 3px 5px; border: 1px soli
 .touch-actions .touch-key:disabled { opacity: .48; filter: saturate(.35); }
 .touch-actions .touch-key--spear { min-width: 68px; border-color: #e5c089; color: #392717; background: linear-gradient(135deg,#f6d3a0,#da9d68); }
 .touch-actions .touch-key--spear:disabled { opacity: .48; filter: saturate(.35); }
+.touch-actions .touch-key--equipment { min-width: 68px; border-color: #c8dea9; color: #18362f; background: linear-gradient(135deg,#ecf6c9,#9ccdb4); }
 .spear-aim-controls { display: flex; flex-basis: 100%; justify-content: flex-end; gap: 7px; }
 .spear-angle { display: inline-flex; align-items: center; color: #e1fff3; font-size: 13px; font-weight: 900; font-variant-numeric: tabular-nums; white-space: nowrap; }
 .spear-aim-controls .touch-key { min-width: 58px; border-color: #8ebcae; color: #e3fff2; background: #315b54; }
@@ -300,6 +306,27 @@ kbd { display: inline-block; min-width: 20px; padding: 3px 5px; border: 1px soli
 .avatar-dialog__message.is-error { color: #ffc3aa; }
 .avatar-reset { width: 100%; min-height: 44px; color: #d7e5d8; }
 
+.backpack-dialog { width: min(590px, calc(100vw - 32px)); max-width: 100%; max-height: calc(100dvh - 32px - env(safe-area-inset-top) - env(safe-area-inset-bottom)); margin: auto; padding: 0; overflow-x: hidden; overflow-y: auto; border: 1px solid #729989; border-radius: 2px; color: var(--bone); background: #142729; box-shadow: 0 32px 90px rgba(0,0,0,.55), 0 8px 24px rgba(0,0,0,.25); color-scheme: dark; }
+.backpack-dialog::backdrop { background: rgba(5,17,18,.83); }
+.backpack-dialog__body { position: relative; padding: 31px clamp(20px, 6vw, 32px) 25px; }
+.backpack-dialog__body::before { content: ""; position: absolute; top: 0; left: clamp(20px, 6vw, 32px); width: 63px; height: 4px; transform: skewX(-25deg); background: #bbdfa8; }
+.backpack-dialog__close { position: absolute; top: 15px; right: 16px; display: grid; place-items: center; width: 44px; height: 44px; padding: 0; border: 1px solid rgba(241,234,219,.32); color: var(--bone); background: transparent; font-size: 26px; line-height: 1; }
+.backpack-dialog__close:hover { background: rgba(241,234,219,.1); }
+.backpack-dialog__eyebrow { display: block; margin-right: 48px; color: #bbdfa8; font: 800 10px/1 "Bahnschrift", "Arial Narrow", sans-serif; letter-spacing: .15em; }
+.backpack-dialog h2 { margin: 9px 48px 8px 0; font-size: clamp(23px, 5vw, 30px); font-weight: 900; }
+#backpack-help { max-width: 58ch; margin: 0 0 17px; color: #d5e2d9; font-size: 12px; line-height: 1.65; }
+.backpack-list { display: grid; gap: 8px; max-height: min(48dvh, 390px); overflow-y: auto; padding: 1px 3px 4px 1px; }
+.backpack-item { display: grid; grid-template-columns: 40px minmax(0,1fr) auto; align-items: center; gap: 10px; width: 100%; min-height: 70px; padding: 10px 12px; border: 1px solid #5c786e; color: #eaf0df; background: #203c3a; text-align: left; }
+.backpack-item:hover { border-color: #bbdfa8; background: #2b4b45; }
+.backpack-item[aria-pressed="true"] { border-color: #e1ecb6; background: #315449; box-shadow: inset 4px 0 #d8e9a3; }
+.backpack-item__mark { display: grid; place-items: center; width: 36px; height: 36px; border: 1px solid currentColor; border-radius: 50%; color: var(--equipment-color, #bbdfa8); font: 900 18px/1 "Microsoft YaHei UI", sans-serif; }
+.backpack-item__copy { display: grid; gap: 4px; min-width: 0; }
+.backpack-item__copy strong { overflow: hidden; font-size: 13px; white-space: nowrap; text-overflow: ellipsis; }
+.backpack-item__copy small { color: #b9cbc1; font-size: 10px; line-height: 1.4; }
+.backpack-item__choice { color: #ddedb4; font-size: 11px; font-weight: 900; white-space: nowrap; }
+.backpack-empty { margin: 0; padding: 23px 17px; border: 1px dashed #77958a; color: #d1e3d4; font-size: 12px; line-height: 1.6; }
+.backpack-dialog__message { min-height: 20px; margin: 15px 0 0; color: #c4d8ca; font-size: 11px; line-height: 1.5; }
+
 @media (max-width: 1280px) {
   .masthead { grid-template-columns: minmax(165px,1fr) auto minmax(165px,1fr); gap: 8px; }
   .mode-tab { min-width: 120px; padding-inline: 13px; }
@@ -391,6 +418,11 @@ kbd { display: inline-block; min-width: 20px; padding: 3px 5px; border: 1px soli
   .avatar-dialog__close { top: 9px; right: 10px; }
   .avatar-dialog__preview { width: 105px; height: 105px; margin-block: 15px; font-size: 43px; }
   .avatar-camera-view video { max-height: 30dvh; }
+  .backpack-dialog { width: calc(100vw - 20px); }
+  .backpack-dialog__body { padding: 26px 18px 20px; }
+  .backpack-dialog__body::before { left: 18px; }
+  .backpack-dialog__close { top: 9px; right: 10px; }
+  .backpack-list { max-height: 46dvh; }
   .site-footer span:last-child { display: none; }
 }
 @media (max-width: 430px) {
