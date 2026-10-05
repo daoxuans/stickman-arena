@@ -39,6 +39,7 @@ const SPEAR_DEFAULT_ANGLE = 42;
 const SPEAR_LIFETIME = 94;
 export const ROCK_GRAVITY = SPEAR_GRAVITY;
 export const BOSS_SUMMON_CAP = 5;
+export const BOSS_SUMMON_PER_CAST = 2;
 const BOSS_SKILL_ORDER = ['ward', 'volley', 'quake', 'summon', 'rock'];
 const BOSS_SKILL_TIER = { rock: 1, summon: 2, quake: 3, volley: 4, ward: 5 };
 const BOSS_WINDUP = { rock: 32, summon: 40, quake: 30, volley: 36, ward: 24 };
@@ -92,7 +93,31 @@ function inputOf(value) {
 
 function event(state, type, fields = {}) {
   state.events.push({ id: `${state.tick}:${state.events.length}`, type, ...fields });
-  if (type === 'ko') rememberEnemyCorpse(state, fields.target);
+  if (type !== 'ko') return;
+  rememberEnemyCorpse(state, fields.target);
+  if (state.mode !== 'campaign') return;
+  const boss = state.fighters.find((fighter) => fighter.id === fields.target
+    && fighter.team === 1 && fighter.kind === 'boss' && fighter.hp <= 0);
+  if (!boss) return;
+  // A real Boss KO severs only its own living summons. Emit their own KO
+  // events so tomatoes/corpses remain visible, but do not credit the hero
+  // with additional personal KOs for the campaign light-wave charge.
+  for (const minion of state.fighters) {
+    if (minion.hp <= 0 || minion.team !== boss.team || minion.summonedBy !== boss.id) continue;
+    minion.hp = 0;
+    minion.attackStage = 0;
+    minion.attackTick = 0;
+    minion.kickType = null;
+    minion.kickTick = 0;
+    minion.dodgeTicks = 0;
+    minion.attackBuffered = false;
+    minion.bossCast = null;
+    cancelSpear(state, minion);
+    event(state, 'ko', {
+      x: minion.x, y: minion.y - minion.height * 0.45,
+      target: minion.id, source: boss.id, cause: 'summoner-ko',
+    });
+  }
 }
 
 function clamp(value, low, high) {
@@ -592,8 +617,11 @@ function launchSpear(state, fighter) {
   fighter.spearLaunchFacing = null;
 }
 
-function activeBossSummons(state, boss) {
-  return state.fighters.filter((fighter) => fighter.hp > 0 && fighter.summonedBy === boss.id).length;
+function activeSummons(state, team) {
+  // The five-slot limit belongs to the whole encounter, even if a future
+  // wave contains two summoning Bosses. Ownership remains per Boss for KO.
+  return state.fighters.filter((fighter) => fighter.hp > 0 && fighter.team === team
+    && typeof fighter.summonedBy === 'string').length;
 }
 
 function bossSkills(fighter) {
@@ -603,7 +631,7 @@ function bossSkills(fighter) {
 function bossSkillAvailable(state, fighter, target, skill) {
   const gap = Math.abs(target.x - fighter.x);
   if (skill === 'rock' || skill === 'volley') return gap > 115 && gap < 700;
-  if (skill === 'summon') return fighter.grounded && activeBossSummons(state, fighter) < BOSS_SUMMON_CAP;
+  if (skill === 'summon') return fighter.grounded && activeSummons(state, fighter.team) < BOSS_SUMMON_CAP;
   if (skill === 'quake') return fighter.grounded && gap <= BOSS_QUAKE_RANGE + 15
     && Math.abs(target.y - fighter.y) <= 34;
   return skill === 'ward' && fighter.wardTicks <= 0;
@@ -658,8 +686,8 @@ function beginBossCast(state, fighter, target, skill) {
     cast.volley = skill === 'volley' ? 2 : 1;
     updateRockCastGeometry(fighter, cast);
   } else if (skill === 'summon') {
-    cast.count = Math.min(BOSS_SUMMON_CAP - activeBossSummons(state, fighter),
-      fighter.bossTier >= 4 ? 3 : 2);
+    cast.count = Math.min(BOSS_SUMMON_CAP - activeSummons(state, fighter.team),
+      BOSS_SUMMON_PER_CAST);
   } else if (skill === 'quake') cast.range = BOSS_QUAKE_RANGE;
   else if (skill === 'ward') cast.durationTicks = BOSS_WARD_TICKS;
   fighter.bossCast = cast;
@@ -706,11 +734,11 @@ function launchRock(state, fighter, cast) {
 }
 
 function summonBossMinions(state, boss, cast) {
-  // Only active summons consume slots. A defeated boss cannot start another
-  // cast; surviving summons remain ordinary, killable wave enemies.
-  const freeSlots = BOSS_SUMMON_CAP - activeBossSummons(state, boss);
+  // Only active summons consume slots. A defeated Boss cannot start another
+  // cast, and its own surviving summons collapse with its real KO.
+  const freeSlots = BOSS_SUMMON_CAP - activeSummons(state, boss.team);
   const kinds = boss.bossTier >= 3 ? ['leaper', 'slinger', 'grunt'] : ['leaper', 'grunt'];
-  for (let index = 0; index < Math.min(cast.count, freeSlots); index++) {
+  for (let index = 0; index < Math.min(cast.count, freeSlots, BOSS_SUMMON_PER_CAST); index++) {
     const kind = kinds[state.summonSerial % kinds.length];
     const fighter = createFighter({
       id: `summon-${boss.id}-${++state.summonSerial}`,

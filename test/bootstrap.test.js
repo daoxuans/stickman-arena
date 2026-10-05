@@ -454,10 +454,10 @@ test('browser controller boots, switches modes, starts a fight and renders a fra
     assert.equal(elements.get('spear-angle').textContent,
       `仰角 ${Math.round(campaignHero().spearAimAngle)}°`);
     const startingAngle = campaignHero().spearAimAngle;
-    document.fire('keydown', { code: 'ArrowUp', repeat: false });
+    document.fire('keydown', { code: 'KeyW', repeat: false });
     advanceFrame();
-    document.fire('keyup', { code: 'ArrowUp' });
-    assert.ok(campaignHero().spearAimAngle > startingAngle, 'up raises the throwing angle');
+    document.fire('keyup', { code: 'KeyW' });
+    assert.ok(campaignHero().spearAimAngle > startingAngle, 'W raises the throwing angle');
     assert.equal(elements.get('spear-angle').textContent,
       `仰角 ${Math.round(campaignHero().spearAimAngle)}°`, 'keyboard adjustments refresh the touch readout');
     const raisedAngle = campaignHero().spearAimAngle;
@@ -496,6 +496,16 @@ test('browser controller boots, switches modes, starts a fight and renders a fra
     tapKey('KeyI');
     advanceFrame();
     assert.equal(campaignHero().spearAiming, true, 'a remaining spear can be aimed again');
+    tapKey('ArrowUp');
+    const upJump = advanceFrame();
+    assert.equal(upJump[0].jump, true, 'up queues a jump even while aiming');
+    assert.equal(upJump[0].aimUp, false, 'up never raises the spear angle');
+    assert.equal(campaignHero().spearAiming, false, 'jump cancels an uncommitted throw');
+    assert.equal(latestCampaignView.spearRemaining, 4, 'jumping spends no spear');
+    advanceFrame();
+    tapKey('KeyI');
+    advanceFrame();
+    assert.equal(campaignHero().spearAiming, true);
     tapKey('Escape');
     advanceFrame();
     assert.equal(campaignHero().spearAiming, false, 'Escape cancels without a projectile');
@@ -645,7 +655,7 @@ test('browser controller boots, switches modes, starts a fight and renders a fra
     assert.equal(advanceFrame()[0].jump, false);
     assert.equal(campaignInputs.at(-1).kick, false);
 
-    for (const [code, action] of [['Space', 'jump'], ['KeyJ', 'attack'], ['KeyK', 'kick'], ['KeyL', 'special'], ['KeyI', 'spear'], ['ShiftLeft', 'dodge']]) {
+    for (const [code, action] of [['Space', 'jump'], ['ArrowUp', 'jump'], ['KeyJ', 'attack'], ['KeyK', 'kick'], ['KeyL', 'special'], ['KeyI', 'spear'], ['ShiftLeft', 'dodge']]) {
       tapKey(code);
       assert.equal(advanceFrame()[0][action], true, `short ${action} keyboard tap should survive until the next tick`);
       assert.equal(advanceFrame()[0][action], false, `${action} must not automatically repeat`);
@@ -788,8 +798,13 @@ test('browser controller boots, switches modes, starts a fight and renders a fra
     document.fire('keyup', { code: 'KeyI' });
     assert.equal(socket.sent.at(-1).input.spear, false, 'release separates two I presses');
     document.fire('keydown', { code: 'ArrowUp', repeat: false });
-    assert.equal(socket.sent.at(-1).input.aimUp, true, 'an aim key is authorized in PvP');
+    assert.equal(socket.sent.at(-1).input.jump, true, 'up sends a jump in PvP');
+    assert.equal(socket.sent.at(-1).input.aimUp, false, 'up does not send spear elevation in PvP');
     document.fire('keyup', { code: 'ArrowUp' });
+    assert.equal(socket.sent.at(-1).input.jump, false);
+    document.fire('keydown', { code: 'KeyW', repeat: false });
+    assert.equal(socket.sent.at(-1).input.aimUp, true, 'W remains the PvP aim-up key');
+    document.fire('keyup', { code: 'KeyW' });
     assert.equal(socket.sent.at(-1).input.aimUp, false);
     assert.equal(elements.get('spear-button').hidden, false, 'both duelists see the spear button');
     assert.equal(elements.get('spear-guide-remaining').textContent, '5/5');
@@ -867,9 +882,14 @@ test('browser controller boots, switches modes, starts a fight and renders a fra
       'the charged wave may also cancel the unconfirmed aim');
 
     document.fire('keydown', { code: 'ArrowUp', repeat: false });
+    assert.equal(socket.sent.at(-1).input.jump, true, 'up jumps rather than nudging a PvP aim');
+    assert.equal(socket.sent.at(-1).input.aimUp, false);
+    assert.equal('aimAngle' in socket.sent.at(-1).input, false);
     document.fire('keyup', { code: 'ArrowUp' });
+    document.fire('keydown', { code: 'KeyW', repeat: false });
+    document.fire('keyup', { code: 'KeyW' });
     assert.ok(socket.sent.at(-1).input.aimAngle > 34,
-      'a quick up tap sends an absolute angle even if released before a server tick');
+      'a quick W tap sends an absolute angle even if released before a server tick');
     const upButton = elements.get('aim-up-button');
     upButton.fire('pointerdown', { pointerId: 70 });
     upButton.fire('pointerup', { pointerId: 70 });

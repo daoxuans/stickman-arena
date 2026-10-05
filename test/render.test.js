@@ -2021,12 +2021,12 @@ test('summon, ground quake and ward show bounded warnings and a persistent Boss 
         bossCast: { type, ticks: 10, totalTicks: 30, ...fields } }] }), meta);
       return recording.strokes;
     };
-    const summon = renderCast('summon', { count: 3 });
+    const summon = renderCast('summon', { count: 2 });
     assert.ok(summon.some(({ color, points }) => color === '#c6f4dd'
       && points.some((point) => point.kind === 'ellipse' && point.x === boss.x)),
     'summoning announces itself around the Boss feet');
-    assert.equal(summon.filter(({ color }) => color === '#eaffed').length, 3,
-      'its pre-cast marks communicate the capped batch size');
+    assert.equal(summon.filter(({ color }) => color === '#eaffed').length, 2,
+      'its pre-cast marks communicate the new per-cast cap');
     const quake = renderCast('quake', { range: 150 });
     const strips = quake.filter(({ color, points }) => color === '#ffc29b'
       && points.length === 7 && points.every(Array.isArray));

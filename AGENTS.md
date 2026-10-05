@@ -13,6 +13,9 @@
 
 ## 不要意外破坏的基线
 
+- ↑ 方向键与空格均用于跳跃，↑ 不再用于投矛抬角；闯关与联机瞄准时 W 抬角、↓/S 压角，触屏抬高/压低及舞台竖拖仍可调角。瞄准中按 ↑ 按跳跃处理：先取消未确认瞄准，再按动作条件尝试跳跃。
+- 单人里程碑 Boss 每次召唤最多 2 名、同场活召唤兵总数仍最多 5 名。Boss 真实 KO 同一模拟帧，仅其本人召唤且仍活着的小兵跟随真实 KO，逐个保留 KO 番茄/尸体事件；预设敌人和其他来源召唤兵不受影响。连带 KO 的来源为 Boss，不计玩家亲自 KO 的光波充能；仍有其他活敌人时须清空才过波。Boss 固定装备掉落仍在 Boss 真 KO 且玩家存活的同帧发生，双 KO 仍先失败，存档与联机规则不变。
+
 - 闯关为四主题 56 关，每章 14 关；每章第 1/5/9/13 关自动存档。失败立即回最近已激活的存档关，重试从该关满血起点重建；路线中未通关/锁定关不能跳入，已经通关的节点可进入不改正式记录的临时重打，退出恢复本页暂停的正式现场，刷新只按正式存档重建；全部通关也可重打第 56 关，不必重置记录。
 - 第 01 关按用户明确要求固定使用 `public/assets/backgrounds/forest-intro.webp`；用户要求第二张照片也保留在某一关，当前实现把 `city-5.webp` 固定放在第 27 关，关号不是用户指定。其余照片映射、资源授权风险见 PRD；不要擅自移除第二张或把固定映射改成逐次随机。
 - 拳击是近身拳风，不是箭头或远程投射物；地面踢、空中跳踢、闪避、Boss 预警、KO 烂番茄和偶数关稀疏坠物须保持可读。单人敌人 KO 后先倒地，约 27 有效帧后落稳，再保留 180 有效帧；活玩家须站在尸体同一实际承载面（地面或同一块平台，含移动/倾斜木条），离开后重新走过才触发一次散骨，仅脚底高度接近或隔着浅木板不够。散骨只改变表现，不造成伤害或光波充能。最后一敌真实 KO 后约 3 秒可左右移动/跳跃且免伤的收尾窗口结束才结算；进入收尾清除已缓存的拳/踢/闪输入，拳/踢/闪/投矛/光波在窗口内不可用；临近结束触发散骨可短暂顺延至动效可见。玩家 KO/双 KO 仍立即失败。联机保留 KO 番茄，不启用踩骨或天降坠物。单关**预设**敌人总数 >3 才有闯关光波，玩家亲自 KO 两人（可含召唤兵）充一次；联机光波按本人命中充能，不能套用闯关全波比例伤害。
@@ -33,7 +36,7 @@
 |---|---|---|
 | 关卡/存档/已通关重打/照片选图 | `shared/levels.js`、`public/campaign.js`、`public/app.js`、`public/render.js` | `test/levels.test.js`、`test/campaign.test.js`、`test/bootstrap.test.js`、`test/backgrounds.test.js`；练习存档隔离、刷新、退出恢复、PRD |
 | 战斗/AI/动效 | `shared/combat.js`、`public/render.js`、`public/app.js` | `test/combat.test.js`、`test/render.test.js`、`test/sound.test.js`、尸体散骨的有效帧/镜头/减少动态效果、设计基线 |
-| Boss 装备/背包 | `shared/equipment.js`、`shared/combat.js`、`public/campaign.js`、`public/app.js`、`public/render.js`、`public/index.html`、`public/styles.css` | `test/equipment.test.js`、`test/campaign.test.js`、`test/bootstrap.test.js`、`test/render.test.js`；九 Boss 保底/去重、Boss 先死但召唤兵仍活、移动平台与世界镜头、过关收纳/回档快照、旧档补发、练习/PvP 隔离、收尾禁用装备技、PRD/设计基线/决策 D-027 |
+| Boss 装备/背包 | `shared/equipment.js`、`shared/combat.js`、`public/campaign.js`、`public/app.js`、`public/render.js`、`public/index.html`、`public/styles.css` | `test/equipment.test.js`、`test/campaign.test.js`、`test/bootstrap.test.js`、`test/render.test.js`；九 Boss 保底/去重、Boss 真 KO 时仅本人召唤兵同步 KO 且不影响预设敌/其他来源、仍有其他活敌须清空、移动平台与世界镜头、过关收纳/回档快照、旧档补发、练习/PvP 隔离、收尾禁用装备技、PRD/设计基线/决策 D-027/D-030 |
 | 背景音乐/混音 | `public/app.js` 的 `SoundEffects` 与 `syncMusic()` | `test/sound.test.js`、四主题/房主主题与战斗阶段门控、手势/静音/失焦/切局、打击与 KO 同时发生时的音乐避让；实机音量待试听 |
 | 联机房间/输入/技能与陷阱 | `server/index.js`、`shared/combat.js`、`public/app.js`、`public/render.js`、`public/index.html` | `test/server.test.js`、`test/combat.test.js`、`test/render.test.js`、`test/bootstrap.test.js`；短按/第二次投矛边沿、充能与无敌、双方机关扣血/重赛重置、长世界两端镜头、跨模式/断线边界、PRD |
 | 页面样式/触控/本地头像 | `public/index.html`、`public/styles.css`、`public/app.js`、`public/avatar.js`、`public/render.js` | `test/bootstrap.test.js`、`test/avatar.test.js`、`test/render.test.js`、上传/拍照失败、联机仅本端头像、桌面/窄屏/减少动态效果检查、设计基线 |

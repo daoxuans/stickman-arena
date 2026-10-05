@@ -69,7 +69,7 @@ const campaignActions = new Set([
 const keyBindings = new Map([
   ['KeyA', 'left'], ['ArrowLeft', 'left'],
   ['KeyD', 'right'], ['ArrowRight', 'right'],
-  ['KeyW', 'aimUp'], ['ArrowUp', 'aimUp'],
+  ['KeyW', 'aimUp'], ['ArrowUp', 'jump'],
   ['KeyS', 'aimDown'], ['ArrowDown', 'aimDown'],
   ['KeyJ', 'attack'], ['KeyK', 'kick'], ['KeyL', 'special'], ['KeyI', 'spear'],
   ['KeyE', 'equipment'], ['Space', 'jump'],
@@ -1310,7 +1310,7 @@ function updateCampaignHud() {
   const spearText = campaignView.phase === 'aftermath'
     ? `胜利收尾 · 投矛剩余 ${count}，退开再走过倒地敌人`
     : aiming
-    ? `投矛剩余 ${count} · 瞄准中，用 ↑↓ / W S 或上下拖动调角，再按 I 发射，Esc 取消`
+    ? `投矛剩余 ${count} · W 抬角、S/↓ 压角或上下拖动，再按 I 发射；↑ 跳跃并取消瞄准`
     : winding ? `投矛剩余 ${count} · 蓄势中，实际投出才扣次；被击中会打断`
       : spearRemaining === 0 ? `投矛已用尽（${count}）· 下一关或失败回档重试后恢复`
         : busy ? `投矛剩余 ${count} · 出招结束后按 I 瞄准`
@@ -1387,8 +1387,10 @@ function campaignOverlay() {
   }
   const bossTier = level.waves.flatMap((wave) => wave.groups)
     .find((group) => group.kind === 'boss' && group.bossTier > 0)?.bossTier ?? 0;
+  const summonHint = bossTier >= 2
+    ? '每次最多召唤 2 名援兵，场上活兵最多 5 名；首领 KO 时它召出的活兵也会倒下。' : '';
   const bossHint = bossTier
-    ? ` 本关首领逐级叠加${MILESTONE_BOSS_SKILLS.slice(0, bossTier).join('、')}；召唤援兵同时最多 5 名。光波对首领只扣当前血量的三分之一。击败首领必掉装备。`
+    ? ` 本关首领逐级叠加${MILESTONE_BOSS_SKILLS.slice(0, bossTier).join('、')}。${summonHint}光波对首领只扣当前血量的三分之一。击败首领必掉装备。`
     : level.isBoss ? ' 光波对首领只扣当前血量的三分之一；击败后必掉装备。' : '';
   if (phase === 'failed') {
     showOverlay({
@@ -1442,7 +1444,7 @@ function campaignOverlay() {
   } else {
     showOverlay({
       title: level.number === 1 && progress.cleared.length === 0 ? '准备开战' : '继续征程',
-      body: `第 ${level.number} / ${MAX_LEVEL} 关 · ${level.themeName}「${level.name}」。A/D 移动，J 攻击，空格跳跃，Shift 闪避。每关最多投矛 ${SPEARS_PER_LEVEL} 次；按 I 预览弧线，↑↓ 调角，再按 I 确认发射，真正投出才扣次；Esc 取消。B 打开背包，选装备后按 E 攻击。${campaignView.specialEligible ? '每击倒两名敌人可按 L 释放一次无敌光波。' : ''}${bossHint}`,
+      body: `第 ${level.number} / ${MAX_LEVEL} 关 · ${level.themeName}「${level.name}」。A/D 移动，J 攻击，↑/空格跳跃，Shift 闪避。每关最多投矛 ${SPEARS_PER_LEVEL} 次；按 I 预览弧线，W 抬角、S/↓ 压角，再按 I 确认发射，真正投出才扣次；Esc 取消。B 打开背包，选装备后按 E 攻击。${campaignView.specialEligible ? '每击倒两名敌人可按 L 释放一次无敌光波。' : ''}${bossHint}`,
       primary: '开始挑战',
       onPrimary: () => { resumeCampaign(); hideOverlay(); },
       secondary: '设置头像', onSecondary: openAvatarDialog,
@@ -1636,7 +1638,7 @@ function updateDuelHud() {
     : winding ? `朝${direction}蓄势中 · 矛实际飞出才扣次数`
       : active ? `朝${direction}前方光波射程 ${DUEL_WAVE_REACH}，需同高度 · 投矛剩余 ${count} · 空中「踢腿」可跳踢`
         : duel.phase === 'finished' ? '本局结束 · 双方申请再战后，投矛与光波重新开始'
-          : `联机：I 投矛、↑↓ 调角、L 光波 · 开战后每人 ${SPEARS_PER_DUEL} 发矛`;
+          : `联机：I 投矛、W 抬角、S/↓ 压角、↑/空格跳跃、L 光波 · 每人 ${SPEARS_PER_DUEL} 发矛`;
   ui['equipment-status'].hidden = true;
   ui['equipment-key-guide'].hidden = true;
   ui['equipment-button'].hidden = true;
@@ -1649,7 +1651,7 @@ function updateDuelHud() {
   ui['spear-status'].textContent = !active
     ? `联机投矛 ${count} · ${duel.phase === 'finished' ? `本局结束，下局恢复 ${SPEARS_PER_DUEL} 发`
       : duel.phase === 'playing' ? '已被 KO，等待结果' : '开战后按 I 瞄准'}`
-    : aiming ? `联机投矛剩余 ${count} · 朝${direction}瞄准，↑↓ / W S 或上下拖动调角，再按 I 发射，Esc 取消`
+    : aiming ? `联机投矛剩余 ${count} · 朝${direction}瞄准，W 抬角、S/↓ 压角或上下拖动，再按 I 发射；↑ 跳跃并取消瞄准`
       : winding ? `联机投矛剩余 ${count} · 蓄势中，真正投出才扣 1 发`
         : remaining === 0 ? `联机投矛已用尽（0/${SPEARS_PER_DUEL}）· 下局恢复`
           : `联机投矛剩余 ${count} · 朝${direction}按 I 瞄准，再按 I 确认`;

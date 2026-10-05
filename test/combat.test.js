@@ -1949,7 +1949,7 @@ test('a moving player can leave a locked rock arc; platform cover and dodge stil
   }
 });
 
-test('a boss summons at most five living tagged minions, refills a free slot and stops when KO', () => {
+test('a boss summons at most two per cast and five alive, refills a free slot and stops when KO', () => {
   assert.equal(BOSS_SUMMON_CAP, 5);
   const { state, boss } = milestoneDuel(2);
   const summon = () => {
@@ -1962,6 +1962,8 @@ test('a boss summons at most five living tagged minions, refills a free slot and
   for (const expected of [2, 4, 5]) {
     const cue = summon();
     assert.ok(cue);
+    assert.equal(cue.count, expected === BOSS_SUMMON_CAP ? 1 : 2,
+      'the warning reports only the free slots this cast can fill');
     assert.equal(state.fighters.filter((fighter) => fighter.hp > 0
       && fighter.summonedBy === boss.id).length, expected);
     assert.ok(state.fighters.filter((fighter) => fighter.summonedBy === boss.id)
@@ -1977,15 +1979,137 @@ test('a boss summons at most five living tagged minions, refills a free slot and
   assert.equal(state.fighters.filter((fighter) => fighter.hp > 0
     && fighter.summonedBy === boss.id).length, BOSS_SUMMON_CAP);
   assert.equal(new Set(state.fighters.map((fighter) => fighter.id)).size, state.fighters.length);
-  boss.bossAbilityCooldown = 0;
-  boss.bossCast = null;
   const survivors = state.fighters.filter((fighter) => fighter.hp > 0 && fighter.summonedBy === boss.id);
-  boss.hp = 0;
+  boss.hp = 1;
+  boss.stun = 500;
+  boss.invulnerable = 0;
+  state.projectiles.push({
+    id: 'spear-boss-ko', kind: 'spear', source: state.fighters[0].id, team: 0,
+    x: boss.x - 35, y: boss.y - 72, vx: 35, vy: -SPEAR_GRAVITY,
+    radius: 7, damage: 22, ttl: 8,
+  });
   stepCombat(state, { boss: { bossSkill: 'summon' } });
+  assert.equal(boss.hp, 0, 'the projectile produces an actual KO event');
   assert.equal(boss.bossCast, null);
   assert.equal(state.fighters.filter((fighter) => fighter.hp > 0
-    && fighter.summonedBy === boss.id).length, survivors.length,
-  'summoned enemies remain killable wave members after the boss falls');
+    && fighter.summonedBy === boss.id).length, 0,
+  'all surviving summons owned by this Boss fall in the same combat tick');
+  assert.deepEqual(state.events.filter((entry) => entry.type === 'ko')
+    .map((entry) => entry.target).sort(), [boss.id, ...survivors.map((fighter) => fighter.id)].sort());
+  assert.equal(state.corpses.filter((corpse) => survivors.some((fighter) => fighter.id === corpse.id)).length,
+    survivors.length, 'the summons still leave ordinary campaign corpses');
+  stepCombat(state, { boss: { bossSkill: 'summon' } });
+  assert.ok(!state.events.some((entry) => entry.type === 'boss-summon-windup'),
+    'no posthumous cast can create another batch');
+});
+
+test('higher-tier Bosses summon no more than two at once, even with all five slots free', () => {
+  for (const tier of [4, 5]) {
+    const { state, boss } = milestoneDuel(tier);
+    stepCombat(state, { boss: { bossSkill: 'summon' } });
+    const cue = state.events.find((entry) => entry.type === 'boss-summon-windup');
+    assert.equal(cue?.count, 2, `tier ${tier} advertises no more than two arrivals`);
+    for (let tick = 1; tick < 40; tick++) stepCombat(state);
+    assert.equal(state.fighters.filter((fighter) => fighter.hp > 0
+      && fighter.summonedBy === boss.id).length, 2,
+    `tier ${tier} produces only two living summons on its first cast`);
+  }
+});
+
+test('two Bosses share five live summon slots but only lose their own children on KO', () => {
+  const hero = createFighter({ id: 'hero', x: 210, team: 0 });
+  const first = createFighter({ id: 'boss-a', x: 550, team: 1, kind: 'boss', bossTier: 2 });
+  const second = createFighter({ id: 'boss-b', x: 950, team: 1, kind: 'boss', bossTier: 2 });
+  const state = createCombatState({
+    arena: arena({ width: 1920 }), fighters: [hero, first, second],
+  });
+  const living = () => state.fighters.filter((fighter) => fighter.team === 1
+    && fighter.summonedBy !== null && fighter.hp > 0);
+  const cast = (boss, expected) => {
+    boss.bossAbilityCooldown = 0;
+    const before = living().length;
+    stepCombat(state, { [boss.id]: { bossSkill: 'summon' } });
+    const cue = state.events.find((entry) => entry.type === 'boss-summon-windup'
+      && entry.source === boss.id);
+    assert.equal(cue?.count, expected, 'the warning uses the shared available slots');
+    for (let tick = 1; tick < 40; tick++) stepCombat(state);
+    assert.equal(living().length - before, expected, 'one cast adds only its advertised children');
+    assert.ok(living().length <= BOSS_SUMMON_CAP, 'all Bosses share the live cap');
+  };
+
+  cast(first, 2);
+  cast(second, 2);
+  cast(first, 1);
+  const firstChildren = living().filter((fighter) => fighter.summonedBy === first.id);
+  const secondChildren = living().filter((fighter) => fighter.summonedBy === second.id);
+  assert.deepEqual([firstChildren.length, secondChildren.length], [3, 2]);
+  second.bossAbilityCooldown = 0;
+  stepCombat(state, { [second.id]: { bossSkill: 'summon' } });
+  assert.equal(second.bossCast, null, 'a second Boss cannot exceed the shared cap');
+  assert.ok(!state.events.some((entry) => entry.type === 'boss-summon-windup'));
+
+  first.hp = 1;
+  first.stun = 500;
+  first.invulnerable = 0;
+  state.projectiles.push({
+    id: 'shared-cap-boss-ko', kind: 'spear', source: hero.id, team: hero.team,
+    x: first.x - 35, y: first.y - 72, vx: 35, vy: -SPEAR_GRAVITY,
+    radius: 7, damage: 22, ttl: 8,
+  });
+  stepCombat(state);
+  assert.equal(first.hp, 0, 'a real hit kills the first Boss');
+  assert.ok(firstChildren.every((fighter) => fighter.hp === 0));
+  assert.ok(secondChildren.every((fighter) => fighter.hp > 0));
+  assert.equal(second.hp, second.maxHp);
+  assert.deepEqual(state.events.filter((entry) => entry.type === 'ko')
+    .map((entry) => entry.target).sort(),
+    [first.id, ...firstChildren.map((fighter) => fighter.id)].sort());
+  assert.ok(state.events.filter((entry) => entry.type === 'ko'
+    && firstChildren.some((fighter) => fighter.id === entry.target))
+    .every((entry) => entry.source === first.id));
+  assert.equal(living().length, 2, 'only the surviving Boss children hold slots');
+
+  while (state.hitstop > 0) stepCombat(state);
+  cast(second, 2);
+  cast(second, 1);
+  assert.equal(living().length, BOSS_SUMMON_CAP,
+    'the surviving Boss refills slots freed by the other Boss KO');
+});
+
+test('a real Boss KO removes only its own living summons, preserving unrelated enemies', () => {
+  const { state, boss, hero } = milestoneDuel(2);
+  const owned = [
+    createFighter({ id: 'boss-child-a', x: 650, team: 1, kind: 'grunt', summonedBy: boss.id }),
+    createFighter({ id: 'boss-child-b', x: 710, team: 1, kind: 'slinger', summonedBy: boss.id }),
+  ];
+  const otherBoss = createFighter({ id: 'other-boss', x: 950, team: 1, kind: 'boss' });
+  const otherChild = createFighter({ id: 'other-child', x: 1050, team: 1,
+    kind: 'grunt', summonedBy: otherBoss.id });
+  const ordinary = createFighter({ id: 'ordinary', x: 1150, team: 1, kind: 'grunt' });
+  state.fighters.push(...owned, otherBoss, otherChild, ordinary);
+  boss.hp = 1;
+  boss.stun = 500;
+  boss.invulnerable = 0;
+  state.projectiles.push({
+    id: 'targeted-boss-ko', kind: 'spear', source: hero.id, team: hero.team,
+    x: boss.x - 70, y: boss.y - 72, vx: 70, vy: -SPEAR_GRAVITY,
+    radius: 7, damage: 22, ttl: 8,
+  });
+
+  stepCombat(state);
+  assert.equal(boss.hp, 0);
+  assert.deepEqual(owned.map((fighter) => fighter.hp), [0, 0]);
+  assert.deepEqual([otherBoss.hp, otherChild.hp, ordinary.hp],
+    [otherBoss.maxHp, otherChild.maxHp, ordinary.maxHp],
+    'another Boss, its child and a preset enemy are not affected');
+  const ko = state.events.filter((entry) => entry.type === 'ko');
+  assert.deepEqual(ko.map((entry) => entry.target).sort(),
+    [boss.id, ...owned.map((fighter) => fighter.id)].sort());
+  assert.ok(ko.filter((entry) => owned.some((fighter) => fighter.id === entry.target))
+    .every((entry) => entry.source !== hero.id),
+  'the player did not personally KO the linked summons');
+  assert.deepEqual(state.corpses.map((corpse) => corpse.id).sort(),
+    [boss.id, ...owned.map((fighter) => fighter.id)].sort());
 });
 
 test('quake hits the same grounded support only, while a jump or shallow intervening plank avoids it', () => {

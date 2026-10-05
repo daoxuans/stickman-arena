@@ -693,7 +693,7 @@ test('a light wave takes one third of Boss current HP, half from other foes, eve
   assert.equal(retry.combat.fighters.some((fighter) => fighter.summonedBy), false);
 });
 
-test('Boss summons join the live wave, and defeating the Boss does not skip surviving minions', () => {
+test('Boss summons join the live wave and collapse on its real KO without earning extra light-wave charge', () => {
   const session = new CampaignSession({ storage: seedProgress(20, 19) });
   const level = session.start().level;
   while (session.waveIndex < level.waves.length - 1) knockOutWave(session);
@@ -708,15 +708,54 @@ test('Boss summons join the live wave, and defeating the Boss does not skip surv
   assert.equal(arrival.level.enemyCount, 4, 'extra summons never change the static level-size gate');
   assert.ok(arrival.events.filter((event) => event.type === 'boss-summon').length >= 2);
 
-  boss.hp = 0;
-  const waiting = session.step();
-  assert.equal(waiting.phase, 'playing');
-  assert.equal(waiting.waveNumber, level.waves.length);
-  assert.equal(waiting.combat.fighters.filter((fighter) => fighter.summonedBy === boss.id && fighter.hp > 0).length, 2);
-  minions[0].hp = 0;
-  const finish = knockOutWithHero(session, 1);
-  assert.equal(finish.phase, 'aftermath', 'last minion KO starts the normal playable victory window');
-  assert.equal(finish.specialKills, 1, 'a summoned foe personally KOed by the player counts as an enemy');
+  minions.forEach((minion, index) => {
+    minion.x = hero.x + 400 + index * 60;
+    minion.stun = 500;
+  });
+  const { result } = knockOutBossWithHero(session);
+  assert.equal(result.phase, 'aftermath', 'the last Boss and its linked summons enter the normal victory window');
+  assert.equal(result.waveNumber, level.waves.length);
+  assert.ok(minions.every((minion) => minion.hp === 0));
+  assert.ok(minions.every((minion) => result.events.some((event) => event.type === 'ko'
+    && event.target === minion.id && event.source !== hero.id)));
+  assert.ok(minions.every((minion) => result.combat.corpses.some((corpse) => corpse.id === minion.id)),
+    'linked summons keep the usual KO corpse and scatter lifecycle');
+  assert.equal(result.specialKills, 1, 'only the Boss personally KOed by the hero counts');
+  assert.equal(result.specialCharges, 0, 'two collapsing minions cannot generate a free light wave');
+  assert.equal(result.combat.equipmentDrops.length, 1, 'the real Boss KO still drops its reward');
+});
+
+test('a summoned enemy personally KOed before its Boss still charges the campaign light wave', () => {
+  const session = new CampaignSession({ storage: seedProgress(20, 19) });
+  session.start();
+  const boss = enterBossWave(session);
+  const hero = session.combat.fighters.find((fighter) => fighter.id === 'hero');
+  const personal = createFighter({ id: 'personal-summon', x: hero.x + 40, y: hero.y,
+    team: 1, kind: 'grunt', summonedBy: boss.id });
+  const linked = createFighter({ id: 'linked-summon', x: hero.x + 500, y: hero.y,
+    team: 1, kind: 'grunt', summonedBy: boss.id });
+  personal.hp = 1;
+  personal.stun = linked.stun = boss.stun = 500;
+  boss.x = hero.x + 500;
+  session.combat.fighters.push(personal, linked);
+  hero.attackStage = 1;
+  hero.attackTick = 4;
+  hero.hitIds = [];
+  hero.facing = 1;
+  const first = session.step();
+  assert.equal(personal.hp, 0);
+  assert.ok(boss.hp > 0);
+  assert.equal(first.specialKills, 1, 'a player-delivered minion KO still counts');
+  assert.equal(first.specialCharges, 0);
+  finishHitstop(session);
+
+  const { result } = knockOutBossWithHero(session);
+  assert.equal(result.phase, 'aftermath');
+  assert.equal(linked.hp, 0);
+  assert.equal(result.specialKills, 2, 'the subsequent personal Boss KO completes the pair');
+  assert.equal(result.specialCharges, 1, 'the automatic linked KO does not count as a third personal kill');
+  assert.ok(!result.events.some((event) => event.type === 'ko'
+    && event.target === linked.id && event.source === hero.id));
 });
 
 test('the final boss ends the campaign and persists completion', () => {
@@ -1083,7 +1122,7 @@ test('uncollected gear follows a Boss corpse on a moving platform, then falls af
   assert.equal(drop.y, formerY + 7);
 });
 
-test('Boss KO drops equipment while its summoned minion still blocks completion; failure rolls it back', () => {
+test('Boss KO drops equipment and collapses its minion, but an unrelated foe blocks completion', () => {
   const store = seedProgress(20, 19);
   const session = new CampaignSession({ storage: store });
   session.start();
@@ -1093,11 +1132,17 @@ test('Boss KO drops equipment while its summoned minion still blocks completion;
     id: 'remaining-summon', name: '援兵', team: 1, kind: 'grunt',
     x: hero.x + 500, y: hero.y, summonedBy: boss.id,
   });
-  minion.stun = 500;
-  session.combat.fighters.push(minion);
+  const unrelated = createFighter({
+    id: 'independent-enemy', name: '预设敌人', team: 1, kind: 'grunt',
+    x: hero.x + 600, y: hero.y,
+  });
+  minion.stun = unrelated.stun = 500;
+  session.combat.fighters.push(minion, unrelated);
   const { result } = knockOutBossWithHero(session);
   assert.equal(result.phase, 'playing');
-  assert.ok(result.combat.fighters.some((fighter) => fighter.id === minion.id && fighter.hp > 0));
+  assert.equal(minion.hp, 0);
+  assert.ok(result.events.some((event) => event.type === 'ko' && event.target === minion.id));
+  assert.equal(unrelated.hp, unrelated.maxHp, 'a non-summoned foe remains alive');
   assert.equal(result.combat.equipmentDrops.length, 1);
   assert.ok(result.events.some((event) => event.type === 'equipment-drop'));
   let picked = result;
@@ -1127,6 +1172,12 @@ test('same-frame Boss and hero KO fails without generating persistent or collect
   boss.stun = 500;
   boss.invulnerable = 0;
   boss.wardTicks = 0;
+  const minion = createFighter({
+    id: 'double-ko-linked-summon', x: hero.x + 500, y: hero.y,
+    team: 1, kind: 'grunt', summonedBy: boss.id,
+  });
+  minion.stun = 500;
+  session.combat.fighters.push(minion);
   hero.hp = 1;
   hero.invulnerable = 0;
   hero.hazardCooldown = 0;
@@ -1140,6 +1191,8 @@ test('same-frame Boss and hero KO fails without generating persistent or collect
   const failure = session.step();
   assert.ok(failure.events.some((event) => event.type === 'ko' && event.target === boss.id));
   assert.ok(failure.events.some((event) => event.type === 'ko' && event.target === hero.id));
+  assert.equal(minion.hp, 0, 'the linked enemy still falls on its Boss KO');
+  assert.ok(failure.events.some((event) => event.type === 'ko' && event.target === minion.id));
   assert.equal(failure.phase, 'failed');
   assert.ok(!failure.events.some((event) => event.type === 'equipment-drop'));
   assert.deepEqual(failure.combat.equipmentDrops, []);

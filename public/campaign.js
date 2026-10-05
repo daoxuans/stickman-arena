@@ -554,8 +554,8 @@ export class CampaignSession {
       });
       if (this.replayLevel === null) this.#save();
     } else {
-      // A Boss may fall while its summoned minions remain alive. Reward the
-      // actual KO once, then leave ordinary wave progression to the live foes.
+      // A Boss's own summons collapse on its KO. Preset foes or summons from
+      // another source can still block the wave; reward the real Boss KO once.
       this.#dropBossEquipment();
       this.#pickupNearby(player);
       if (this.combat.fighters.every((fighter) => fighter.team === 0 || fighter.hp <= 0)) {
