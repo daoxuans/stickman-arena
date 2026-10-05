@@ -1765,7 +1765,8 @@ function drawWandererCape(ctx, shoulder, fighter, facing, tick, reducedMotion, d
 function drawWandererFace(ctx, head, expression, palette, defeated, attackStage) {
   const [x, y] = head;
   // No blur passes: a saturated underlay and crisp pale core make the eyes
-  // shine at a 44px head size, including on a bright photo background.
+  // shine at a 44px head size against the stage background. A local portrait
+  // replaces these facial strokes instead of having them painted over it.
   if (defeated) {
     for (const offset of [-9, 9]) {
       line(ctx, [[x + offset - 4, y - 5], [x + offset + 3, y + 1]],
@@ -1812,10 +1813,10 @@ function drawWandererFace(ctx, head, expression, palette, defeated, attackStage)
 }
 
 function drawWandererAvatar(ctx, head, avatar) {
-  if (!avatar || avatar.complete === false) return;
+  if (!avatar || avatar.complete === false) return false;
   const width = Number(avatar.naturalWidth ?? avatar.width);
   const height = Number(avatar.naturalHeight ?? avatar.height);
-  if (!Number.isFinite(width) || !Number.isFinite(height) || width <= 0 || height <= 0) return;
+  if (!Number.isFinite(width) || !Number.isFinite(height) || width <= 0 || height <= 0) return false;
 
   // Cover the face rather than stretching a portrait. The small upward bias
   // keeps eyes in the large head when a tall camera photo includes shoulders.
@@ -1830,8 +1831,10 @@ function drawWandererAvatar(ctx, head, avatar) {
     ctx.clip();
     ctx.drawImage(avatar, sourceX, sourceY, sourceSize, sourceSize,
       head[0] - radius, head[1] - radius, radius * 2, radius * 2);
+    return true;
   } catch {
     // A revoked or detached image falls back to the existing painted face.
+    return false;
   } finally {
     ctx.restore();
   }
@@ -2091,16 +2094,18 @@ function drawFighter(ctx, fighter, index, groundY, tick, reducedMotion = false,
   ctx.fillStyle = wanderer ? hit ? '#314954' : '#15252e' : core;
   ctx.fill();
   if (wanderer) {
-    // The photo is purely local paint inside the existing head; the outline,
-    // expressive eyes/mouth, scarf, hat and KO tomato remain above it.
-    drawWandererAvatar(ctx, head, avatar);
-    ctx.beginPath();
-    ctx.arc(head[0], head[1], HEAD_RADIUS - 1, Math.PI * .52, Math.PI * 1.42);
-    ctx.strokeStyle = WANDERER_HAT.weave;
-    ctx.lineWidth = 1.25;
-    ctx.stroke();
-    drawWandererFace(ctx, head, defeated ? 'sad' : expression,
-      wandererPalette, defeated, attackStage);
+    // A real local photo replaces the painted facial features entirely. Keep
+    // the head silhouette and costume; if drawing fails, use the default face.
+    const portraitPainted = drawWandererAvatar(ctx, head, avatar);
+    if (!portraitPainted) {
+      ctx.beginPath();
+      ctx.arc(head[0], head[1], HEAD_RADIUS - 1, Math.PI * .52, Math.PI * 1.42);
+      ctx.strokeStyle = WANDERER_HAT.weave;
+      ctx.lineWidth = 1.25;
+      ctx.stroke();
+      drawWandererFace(ctx, head, defeated ? 'sad' : expression,
+        wandererPalette, defeated, attackStage);
+    }
     drawWandererScarf(ctx, head, wandererPalette);
     drawWandererHat(ctx, head);
   } else {

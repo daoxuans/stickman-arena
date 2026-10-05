@@ -26,7 +26,7 @@ const SHADOW_WANDERER = {
     eye: '#e9feff', eyeAccent: '#7be8f1' },
 };
 
-function recordingCanvas() {
+function recordingCanvas({ failImages = false } = {}) {
   const fills = [];
   const strokes = [];
   const rects = [];
@@ -55,6 +55,7 @@ function recordingCanvas() {
         originX: drawing.offsetX, originY: drawing.offsetY, scaleX: drawing.scaleX });
     },
     drawImage(image, ...args) {
+      if (failImages) throw new Error('image is no longer drawable');
       images.push({ image, args, originX: drawing.offsetX, originY: drawing.offsetY,
         scaleX: drawing.scaleX, clip: drawing.clip, order: drawOrder++ });
     },
@@ -88,8 +89,8 @@ function recordingCanvas() {
   return { canvas, fills, strokes, rects, images, rotations, labels };
 }
 
-function recordingRenderer(reducedMotion = false) {
-  const recording = recordingCanvas();
+function recordingRenderer(reducedMotion = false, options = {}) {
+  const recording = recordingCanvas(options);
   const previousMatchMedia = globalThis.matchMedia;
   try {
     globalThis.matchMedia = () => ({ matches: reducedMotion });
@@ -140,6 +141,18 @@ function mouth(strokes, outline) {
 function mouthCurve(stroke) {
   assert.ok(stroke, 'a result or punch expression has a readable mouth');
   return stroke.points[1].cy1 - stroke.points[0][1];
+}
+
+function assertPortraitHasNoPaintedExpression(recording, portraitPaint, palette) {
+  const scarf = recording.fills.find(({ color, order }) =>
+    color === palette.scarf && order > portraitPaint.order);
+  assert.ok(scarf, 'the scarf still layers over the portrait');
+  const facialColors = new Set([palette.eye, palette.eyeAccent, palette.scarfLight,
+    SHADOW_WANDERER.head, '#fff6e5', '#8dbec1']);
+  const facialMarks = [...recording.fills, ...recording.strokes].filter(({ color, order }) =>
+    order > portraitPaint.order && order < scarf.order && facialColors.has(color));
+  assert.deepEqual(facialMarks, [], 'eyes, brows, mouth, teeth and tear must not cover the photo');
+  return scarf;
 }
 
 function renderResult(fighters, meta = {}, state = {}) {
@@ -234,7 +247,7 @@ test('boss and reduced-motion settings preserve readable facial expressions', ()
   }
 });
 
-test('a loaded local avatar is square-cropped inside the large head under expression, scarf and hat', () => {
+test('a loaded local avatar replaces the painted face under the scarf and hat', () => {
   for (const reducedMotion of [false, true]) {
     const recording = recordingRenderer(reducedMotion);
     const portrait = { complete: true, naturalWidth: 640, naturalHeight: 960 };
@@ -257,13 +270,10 @@ test('a loaded local avatar is square-cropped inside the large head under expres
     assert.deepEqual(image.args.slice(4), [circle.x - 18, circle.y - 18, 36, 36],
       'the clipped portrait tracks the animated head exactly');
     const head = heroHead(recording.fills);
-    const eye = recording.fills.find(({ color }) => color === SHADOW_WANDERER.p1.eye);
     const hat = recording.fills.find(({ color }) => color === SHADOW_WANDERER.hatOutline);
-    const scarf = recording.fills.filter(({ color }) => color === SHADOW_WANDERER.p1.scarf).at(-1);
-    assert.ok(head.order < image.order && image.order < eye.order
-      && image.order < scarf.order && image.order < hat.order,
-    'the original outline and effort face stay legible above the portrait');
-    assert.equal(mouthCurve(mouth(recording.strokes, SHADOW_WANDERER.p1.eye)), 0);
+    const scarf = assertPortraitHasNoPaintedExpression(recording, image, SHADOW_WANDERER.p1);
+    assert.ok(head.order < image.order && image.order < scarf.order && scarf.order < hat.order,
+      'the head outline remains beneath the photo while clothing stays on top');
     assert.ok(recording.fills.some(({ color }) => color === SHADOW_WANDERER.p1.capeEdge),
       'the dynamic red cloak is unchanged even under reduced motion');
 
@@ -279,12 +289,64 @@ test('a loaded local avatar is square-cropped inside the large head under expres
       'existing effort expression remains exactly available without a photo');
 
     recording.renderer.setAvatar({ complete: false, naturalWidth: 640, naturalHeight: 960 });
+    recording.strokes.length = 0;
     recording.renderer.render({ tick: 42,
       arena: { theme: 'land', groundY: 430, platforms: [], hazards: [] },
       fighters: [hero] }, { mode: 'campaign', theme: 'land', level: 3,
       localFighterId: 'hero' });
     assert.equal(recording.images.length, 0, 'an undecoded image also falls back safely');
+    assert.equal(mouthCurve(mouth(recording.strokes, SHADOW_WANDERER.p1.eye)), 0,
+      'a failed decode retains the default facial expression');
   }
+});
+
+test('a local portrait suppresses neutral, effort, victory, failure and KO facial marks', () => {
+  const portrait = { complete: true, naturalWidth: 192, naturalHeight: 192 };
+  const arena = { theme: 'land', groundY: 430, platforms: [], hazards: [] };
+  for (const [name, phase, attackStage, hp] of [
+    ['neutral', 'playing', 0, 100],
+    ['effort', 'playing', 2, 100],
+    ['victory', 'cleared', 0, 100],
+    ['failure', 'failed', 0, 100],
+    ['KO', 'failed', 0, 0],
+  ]) {
+    const recording = recordingRenderer();
+    recording.renderer.setAvatar(portrait);
+    const hero = { ...fighter('hero', attackStage, 8), id: 'hero', team: 0, hp };
+    recording.renderer.render({ tick: 40, arena, fighters: [hero] },
+      { mode: 'campaign', theme: 'land', level: 3,
+        campaignPhase: phase, localFighterId: 'hero' });
+    assert.equal(recording.images.length, 1, `${name} still displays the portrait`);
+    assertPortraitHasNoPaintedExpression(recording, recording.images[0], SHADOW_WANDERER.p1);
+  }
+});
+
+test('a portrait belongs only to the hero; an attacking enemy keeps its expression', () => {
+  const recording = recordingRenderer();
+  recording.renderer.setAvatar({ complete: true, width: 192, height: 192 });
+  const hero = { ...fighter('hero', 0, 0), id: 'hero', team: 0, x: 330 };
+  const enemy = { ...fighter('grunt', 2, 15, -1), id: 'enemy', team: 1, x: 630 };
+  recording.renderer.render({ tick: 40,
+    arena: { theme: 'land', groundY: 430, platforms: [], hazards: [] },
+    fighters: [hero, enemy] },
+  { mode: 'campaign', theme: 'land', level: 3, localFighterId: 'hero' });
+  assert.equal(recording.images.length, 1);
+  assertPortraitHasNoPaintedExpression(recording, recording.images[0], SHADOW_WANDERER.p1);
+  assert.equal(mouthCurve(mouth(recording.strokes, '#663f41')), 0,
+    'the enemy effort expression is unaffected by the hero portrait');
+});
+
+test('an image that becomes undrawable restores the default expression', () => {
+  const recording = recordingRenderer(false, { failImages: true });
+  recording.renderer.setAvatar({ complete: true, naturalWidth: 192, naturalHeight: 192 });
+  const hero = { ...fighter('hero', 2, 8), id: 'hero', team: 0 };
+  recording.renderer.render({ tick: 40,
+    arena: { theme: 'land', groundY: 430, platforms: [], hazards: [] },
+    fighters: [hero] },
+  { mode: 'campaign', theme: 'land', level: 3, localFighterId: 'hero' });
+  assert.equal(recording.images.length, 0);
+  assert.equal(mouthCurve(mouth(recording.strokes, SHADOW_WANDERER.p1.eye)), 0,
+    'drawImage failure cannot leave a blank head');
 });
 
 test('only the fighter selected by this local client receives its avatar in a duel', () => {
@@ -300,23 +362,45 @@ test('only the fighter selected by this local client receives its avatar in a du
   const state = (tick) => ({ tick,
     arena: { theme: 'city', groundY: 430, platforms: [], hazards: [] },
     fighters });
+  const eyeCount = (palette, originX) => recording.fills.filter(({ color, originX: x }) =>
+    color === palette.eye && x === originX).length;
   recording.renderer.render(state(40), { mode: 'duel', theme: 'city', localFighterId: 'p2' });
   assert.equal(recording.images.length, 1);
   assert.equal(recording.images[0].image, portrait);
   assert.equal(recording.images[0].originX, 630);
   assert.equal(recording.images[0].scaleX, -1);
+  assertPortraitHasNoPaintedExpression(recording, recording.images[0], SHADOW_WANDERER.p2);
+  assert.equal(eyeCount(SHADOW_WANDERER.p2, 630), 0, 'our P2 portrait has no painted eyes');
+  assert.ok(eyeCount(SHADOW_WANDERER.p1, 330) >= 2,
+    'the remote P1 retains its default expression');
   recording.images.length = 0;
+  recording.fills.length = 0;
+  recording.strokes.length = 0;
   recording.renderer.render(state(41), { mode: 'duel', theme: 'city', localFighterId: null });
   assert.equal(recording.images.length, 0, 'waiting/unassigned clients show no local photo');
+  assert.ok(eyeCount(SHADOW_WANDERER.p1, 330) >= 2
+    && eyeCount(SHADOW_WANDERER.p2, 630) >= 2,
+  'without a local fighter assignment, both players keep default faces');
+  recording.fills.length = 0;
+  recording.strokes.length = 0;
   recording.renderer.render(state(42), { mode: 'duel', theme: 'city', localFighterId: 'p1' });
   assert.equal(recording.images.length, 1);
   assert.equal(recording.images[0].originX, 330, 'local identity, not team or slot, chooses the head');
   assert.equal(recording.images[0].image, portrait,
     'an avatar attached to an incoming fighter snapshot is never trusted');
+  assertPortraitHasNoPaintedExpression(recording, recording.images[0], SHADOW_WANDERER.p1);
+  assert.equal(eyeCount(SHADOW_WANDERER.p1, 330), 0, 'our P1 portrait has no painted eyes');
+  assert.ok(eyeCount(SHADOW_WANDERER.p2, 630) >= 2,
+    'the remote P2 retains its default expression');
   recording.images.length = 0;
+  recording.fills.length = 0;
+  recording.strokes.length = 0;
   recording.renderer.setAvatar(null);
   recording.renderer.render(state(43), { mode: 'duel', theme: 'city', localFighterId: 'p2' });
   assert.equal(recording.images.length, 0, 'local deletion removes photos from both duel heads');
+  assert.ok(eyeCount(SHADOW_WANDERER.p1, 330) >= 2
+    && eyeCount(SHADOW_WANDERER.p2, 630) >= 2,
+  'clearing the photo restores both default faces');
 });
 
 test('the own KO echo keeps its avatar and tomato, then sceneToken clears old echoes', () => {
@@ -334,12 +418,17 @@ test('the own KO echo keeps its avatar and tomato, then sceneToken clears old ec
     advance(420);
     recording.images.length = 0;
     recording.fills.length = 0;
+    recording.strokes.length = 0;
     recording.renderer.render({ tick: 40, arena, fighters: [] }, meta);
     assert.equal(recording.images.length, 1, 'our KO ghost still wears the chosen face');
     const portraitPaint = recording.images[0];
+    const scarf = assertPortraitHasNoPaintedExpression(recording, portraitPaint,
+      SHADOW_WANDERER.p1);
+    const hat = recording.fills.find(({ color }) => color === SHADOW_WANDERER.hatOutline);
     const stain = recording.fills.find(({ color }) => color === '#702d2a');
-    assert.ok(stain && stain.order > portraitPaint.order,
-      'the rotten tomato remains on top of the fallen portrait and hat');
+    assert.ok(hat && stain && portraitPaint.order < scarf.order
+      && scarf.order < hat.order && hat.order < stain.order,
+    'the rotten tomato remains on top of the fallen portrait, scarf and hat');
 
     recording.images.length = 0;
     recording.fills.length = 0;
