@@ -210,9 +210,9 @@ test('a 1920px stage uses its far half and never spawns enemies on a ground haza
   }
 });
 
-test('the campaign spear aims before any KO, needs confirmation, repeats, and survives retry', () => {
+test('campaign spear aim/confirm costs nothing, a real throw costs one, and retry refreshes the allowance', () => {
   const session = new CampaignSession({ storage: seedProgress(7, 5) });
-  assert.equal(Object.hasOwn(session.start(), 'spearCharges'), false);
+  assert.equal(session.start().spearRemaining, 5);
   const enemy = session.combat.fighters.find((fighter) => fighter.team === 1);
   enemy.x = 500;
   enemy.hp = 60;
@@ -222,10 +222,12 @@ test('the campaign spear aims before any KO, needs confirmation, repeats, and su
   session.combat.arena.platforms = []; // Interception is verified in the combat physics tests.
   const firstAim = session.step({ spear: true });
   assert.ok(firstAim.events.some((entry) => entry.type === 'spear-aim'));
+  assert.equal(firstAim.spearRemaining, 5);
   assert.equal(session.combat.fighters[0].spearWindup, 0);
   session.step({ spear: false, aimUp: true });
   const confirmed = session.step({ spear: true });
   assert.ok(confirmed.events.some((entry) => entry.type === 'spear-windup'));
+  assert.equal(confirmed.spearRemaining, 5);
   let throws = 0;
   let hits = 0;
   for (let frame = 0; frame < 65; frame++) {
@@ -236,18 +238,21 @@ test('the campaign spear aims before any KO, needs confirmation, repeats, and su
     assert.ok(!result.events.some((entry) => entry.type === 'spear-ready'));
   }
   assert.equal(throws, 1, 'a held key never repeats the throw');
+  assert.equal(session.snapshot().spearRemaining, 4);
   assert.equal(hits, 1);
   assert.equal(enemy.hp, 38);
   session.step({ spear: false });
   assert.ok(session.step({ spear: true }).events.some((entry) => entry.type === 'spear-aim'));
   session.step({ spear: false });
   assert.ok(session.step({ spear: true }).events.some((entry) => entry.type === 'spear-windup'));
+  assert.equal(session.snapshot().spearRemaining, 4, 'a second confirmed but unthrown spear is free');
   assert.equal(session.combat.fighters[0].spearCooldown, 0);
 
   session.combat.fighters[0].hp = 0;
   assert.equal(session.step().phase, 'failed');
   const retry = session.retry();
   assert.equal(retry.level.number, 5);
+  assert.equal(retry.spearRemaining, 5, 'failure resets the per-level throw allowance');
   assert.ok(session.step({ spear: true }).events.some((entry) => entry.type === 'spear-aim'));
 });
 
@@ -271,7 +276,7 @@ test('a spear KO remains a personal KO for the existing light-wave skill', () =>
   assert.equal(ko?.source, 'hero');
   assert.equal(session.snapshot().specialKills, 1);
   assert.equal(session.snapshot().specialCharges, 0);
-  assert.equal(Object.hasOwn(session.snapshot(), 'spearCharges'), false);
+  assert.equal(session.snapshot().spearRemaining, 4);
 });
 
 test('an uncharged wave leaves spear aim alone; a charged wave cancels aim or windup', () => {
@@ -284,18 +289,65 @@ test('an uncharged wave leaves spear aim alone; a charged wave cancels aim or wi
   assert.equal(hero.spearAiming, true, 'an unavailable wave must not cancel aiming');
   session.step({ special: false });
   session.specialCharges = 1;
-  const wave = session.step({ special: true });
-  assert.ok(wave.events.some((entry) => entry.type === 'special-wave'));
+  hero.facing = -1;
+  const beforeTurnX = hero.x;
+  const wave = session.step({ special: true, right: true });
+  const turnCue = wave.events.find((entry) => entry.type === 'special-wave');
+  assert.ok(hero.x > beforeTurnX, 'the player can turn and move on the casting tick');
+  assert.equal(turnCue?.facing, 1,
+    'beam direction uses the caster facing shown after this same simulation tick');
+  assert.equal(turnCue.x, hero.x, 'the beam originates at the same-frame caster position');
+  assert.equal(turnCue.y, hero.y - hero.height * .52);
   assert.equal(hero.spearAiming, false);
   assert.equal(hero.spearWindup, 0);
+  assert.equal(wave.spearRemaining, 5, 'cancelling an aim with a wave costs no spear');
 
   session.step({ special: false, spear: true });
   session.step({ spear: false });
   session.step({ spear: true });
   assert.ok(hero.spearWindup > 0, 'a second I press commits the spear');
   session.specialCharges = 1;
-  session.step({ special: true });
+  hero.facing = -1;
+  const beforeJumpY = hero.y;
+  const secondWave = session.step({ special: true, jump: true });
   assert.equal(hero.spearWindup, 0, 'a charged wave also interrupts committed windup');
+  assert.equal(secondWave.spearRemaining, 5, 'a wave interrupting windup costs no spear');
+  assert.ok(hero.y < beforeJumpY, 'jump changes the caster hand position on the casting tick');
+  const jumpCue = secondWave.events.find((entry) => entry.type === 'special-wave');
+  assert.equal(jumpCue?.facing, -1);
+  assert.equal(jumpCue.x, hero.x);
+  assert.equal(jumpCue.y, hero.y - hero.height * .52,
+    'the source follows the airborne caster, not the pre-step feet position');
+});
+
+test('one room shares spear throws across waves; a new stage restores five without saving ammo', () => {
+  const store = seedProgress(2, 1);
+  const session = new CampaignSession({ storage: store });
+  assert.equal(session.start().spearRemaining, 5);
+  for (const enemy of session.combat.fighters.filter((fighter) => fighter.team === 1)) enemy.stun = 300;
+  session.step({ spear: true });
+  session.step({ spear: false });
+  session.step({ spear: true });
+  let launched = false;
+  for (let frame = 0; frame < 30 && !launched; frame++) {
+    const snapshot = session.step({ spear: true });
+    launched = snapshot.events.some((entry) => entry.type === 'spear-throw' && entry.source === 'hero');
+  }
+  assert.equal(launched, true);
+  assert.equal(session.snapshot().spearRemaining, 4);
+  assert.equal(new CampaignSession({ storage: store }).start().spearRemaining, 5,
+    'a page reload rebuilds the level instead of persisting a partial allowance');
+  const secondWave = knockOutWave(session);
+  assert.equal(secondWave.waveNumber, 2);
+  assert.equal(secondWave.spearRemaining, 4, 'the second wave spends from the same five');
+  const cleared = knockOutWave(session);
+  assert.equal(cleared.phase, 'cleared');
+  assert.equal(cleared.spearRemaining, 4);
+  const next = session.next();
+  assert.equal(next.level.number, 3);
+  assert.equal(next.spearRemaining, 5, 'only a new stage refreshes the limit');
+  assert.equal(Object.hasOwn(JSON.parse(store.getItem(STORAGE_KEY)), 'spearRemaining'), false,
+    'ammunition is not part of the local checkpoint record');
 });
 
 test('light-wave charges are available only in rooms with more than three enemies and require two player KOs', () => {

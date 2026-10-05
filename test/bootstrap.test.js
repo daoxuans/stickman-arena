@@ -170,7 +170,8 @@ test('browser controller boots, switches modes, starts a fight and renders a fra
     assert.equal(elements.get('special-button').hidden, true, 'the first room cannot use the wave');
     assert.equal(elements.get('spear-button').hidden, false, 'campaign shows the spear action');
     assert.equal(elements.get('spear-button').disabled, true, 'pre-fight overlay keeps the action inactive');
-    assert.match(elements.get('spear-status').textContent, /不限次数/);
+    assert.match(elements.get('spear-status').textContent, /剩余 5\/5/);
+    assert.equal(elements.get('spear-guide-remaining').textContent, '5/5');
 
     elements.get('duel-button').fire('click');
     assert.equal(elements.get('campaign-panel').hidden, true);
@@ -197,14 +198,14 @@ test('browser controller boots, switches modes, starts a fight and renders a fra
     const campaignHero = () => latestCampaignView.combat.fighters.find((fighter) => fighter.id === 'hero');
     advanceFrame(35);
     assert.equal(elements.get('spear-button').disabled, false, 'a player can aim from the first fight without a KO');
-    assert.equal(elements.get('spear-button').attributes.get('aria-label'), '进入投矛瞄准，不限次数');
+    assert.equal(elements.get('spear-button').attributes.get('aria-label'), '进入投矛瞄准，剩余 5 次');
     assert.match(elements.get('player-health-text').textContent, /100 \/ 100/);
 
     tapKey('KeyI');
     assert.equal(advanceFrame()[0].spear, true);
     assert.equal(campaignHero().spearAiming, true, 'first I press should preview an arc, not throw');
     assert.equal(campaignHero().spearWindup, 0);
-    assert.equal(elements.get('spear-button').textContent, '发射');
+    assert.equal(elements.get('spear-button').textContent, '发射 ×5');
     assert.equal(elements.get('spear-aim-controls').hidden, false);
     assert.equal(elements.get('spear-angle').textContent,
       `仰角 ${Math.round(campaignHero().spearAimAngle)}°`);
@@ -239,16 +240,22 @@ test('browser controller boots, switches modes, starts a fight and renders a fra
     advanceFrame();
     assert.equal(campaignHero().spearAiming, false);
     assert.ok(campaignHero().spearWindup > 0, 'second I press commits a 20-tick windup');
+    assert.equal(latestCampaignView.spearRemaining, 5, 'confirming alone does not spend a spear');
     assert.equal(elements.get('spear-button').disabled, true);
     assert.equal(elements.get('spear-aim-controls').hidden, true);
     for (let index = 0; index < 4; index++) advanceFrame(100);
     assert.equal(campaignHero().spearWindup, 0, 'the committed throw completes before re-aiming');
+    assert.equal(latestCampaignView.spearRemaining, 4);
+    assert.equal(elements.get('spear-guide-remaining').textContent, '4/5');
+    assert.equal(elements.get('spear-button').textContent, '投矛 ×4');
+    assert.match(elements.get('touch-tip').textContent, /剩余 4\/5/);
     tapKey('KeyI');
     advanceFrame();
-    assert.equal(campaignHero().spearAiming, true, 'the unlimited spear can be aimed again');
+    assert.equal(campaignHero().spearAiming, true, 'a remaining spear can be aimed again');
     tapKey('Escape');
     advanceFrame();
     assert.equal(campaignHero().spearAiming, false, 'Escape cancels without a projectile');
+    assert.equal(latestCampaignView.spearRemaining, 4, 'cancel leaves the allowance intact');
     const spearTouch = elements.get('spear-button');
     spearTouch.fire('pointerdown', { pointerId: 79 });
     spearTouch.fire('pointerup', { pointerId: 79 });
@@ -260,15 +267,35 @@ test('browser controller boots, switches modes, starts a fight and renders a fra
     advanceFrame();
     assert.ok(campaignHero().spearWindup > 0, 'touch 发射 explicitly confirms the aimed throw');
     for (let index = 0; index < 4; index++) advanceFrame(100);
+    assert.equal(latestCampaignView.spearRemaining, 3);
     spearTouch.fire('pointerdown', { pointerId: 79 });
     spearTouch.fire('pointerup', { pointerId: 79 });
     advanceFrame();
-    assert.equal(campaignHero().spearAiming, true, 'touch can aim again without an ammo counter');
+    assert.equal(campaignHero().spearAiming, true, 'touch can aim again while throws remain');
     const cancelTouch = elements.get('aim-cancel-button');
     cancelTouch.fire('pointerdown', { pointerId: 80 });
     cancelTouch.fire('pointerup', { pointerId: 80 });
     advanceFrame();
     assert.equal(campaignHero().spearAiming, false, 'touch cancel leaves the throw uncommitted');
+    assert.equal(latestCampaignView.spearRemaining, 3);
+
+    // Core tests deplete five actual launches. Here the exhausted state probes
+    // both visible touch controls and the keyboard command path without
+    // spending the rest of the browser integration test firing four more.
+    activeCampaign.combat.spearRemaining = 0;
+    advanceFrame(100);
+    assert.equal(elements.get('spear-button').disabled, true);
+    assert.equal(elements.get('spear-button').textContent, '投矛 ×0');
+    assert.equal(elements.get('spear-guide-remaining').textContent, '0/5');
+    assert.match(elements.get('spear-status').textContent, /已用尽/);
+    assert.match(elements.get('touch-tip').textContent, /0\/5/);
+    tapKey('KeyI');
+    assert.equal(advanceFrame()[0].spear, false, 'an exhausted keyboard press does not queue a new aim');
+    assert.equal(campaignHero().spearAiming, false);
+    spearTouch.fire('pointerdown', { pointerId: 83 });
+    assert.equal(advanceFrame()[0].spear, false, 'disabled touch cannot queue a sixth spear');
+    activeCampaign.combat.spearRemaining = 3;
+    advanceFrame(100);
 
     for (const [label, cancel] of [
       ['Escape', () => tapKey('Escape')],
@@ -306,7 +333,8 @@ test('browser controller boots, switches modes, starts a fight and renders a fra
     assert.ok(latestCampaignView.events.some((event) => event.type === 'special-wave'));
     assert.equal(campaignHero().spearAiming, false);
     assert.equal(elements.get('spear-aim-controls').hidden, true, 'wave hides aim controls immediately');
-    assert.equal(elements.get('spear-button').textContent, '投矛', 'wave restores the spear button immediately');
+    assert.equal(elements.get('spear-button').textContent, '投矛 ×3',
+      'wave restores the spear button without spending a throw');
     assert.equal(elements.get('spear-button').disabled, false);
     assert.equal(elements.get('special-button').disabled, true, 'spent wave charge updates immediately');
     activeCampaign.specialEligible = false;

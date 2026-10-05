@@ -768,34 +768,178 @@ test('Boss windup gathers local gold energy without changing its warning window'
     'reduced motion keeps the warning but removes the loose charging sparks');
 });
 
-test('the special wave expands from the player once with a local crest and readable invulnerable aura', () => {
-  const { renderer, strokes, rects } = recordingRenderer();
-  renderFrame(renderer, [], 39);
-  strokes.length = 0;
-  const wave = { id: '40:special-wave', type: 'special-wave', x: 310, y: 350, radius: 960 };
-  renderer.effect(wave);
-  renderFrame(renderer, [{ ...fighter('hero', 0, 0), specialWaveTicks: 25 }], 40);
-  assert.equal(strokes.filter(({ color }) => color === '#dffff8').length, 1);
-  assert.equal(strokes.filter(({ color }) => color === '#72e4df').length, 1);
-  assert.equal(strokes.filter(({ color }) => color === '#ffe0ae').length, 1,
-    'the land scene lends the jade spell a restrained warm crest');
-  assert.ok(!rects.some(({ color }) => typeof color === 'string'
-    && color.startsWith('rgba(148,255,239,')),
-  'the cast uses a local crest instead of a full-screen flash');
-  assert.ok(strokes.some(({ color }) => color === '#ddfff3'),
-    'the hero is visibly shielded for the whole special window');
-  strokes.length = 0;
-  renderer.effect({ ...wave });
-  renderFrame(renderer, [], 41);
-  assert.equal(strokes.filter(({ color }) => color === '#dffff8').length, 1,
-    'replayed snapshots cannot stack the same full-screen wave');
+test('the special wave charges at two palms, then releases a directional beam with a quieter area echo', () => {
+  withClock((advance) => {
+    const { renderer, fills, strokes, rects } = recordingRenderer();
+    renderFrame(renderer, [], 39);
+    strokes.length = 0;
+    fills.length = 0;
+    const wave = { id: '40:special-wave', type: 'special-wave', x: 310, y: 350,
+      facing: 1, radius: 960 };
+    renderer.effect(wave);
+    renderFrame(renderer, [{ ...fighter('hero', 0, 0), specialWaveTicks: 35 }], 40);
+    assert.ok(fills.some(({ color }) => color === '#e9fff0'),
+      'the first frame gathers jade-white energy at the palms');
+    assert.equal(strokes.filter(({ color }) => color === '#fffdf0').length, 0,
+      'the long beam waits until its short visual charge finishes');
+    assert.equal(strokes.filter(({ color }) => color === '#dffff8').length, 1,
+      'the cast also sends a weaker round shock across the full wave');
+    assert.equal(strokes.filter(({ color }) => color === '#ffe0ae').length, 1,
+      'the land scene lends a restrained warm crest');
+    assert.ok(!rects.some(({ color }) => typeof color === 'string'
+      && color.startsWith('rgba(148,255,239,')),
+    'the cast never flashes a full-screen rectangle');
+    assert.ok(strokes.some(({ color }) => color === '#ddfff3'),
+      'the hero remains visibly shielded during the special window');
 
-  const reduced = recordingRenderer(true);
-  renderFrame(reduced.renderer, [], 39);
-  reduced.renderer.effect({ ...wave, id: '40:low-motion-wave' });
-  renderFrame(reduced.renderer, [], 40);
-  assert.equal(reduced.strokes.filter(({ color }) => color === '#dffff8').length, 1,
-    'reduced motion retains a stationary cast confirmation without a flash');
+    advance(175);
+    strokes.length = 0;
+    renderFrame(renderer, [{ ...fighter('hero', 0, 0), specialWaveTicks: 25 }], 50);
+    const core = strokes.find(({ color, width, points }) => color === '#fffdf0'
+      && width === 11 && points.some((point) => point.kind === 'bezier'));
+    assert.ok(core, 'a white-core jade beam moves forward from the hero');
+    assert.ok(strokes.some(({ color, width }) => color === '#173a42' && width === 46),
+      'an ink edge separates the light from bright photo backdrops');
+    assert.equal(strokes.filter(({ color }) => color === '#72e4df').length, 2,
+      'the forward beam dominates the thinner area echo');
+    assert.ok(strokes.filter(({ color }) => color === '#ffe0ae').length <= 3,
+      'the scene-coloured accent stays on the cast crest, rail and moving head');
+    strokes.length = 0;
+    renderer.effect({ ...wave });
+    renderFrame(renderer, [], 51);
+    assert.equal(strokes.filter(({ color, width }) => color === '#fffdf0' && width === 11).length, 1,
+      'replayed authoritative snapshots cannot stack the same beam');
+  });
+});
+
+test('beam head advances in world space, mirrors with cast facing and never overshoots arena edge', () => {
+  withClock((advance) => {
+    const right = recordingRenderer();
+    const left = recordingRenderer();
+    const meta = { mode: 'campaign', theme: 'land', level: 44 };
+    const state = scrollingState(1450);
+    for (const recording of [right, left]) recording.renderer.render({ ...state, tick: 39 }, meta);
+    right.renderer.effect({ id: '40:right-wave', type: 'special-wave', source: 'hero',
+      x: 1450, y: 350, facing: 1, radius: 1920 });
+    left.renderer.effect({ id: '40:left-wave', type: 'special-wave', source: 'hero',
+      x: 1450, y: 350, facing: -1, radius: 1920 });
+    const core = (recording) => recording.strokes.find(({ color, width, points }) =>
+      color === '#fffdf0' && width === 11 && points.some((point) => point.kind === 'bezier'));
+    const endpoint = (stroke) => stroke.points.find((point) => point.kind === 'bezier').x;
+
+    advance(145);
+    for (const recording of [right, left]) {
+      recording.strokes.length = 0;
+      recording.renderer.render({ ...state, tick: 48 }, meta);
+    }
+    const rightEarly = core(right);
+    const leftEarly = core(left);
+    assert.ok(rightEarly && leftEarly);
+    assert.equal(rightEarly.originX, 1450 + 39 - 960,
+      'the outgoing palm is fixed in world space across the old 960px seam');
+    assert.equal(leftEarly.originX, 1450 - 39 - 960,
+      'a left-facing cast starts from the other extended palm');
+    assert.equal(rightEarly.scaleX, 1);
+    assert.equal(leftEarly.scaleX, -1, 'the same beam geometry mirrors to the left');
+    const rightLength = endpoint(rightEarly);
+    const leftLength = endpoint(leftEarly);
+
+    advance(155);
+    for (const recording of [right, left]) {
+      recording.strokes.length = 0;
+      recording.renderer.render({ ...state, tick: 57 }, meta);
+    }
+    assert.ok(endpoint(core(right)) > rightLength + 30);
+    assert.ok(endpoint(core(left)) > leftLength + 50,
+      'the luminous head visibly advances over the first few frames');
+    assert.ok(endpoint(core(right)) <= 1920 - (1450 + 39),
+      'rightward light stops at the world boundary');
+    assert.ok(endpoint(core(left)) <= 1450 - 39,
+      'leftward light stops at the other world boundary');
+  });
+});
+
+test('reduced motion keeps a static, short directional beam and calm per-target confirmation', () => {
+  withClock((advance) => {
+    const calm = recordingRenderer(true);
+    const hero = { ...fighter('hero', 0, 0), id: 'hero', team: 0, x: 400 };
+    const behind = { ...fighter('grunt', 0, 0), id: 'behind', team: 1, x: 240 };
+    const ahead = { ...fighter('grunt', 0, 0), id: 'ahead', team: 1, x: 700 };
+    const fighters = [hero, behind, ahead];
+    renderFrame(calm.renderer, fighters, 39);
+    calm.renderer.effect({ id: '40:calm-wave', type: 'special-wave', source: 'hero',
+      x: 400, y: 350, facing: 1, radius: 1920 });
+    for (const target of [behind, ahead]) {
+      calm.renderer.effect({ id: `40:calm-hit-${target.id}`, type: 'hit', source: 'hero',
+        target: target.id, x: target.x, y: 350, heavy: true, special: true });
+    }
+    const calmCore = () => calm.strokes.find(({ color, width }) => color === '#fffdf0' && width === 4);
+    calm.strokes.length = 0;
+    renderFrame(calm.renderer, fighters, 40);
+    const first = calmCore();
+    assert.ok(first, 'low-motion players still see a clearly directional beam immediately');
+    const distance = first.points.find((point) => point.kind === 'bezier').x;
+    assert.ok(distance > 200 && distance <= 380, 'the calm beam is bounded instead of sweeping a viewport');
+    assert.equal(calm.strokes.filter(({ color }) => color === '#e4fff3').length, 2,
+      'front and rear targets each show their own hit confirmation');
+    assert.ok(calm.strokes.some(({ color, scaleX }) => color === '#e4fff3' && scaleX === -1),
+      'a target behind the main ray still has a leftward impact cue');
+    advance(145);
+    calm.strokes.length = 0;
+    renderFrame(calm.renderer, fighters, 49);
+    assert.equal(calmCore().points.find((point) => point.kind === 'bezier').x, distance,
+      'reduced motion fades a fixed ray without moving its head');
+    assert.equal(calm.strokes.filter(({ color, originX }) => color === '#ffe0ae'
+      && (originX === behind.x || originX === ahead.x)).length, 0,
+    'calm target marks do not add moving theme-coloured flecks');
+    advance(210);
+    calm.strokes.length = 0;
+    renderFrame(calm.renderer, fighters, 70);
+    assert.equal(calmCore(), undefined, 'the transient spell clears promptly');
+  });
+});
+
+test('legacy wave events infer facing from the last fighter and a new stage clears the beam', () => {
+  withClock((advance) => {
+    const { renderer, strokes } = recordingRenderer();
+    const hero = { ...fighter('hero', 0, 0, -1), id: 'hero', team: 0 };
+    renderFrame(renderer, [hero], 39);
+    renderer.effect({ id: '40:legacy-wave', type: 'special-wave', source: 'hero',
+      x: hero.x, y: 350, radius: 960 });
+    advance(160);
+    strokes.length = 0;
+    renderFrame(renderer, [hero], 40);
+    assert.ok(strokes.some(({ color, width, scaleX }) => color === '#fffdf0'
+      && width === 11 && scaleX === -1),
+    'an older event without facing still points where its source was looking');
+
+    strokes.length = 0;
+    renderer.render({ tick: 0, arena: { theme: 'city', groundY: 430, width: 960 },
+      fighters: [hero] }, { mode: 'campaign', theme: 'city', level: 15 });
+    assert.ok(!strokes.some(({ color, width }) => color === '#fffdf0' && width === 11),
+      'retry, mode or stage switches never leave the old beam on the next scene');
+  });
+});
+
+test('a wave received before the first wide-world frame keeps cast and target world coordinates', () => {
+  withClock(() => {
+    const { renderer, strokes } = recordingRenderer(true);
+    renderer.effect({ id: 'early-wave', type: 'special-wave', source: 'hero',
+      x: 1450, y: 350, facing: 1, radius: 1920 });
+    renderer.effect({ id: 'early-wave-hit', type: 'hit', special: true, heavy: true,
+      source: 'hero', target: 'enemy', x: 1510, y: 350 });
+    renderer.render(scrollingState(1450), { mode: 'campaign', theme: 'land', level: 44 });
+    const echo = strokes.find(({ color, points }) => color === '#dffff8'
+      && points.some((point) => point.kind === 'arc' && point.x === 1450));
+    const beam = strokes.find(({ color, width }) => color === '#fffdf0' && width === 4);
+    const mark = strokes.find(({ color }) => color === '#e4fff3');
+    assert.equal(echo?.originX, -960);
+    assert.equal(beam?.originX, 1450 + 39 - 960);
+    assert.equal(mark?.originX, 1510 - 960,
+      'neither the ray nor a distant hit snaps to the old x=960 boundary');
+    assert.ok(strokes.some(({ color }) => color === '#ffe0ae'),
+      'the first rendered chapter still tints a cast received before its scene metadata');
+  });
 });
 
 test('confirmed hits create one near-contact ink brush, with a stronger heavy stroke', () => {

@@ -20,6 +20,7 @@ const DODGE_TICKS = 11;
 const DODGE_COOLDOWN = 54;
 const FALL_TICKS = 30;
 export const SPEAR_WINDUP_TICKS = 20;
+export const SPEARS_PER_LEVEL = 5;
 const SPEAR_SPEED = 18;
 export const SPEAR_GRAVITY = 0.9;
 export const SPEAR_MIN_ANGLE = 8;
@@ -143,6 +144,7 @@ export function createCombatState({ mode = 'campaign', arena = {}, fighters = []
     fallingObject: null,
     projectiles: [],
     projectileSerial: 0,
+    ...(mode === 'campaign' ? { spearRemaining: SPEARS_PER_LEVEL } : {}),
     corpses: [],
     aftermath: false,
     status: 'playing',
@@ -483,6 +485,11 @@ function launchSpear(state, fighter) {
     ttl: SPEAR_LIFETIME,
   };
   state.projectiles.push(projectile);
+  // Aiming and windup are free; only a real player launch spends this room's
+  // shared allowance. Enemy telegraphed throws and duels have no such resource.
+  if (state.mode === 'campaign' && fighter.team === 0) {
+    state.spearRemaining = Math.max(0, state.spearRemaining - 1);
+  }
   event(state, 'spear-throw', {
     x: projectile.x, y: projectile.y, source: fighter.id,
     projectileId: projectile.id, vx: projectile.vx, vy: projectile.vy,
@@ -931,6 +938,7 @@ function moveFighter(state, fighter, input) {
       && fighter.stun === 0
       && fighter.dodgeTicks === 0 && fighter.attackStage === 0
       && fighter.kickType === null && fighter.spearWindup === 0 && fighter.spearCooldown === 0
+      && (fighter.team !== 0 || state.spearRemaining > 0)
       && (fighter.team === 0 || fighter.spearEnabled)) {
     if (fighter.team === 0) {
       if (fighter.spearAiming) confirmPlayerSpear(state, fighter);

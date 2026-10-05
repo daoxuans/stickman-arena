@@ -86,6 +86,8 @@ const SPIRIT_TINTS = {
   ocean: '#b9f1eb',
   land: '#ffe0ae',
 };
+const SPIRIT_BEAM_MS = 560;
+const SPIRIT_BEAM_CALM_MS = 330;
 
 const PHOTO_THEMES = ['forest', 'city', 'ocean', 'land'];
 const PHOTO_BACKGROUNDS = Object.fromEntries(PHOTO_THEMES.map((theme) => [theme,
@@ -1268,6 +1270,145 @@ function drawContactImpact(ctx, mark, time, reducedMotion) {
   ctx.restore();
 }
 
+function drawSpiritWave(ctx, item, progress, worldWidth, reducedMotion) {
+  const calm = reducedMotion || item.calm;
+  const crest = clamp(1 - progress / (calm ? .85 : .34), 0, 1);
+  const radius = calm ? 74 : 18 + item.radius * (1 - (1 - progress) ** 2.4);
+  ctx.save();
+  ctx.globalCompositeOperation = 'screen';
+  // The cast still affects the whole wave at once. A quieter circular echo
+  // explains hits behind the forward-facing beam without becoming the spell's
+  // main silhouette or flashing a photograph-sized rectangle.
+  ctx.globalAlpha = (1 - progress) * (calm ? .35 : .26);
+  ctx.beginPath();
+  ctx.arc(item.x, item.y, radius, 0, TAU);
+  ctx.strokeStyle = '#72e4df';
+  ctx.lineWidth = calm ? 3 : 3.5;
+  ctx.stroke();
+  ctx.strokeStyle = '#dffff8';
+  ctx.lineWidth = calm ? 1.5 : 1.8;
+  ctx.stroke();
+  if (crest > 0) {
+    ctx.globalAlpha = crest * (calm ? .4 : .45);
+    ctx.beginPath();
+    ctx.moveTo(item.x - 48, item.y - 8);
+    ctx.bezierCurveTo(item.x - 22, item.y - 46,
+      item.x + 20, item.y - 46, item.x + 48, item.y - 8);
+    ctx.strokeStyle = item.tint;
+    ctx.lineWidth = 2.4;
+    ctx.stroke();
+    ctx.beginPath();
+    ctx.moveTo(item.x - 38, item.y + 22);
+    ctx.bezierCurveTo(item.x - 15, item.y + 39,
+      item.x + 18, item.y + 39, item.x + 40, item.y + 20);
+    ctx.strokeStyle = '#baf5e5';
+    ctx.lineWidth = 1.8;
+    ctx.stroke();
+  }
+
+  // The release point matches the two extended palms on the fighter. Mirror
+  // one bounded world-space path instead of computing viewport coordinates:
+  // camera scrolling cannot detach the beam or reverse its facing mid-cast.
+  const originX = clamp(item.x + item.facing * 39, 0, worldWidth);
+  const distance = item.facing > 0 ? worldWidth - originX : originX;
+  const flight = calm ? 1 : clamp((progress - .09) / .45, 0, 1);
+  const length = calm ? Math.min(distance, 380)
+    : distance * (1 - (1 - flight) ** 2);
+  const release = calm ? .66 : clamp(flight * 3.5, 0, 1);
+  const fade = clamp((1 - progress) / (calm ? .65 : .29), 0, 1);
+  ctx.translate(originX, item.y - 5);
+  ctx.scale(item.facing, 1);
+  if (!calm && crest > 0) {
+    const glow = ctx.createRadialGradient(0, 0, 2, 0, 0, 42);
+    glow.addColorStop(0, 'rgba(220,255,235,.42)');
+    glow.addColorStop(1, 'rgba(116,238,227,0)');
+    ctx.globalAlpha = crest * .46;
+    ellipse(ctx, 0, 0, 42, 42, glow);
+  }
+  if (length > 4 && release > 0) {
+    ctx.beginPath();
+    ctx.moveTo(0, 0);
+    ctx.bezierCurveTo(length * .24, -2, length * .72, 2, length, 0);
+    ctx.lineCap = 'round';
+    ctx.globalCompositeOperation = 'source-over';
+    ctx.globalAlpha = release * fade * (calm ? .5 : .55);
+    ctx.strokeStyle = '#173a42';
+    ctx.lineWidth = calm ? 21 : 46;
+    ctx.stroke();
+    ctx.globalCompositeOperation = 'screen';
+    ctx.globalAlpha = release * fade * (calm ? .62 : .75);
+    ctx.strokeStyle = '#72e4df';
+    ctx.lineWidth = calm ? 16 : 36;
+    ctx.stroke();
+    ctx.strokeStyle = '#baf5e5';
+    ctx.lineWidth = calm ? 9 : 23;
+    ctx.stroke();
+    ctx.strokeStyle = '#fffdf0';
+    ctx.lineWidth = calm ? 4 : 11;
+    ctx.stroke();
+    if (!calm && length > 70) {
+      // A pair of fine ink-and-gold rails makes this a wuxia energy stroke,
+      // not a flat rectangular laser. Only two short curves are drawn.
+      ctx.globalAlpha = release * fade * .59;
+      ctx.beginPath();
+      ctx.moveTo(9, -23);
+      ctx.bezierCurveTo(length * .24, -32, length * .69, -18, length * .88, -12);
+      ctx.strokeStyle = item.tint;
+      ctx.lineWidth = 2.3;
+      ctx.stroke();
+      ctx.beginPath();
+      ctx.moveTo(11, 20);
+      ctx.bezierCurveTo(length * .33, 29, length * .67, 18, length * .9, 11);
+      ctx.strokeStyle = '#f2d8a6';
+      ctx.lineWidth = 1.8;
+      ctx.stroke();
+    }
+    ctx.globalAlpha = release * fade * (calm ? .7 : .83);
+    ellipse(ctx, length, 0, calm ? 8 : 19, calm ? 9 : 19, '#fffdf0');
+    ctx.beginPath();
+    ctx.arc(length, 0, calm ? 13 : 25, -.95, 1.15);
+    ctx.strokeStyle = item.tint;
+    ctx.lineWidth = calm ? 2 : 3;
+    ctx.stroke();
+  }
+  // The release remains legible in the first charged frames, before its
+  // advancing head has crossed the camera view.
+  ctx.globalCompositeOperation = 'screen';
+  ctx.globalAlpha = fade * (calm ? .7 : .83);
+  ellipse(ctx, 0, 0, calm ? 12 : 13 + crest * 4, calm ? 12 : 13 + crest * 4, '#e9fff0');
+  if (!calm && crest > 0) {
+    ctx.globalAlpha = crest * .8;
+    ctx.beginPath();
+    ctx.arc(0, 0, 24, -1.45, .2);
+    ctx.strokeStyle = '#f2d8a6';
+    ctx.lineWidth = 2.4;
+    ctx.stroke();
+  }
+  ctx.restore();
+}
+
+function drawSpiritHit(ctx, item, progress, reducedMotion) {
+  const calm = reducedMotion || item.calm;
+  ctx.save();
+  ctx.translate(item.x, item.y);
+  ctx.scale(item.facing, 1);
+  ctx.globalCompositeOperation = 'screen';
+  ctx.globalAlpha = (1 - progress) * .84;
+  const radius = calm ? 17 : 12 + progress * 13;
+  ctx.beginPath();
+  ctx.arc(0, 0, radius, -1.4, 1.15);
+  ctx.strokeStyle = '#e4fff3';
+  ctx.lineWidth = calm ? 2.4 : 3.4 - progress;
+  ctx.stroke();
+  ctx.beginPath();
+  ctx.moveTo(-9, -18);
+  ctx.bezierCurveTo(2, -22, 11, -15, 16, -7);
+  ctx.strokeStyle = calm ? '#baf5e5' : item.tint;
+  ctx.lineWidth = 2;
+  ctx.stroke();
+  ctx.restore();
+}
+
 function expressionFor(fighter, state, meta) {
   if (number(fighter.hp, 100) <= 0) return 'sad';
   if (state.status === 'finished' && state.winner != null) {
@@ -1550,6 +1691,7 @@ function drawFighter(ctx, fighter, index, groundY, tick, reducedMotion = false,
   const invulnerable = Boolean(fighter.invulnerable) || dodge;
   const defeated = number(fighter.hp, 100) <= 0;
   const spearing = (number(fighter.spearWindup) > 0 || fighter.spearAiming === true) && !defeated;
+  const waveCasting = number(fighter.specialWaveTicks) > 19 && !defeated;
   const bossWindup = boss && attacking
     && attackTick < strike.activeFrom && !defeated;
   const core = hit ? '#fff9e8' : wanderer ? '#35454b'
@@ -1579,7 +1721,7 @@ function drawFighter(ctx, fighter, index, groundY, tick, reducedMotion = false,
 
   const stride = grounded && !stun ? Math.sin(tick * .29 + index) * clamp(Math.abs(vx) / 3.2, 0, 1) : 0;
   const bob = grounded && !defeated ? Math.abs(stride) * 2 + Math.sin(tick * .065 + index) * 1.2 : 0;
-  const lean = dodge ? 13 : bossWindup ? -7 : airKick ? 11 : kicking ? -5
+  const lean = dodge ? 13 : waveCasting ? -4 : bossWindup ? -7 : airKick ? 11 : kicking ? -5
     : attacking ? 6 : stun ? -9 : clamp(vx * 1.05, -6, 6);
   const hip = [lean * .45, -36 - bob];
   const shoulder = [lean, -68 - bob];
@@ -1599,8 +1741,10 @@ function drawFighter(ctx, fighter, index, groundY, tick, reducedMotion = false,
   if (wanderer) drawWandererCape(ctx, shoulder, fighter, facing, tick,
     reducedMotion, defeated, wandererPalette);
 
-  const rearElbow = kicking ? [-13 + lean * .5, -65 - bob] : [-13 + lean * .5, -55 - bob];
-  const rearHand = kicking ? [-8 + lean * .4, -75 - bob]
+  const rearElbow = waveCasting ? [10 + lean * .4, -61 - bob]
+    : kicking ? [-13 + lean * .5, -65 - bob] : [-13 + lean * .5, -55 - bob];
+  const rearHand = waveCasting ? [31 + lean * .3, -49 - bob]
+    : kicking ? [-8 + lean * .4, -75 - bob]
     : [-19 + lean * .42, attacking ? -36 - bob : -39 - bob];
   bone(ctx, [shoulder, rearElbow, rearHand], outline, core, 4.2);
 
@@ -1676,11 +1820,13 @@ function drawFighter(ctx, fighter, index, groundY, tick, reducedMotion = false,
   const reach = strikeActive ? 25 + 25 * clamp((attackTick - strike.activeFrom + 1) / 2, 0, 1)
     : recovery ? 50 - 28 * recovery : 12;
   const armHeight = attackStage === 2 ? -4 : attackStage === 3 ? 5 : 0;
-  const frontElbow = kicking ? [15 + lean * .3, -64 - bob]
+  const frontElbow = waveCasting ? [22 + lean * .3, -63 - bob]
+    : kicking ? [15 + lean * .3, -64 - bob]
     : spearing ? [14 + lean * .3, -68 - bob]
     : bossWindup ? [-3 + lean * .5, -72 - bob]
     : attacking ? [12 + reach * .23 + lean * .35, -68 - bob + armHeight * .5] : [15 + lean * .5, -55 - bob];
-  const frontHand = kicking ? [20 + lean * .25, -80 - bob]
+  const frontHand = waveCasting ? [41 + lean * .2, -50 - bob]
+    : kicking ? [20 + lean * .25, -80 - bob]
     : spearing ? [26 + lean * .2, -65 - bob]
     : bossWindup ? [-12 + lean * .5, -57 - bob]
     : attacking ? [reach, -63 - bob + armHeight] : [22 + lean * .4, -39 - bob];
@@ -1982,9 +2128,16 @@ export function createRenderer(canvas) {
       return;
     }
     if (type === 'special-wave') {
-      rings.push({ x, y, born: stamp, life: reducedMotion ? 290 : 560,
-        radius: clamp(Math.max(number(event.radius, W), worldWidth), 160, worldWidth + 200),
-        color: '#dffff8', tint: SPIRIT_TINTS[sceneTheme], calm: reducedMotion, type });
+      const source = lastFighters.get(String(event.source))?.fighter;
+      const facing = number(event.facing, number(source?.facing, 1)) < 0 ? -1 : 1;
+      // The event may precede the first 1920px render; keep its reported
+      // world position instead of clipping it to the default 960px viewport.
+      const castX = clamp(number(event.x, x), -50, Math.max(worldWidth + 50, 4096));
+      rings.push({ x: castX, y, facing, born: stamp,
+        life: reducedMotion ? SPIRIT_BEAM_CALM_MS : SPIRIT_BEAM_MS,
+        radius: clamp(Math.max(number(event.radius, W), worldWidth), 160,
+          Math.max(worldWidth + 200, 4096)),
+        tint: SPIRIT_TINTS[sceneTheme], calm: reducedMotion, type });
       if (!reducedMotion) {
         shakeStrength = 3.5;
         shakeUntil = stamp + 120;
@@ -2023,7 +2176,10 @@ export function createRenderer(canvas) {
     const heavy = type === 'hit' && Boolean(event.heavy);
     const specialHit = type === 'hit' && event.special === true;
     const fallingImpact = type === 'fall-impact';
-    const facing = number(event.facing, 1) < 0 ? -1 : 1;
+    const targetX = specialHit ? clamp(number(event.x, x), -50, Math.max(worldWidth + 50, 4096)) : x;
+    const source = specialHit ? lastFighters.get(String(event.source))?.fighter : null;
+    const facing = specialHit ? targetX < number(source?.x, targetX) ? -1 : 1
+      : number(event.facing, 1) < 0 ? -1 : 1;
     if (type === 'hit' && !specialHit && event.delivery !== 'spear'
       && !String(event.source ?? '').startsWith('hazard:')) {
       const source = lastFighters.get(String(event.source))?.fighter;
@@ -2038,7 +2194,7 @@ export function createRenderer(canvas) {
     }
     // The jump-kick event is emitted on its first damaging frame. Its origin
     // is the fighter's torso, so shift only the decoration toward the foot.
-    const fx = ultimate ? clamp(x + facing * 84, 0, worldWidth) : x;
+    const fx = ultimate ? clamp(x + facing * 84, 0, worldWidth) : targetX;
     const fy = ultimate ? clamp(y + 10, 0, H) : y;
     const count = reducedMotion ? 5 : ultimate ? 20
       : specialHit ? 11 : fallingImpact ? 8 : heavy ? 18
@@ -2067,7 +2223,9 @@ export function createRenderer(canvas) {
     rings.push({ x: fx, y: fy, born: stamp,
       life: ultimate ? 320 : fallingImpact ? 220 : type === 'kick' ? 190 : type === 'hit' ? 250 : 300,
       radius: ultimate ? 66 : fallingImpact ? 28 : heavy ? 57 : type === 'hit' ? 43 : type === 'kick' ? 25 : 34,
-      color: palette[0], type, facing });
+      color: palette[0], type: specialHit ? 'special-hit' : type, facing,
+      tint: specialHit ? SPIRIT_TINTS[sceneTheme] : undefined,
+      calm: specialHit && reducedMotion });
     if (!reducedMotion && (type === 'hit' || ultimate)) {
       shakeStrength = ultimate ? 4 : clamp(3 + number(event.damage) * .13, 3, heavy ? 8 : 7);
       shakeUntil = stamp + (ultimate ? 150 : 220);
@@ -2083,50 +2241,7 @@ export function createRenderer(canvas) {
       const progress = (time - item.born) / item.life;
       if (progress >= 1) { rings.splice(i, 1); continue; }
       if (item.type === 'special-wave') {
-        const calm = reducedMotion || item.calm;
-        const radius = calm ? 74 : 18 + item.radius * (1 - (1 - progress) ** 2.4);
-        const crest = clamp(1 - progress / (calm ? .85 : .38), 0, 1);
-        ctx.save();
-        ctx.globalCompositeOperation = 'screen';
-        // Damage resolves at cast time. A local crest confirms it immediately;
-        // a thin ring then carries the wave through the world without a
-        // repeated full-viewport flash or an expensive screen-sized bloom.
-        if (!calm && crest > 0) {
-          const glow = ctx.createRadialGradient(item.x, item.y, 4, item.x, item.y, 66);
-          glow.addColorStop(0, 'rgba(198,255,226,.32)');
-          glow.addColorStop(1, 'rgba(116,238,227,0)');
-          ctx.globalAlpha = crest * .42;
-          ellipse(ctx, item.x, item.y, 66, 66, glow);
-        }
-        ctx.globalAlpha = (1 - progress) * (calm ? .66 : .72);
-        ctx.beginPath();
-        ctx.arc(item.x, item.y, radius, 0, TAU);
-        ctx.strokeStyle = '#72e4df';
-        ctx.lineWidth = calm ? 4 : 8 * (1 - progress) + 2.5;
-        ctx.stroke();
-        ctx.beginPath();
-        ctx.arc(item.x, item.y, radius, 0, TAU);
-        ctx.strokeStyle = item.color;
-        ctx.lineWidth = calm ? 2.4 : 3.8 - 1.5 * progress;
-        ctx.stroke();
-        if (crest > 0) {
-          ctx.globalAlpha = crest * (calm ? .7 : .58);
-          ctx.beginPath();
-          ctx.moveTo(item.x - 48, item.y - 8);
-          ctx.bezierCurveTo(item.x - 22, item.y - 46,
-            item.x + 20, item.y - 46, item.x + 48, item.y - 8);
-          ctx.strokeStyle = item.tint;
-          ctx.lineWidth = 2.4;
-          ctx.stroke();
-          ctx.beginPath();
-          ctx.moveTo(item.x - 38, item.y + 22);
-          ctx.bezierCurveTo(item.x - 15, item.y + 39,
-            item.x + 18, item.y + 39, item.x + 40, item.y + 20);
-          ctx.strokeStyle = '#baf5e5';
-          ctx.lineWidth = 1.8;
-          ctx.stroke();
-        }
-        ctx.restore();
+        drawSpiritWave(ctx, item, clamp(progress, 0, 1), worldWidth, reducedMotion);
         continue;
       }
       ctx.save();
@@ -2138,6 +2253,7 @@ export function createRenderer(canvas) {
       ctx.strokeStyle = item.color;
       ctx.lineWidth = item.type === 'ko' || item.type === 'jump-kick' ? 5 - 3 * progress : 3 - 2 * progress;
       ctx.stroke();
+      if (item.type === 'special-hit') drawSpiritHit(ctx, item, progress, reducedMotion);
       if (item.type === 'jump-kick' && !reducedMotion) {
         ctx.translate(item.x, item.y);
         ctx.scale(item.facing, 1);
@@ -2208,6 +2324,12 @@ export function createRenderer(canvas) {
     lastScene = scene;
     sceneTheme = theme;
     worldWidth = Math.max(W, number(arena.width, W));
+    if (firstFrame) {
+      // A cast can arrive before the first frame provides its chapter theme.
+      for (const ring of rings) {
+        if (ring.type === 'special-wave' || ring.type === 'special-hit') ring.tint = SPIRIT_TINTS[theme];
+      }
+    }
     scaleCanvas();
 
     const time = now();

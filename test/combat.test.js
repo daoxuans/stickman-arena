@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import {
   TICK_RATE, CORPSE_SETTLE_TICKS, CORPSE_HOLD_TICKS,
-  SPEAR_WINDUP_TICKS, SPEAR_GRAVITY, SPEAR_MIN_ANGLE, SPEAR_MAX_ANGLE,
+  SPEAR_WINDUP_TICKS, SPEARS_PER_LEVEL, SPEAR_GRAVITY, SPEAR_MIN_ANGLE, SPEAR_MAX_ANGLE,
   createFighter,
   createCombatState, createDuelState, stepCombat, aiInput, attackOf, kickOf,
   cancelSpearAim, spearOrigin, spearFlight, spearAimedFlight, spearTrajectoryPoint,
@@ -32,6 +32,7 @@ function fallingHazard(overrides = {}) {
 test('duel uses a symmetric arena and a 99-second fixed-step clock', () => {
   const state = createDuelState('ocean');
   assert.equal(TICK_RATE, 60);
+  assert.equal(Object.hasOwn(state, 'spearRemaining'), false, 'duels have no campaign spear allowance');
   assert.equal(state.arena.theme, 'ocean');
   assert.equal(state.timerTicks, 99 * TICK_RATE);
   assert.deepEqual(state.fighters.map(({ id, hp }) => [id, hp]), [['p1', 100], ['p2', 100]]);
@@ -869,15 +870,16 @@ test('level 55 heavy keeps moving toward the ground target after its first high 
   assert.equal(result.enemy.hp, result.enemy.maxHp);
 });
 
-test('an unlimited campaign spear first aims, then fires only after a fresh confirmation', () => {
+test('a campaign spear spends one of five throws only when it actually launches', () => {
   const state = sparring(520);
   const [hero, enemy] = state.fighters;
-  assert.equal(Object.hasOwn(hero, 'spearCharges'), false);
+  assert.equal(state.spearRemaining, SPEARS_PER_LEVEL);
   const events = [];
   stepCombat(state, { hero: { spear: true } });
   events.push(...state.events);
   assert.equal(hero.spearAiming, true);
   assert.equal(hero.spearWindup, 0);
+  assert.equal(state.spearRemaining, SPEARS_PER_LEVEL, 'aiming does not spend a throw');
   assert.ok(state.events.some((entry) => entry.type === 'spear-aim'));
   for (let frame = 0; frame < SPEAR_WINDUP_TICKS + 5; frame++) {
     stepCombat(state, { hero: { spear: true } });
@@ -891,11 +893,13 @@ test('an unlimited campaign spear first aims, then fires only after a fresh conf
   assert.equal(hero.spearAiming, false);
   assert.equal(hero.spearWindup, SPEAR_WINDUP_TICKS - 1);
   assert.ok(state.events.some((entry) => entry.type === 'spear-windup'));
+  assert.equal(state.spearRemaining, SPEARS_PER_LEVEL, 'confirming the windup does not spend a throw');
   for (let frame = 0; frame < SPEAR_WINDUP_TICKS + 35; frame++) {
     stepCombat(state, { hero: { spear: true } });
     events.push(...state.events);
   }
   assert.equal(events.filter((entry) => entry.type === 'spear-throw').length, 1);
+  assert.equal(state.spearRemaining, SPEARS_PER_LEVEL - 1);
   assert.equal(events.filter((entry) => entry.type === 'spear-impact').length, 1);
   assert.equal(events.filter((entry) => entry.type === 'hit' && entry.source === 'hero').length, 1);
   assert.equal(events.find((entry) => entry.type === 'hit' && entry.source === 'hero').delivery, 'spear',
@@ -908,7 +912,42 @@ test('an unlimited campaign spear first aims, then fires only after a fresh conf
   stepCombat(state, { hero: { spear: false } });
   stepCombat(state, { hero: { spear: true } });
   assert.ok(state.events.some((entry) => entry.type === 'spear-windup'));
+  assert.equal(state.spearRemaining, SPEARS_PER_LEVEL - 1);
   assert.equal(hero.spearCooldown, 0);
+});
+
+test('five launches exhaust the room allowance, while held or extra spear inputs never fire a sixth', () => {
+  const state = sparring(800);
+  const hero = state.fighters[0];
+  state.fighters[1].hp = 0; // Keep every flight independent of enemy hitstop.
+  let thrown = 0;
+  for (let use = 0; use < SPEARS_PER_LEVEL; use++) {
+    stepCombat(state, { hero: { spear: true } });
+    assert.equal(hero.spearAiming, true, `throw ${use + 1} begins with an aim`);
+    assert.equal(state.spearRemaining, SPEARS_PER_LEVEL - use);
+    stepCombat(state, { hero: { spear: false } });
+    stepCombat(state, { hero: { spear: true } });
+    assert.ok(hero.spearWindup > 0);
+    assert.equal(state.spearRemaining, SPEARS_PER_LEVEL - use);
+    for (let frame = 1; frame < SPEAR_WINDUP_TICKS; frame++) {
+      stepCombat(state, { hero: { spear: true } });
+      thrown += state.events.filter((entry) => entry.type === 'spear-throw').length;
+    }
+    assert.equal(thrown, use + 1, 'a windup produces exactly one projectile');
+    assert.equal(state.spearRemaining, SPEARS_PER_LEVEL - use - 1);
+    stepCombat(state, { hero: { spear: true } });
+    assert.equal(hero.spearAiming, false, 'holding I does not start another aim');
+    stepCombat(state, { hero: { spear: false } });
+  }
+  for (let frame = 0; frame < 30; frame++) {
+    stepCombat(state, { hero: { spear: frame % 2 === 0 } });
+    assert.equal(hero.spearAiming, false, 'zero remaining cannot enter aim');
+    assert.equal(hero.spearWindup, 0);
+    assert.equal(state.spearRemaining, 0);
+    assert.ok(!state.events.some((entry) => entry.type === 'spear-aim'
+      || entry.type === 'spear-windup' || entry.type === 'spear-throw'));
+  }
+  assert.equal(state.projectileSerial, SPEARS_PER_LEVEL);
 });
 
 test('near, middle and distant throws follow visible parabolic arcs and still hit', () => {
@@ -1027,6 +1066,7 @@ test('cancel, punch, kick, jump and dodge leave aim without throwing; a new pres
     assert.equal(hero.spearAiming, false, `${action} cancels the unconfirmed aim`);
     assert.equal(hero.spearWindup, 0);
     assert.equal(state.projectiles.length, 0);
+    assert.equal(state.spearRemaining, SPEARS_PER_LEVEL, `${action} does not spend an unthrown spear`);
     assert.ok(state.events.some((entry) => entry.type === 'spear-aim-cancel'), `${action} has a HUD cue`);
     if (action === 'attack') assert.equal(hero.attackStage, 1);
     if (action === 'kick') assert.equal(hero.kickType, 'ground');
@@ -1039,13 +1079,14 @@ test('cancel, punch, kick, jump and dodge leave aim without throwing; a new pres
   stepCombat(state, { hero: { spear: true } });
   const tick = state.tick;
   assert.equal(cancelSpearAim(hero), true, 'blur can discard a pending aim without a simulation step');
+  assert.equal(state.spearRemaining, SPEARS_PER_LEVEL);
   assert.equal(state.tick, tick);
   assert.equal(cancelSpearAim(hero), false);
   stepCombat(state, { hero: { spear: true } });
   assert.equal(hero.spearAiming, false, 'holding the original press does not restart');
   stepCombat(state);
   stepCombat(state, { hero: { spear: true } });
-  assert.equal(hero.spearAiming, true, 'release and fresh press reopens unlimited aim');
+  assert.equal(hero.spearAiming, true, 'release and fresh press reopens aim while ammo remains');
   stepCombat(state, { hero: { spear: false, aimCancel: true } });
   stepCombat(state, { hero: { spear: true, aimCancel: true } });
   assert.equal(hero.spearAiming, false, 'cancel and I in the same tick must not reopen the aim');
@@ -1065,6 +1106,7 @@ test('a moving or jumping target cannot silently redirect a telegraphed spear', 
   }
   const thrown = state.events.find((entry) => entry.type === 'spear-throw');
   assert.ok(thrown);
+  assert.equal(state.spearRemaining, SPEARS_PER_LEVEL, 'an enemy throw never spends hero ammo');
   assert.ok(hero.x - warning.targetX > 65, 'the player has left the warned lane');
   assert.ok(warning.targetY - (hero.y - hero.height * 0.57) > 50,
     'the player has also jumped above the warned height');
@@ -1119,7 +1161,7 @@ test('a hit cancels aim, an interrupted windup can be retried, and dodge absorbs
   while (hero.stun > 0 || state.hitstop > 0) stepCombat(state);
   stepCombat(state, { hero: { spear: true } });
   assert.ok(state.events.some((entry) => entry.type === 'spear-aim'),
-    'a new press after recovery starts aiming without a consumable resource');
+    'a new press after recovery starts aiming without spending for the interrupted attempt');
   stepCombat(state);
   stepCombat(state, { hero: { spear: true } });
   assert.ok(state.events.some((entry) => entry.type === 'spear-windup'));
@@ -1134,6 +1176,7 @@ test('a hit cancels aim, an interrupted windup can be retried, and dodge absorbs
   stepCombat(state);
   assert.equal(hero.spearWindup, 0, 'a new punch interrupts the committed throw');
   assert.equal(state.projectiles.length, 0);
+  assert.equal(state.spearRemaining, SPEARS_PER_LEVEL, 'a hit during windup spends no spear');
 
   const guarded = sparring(350);
   const target = guarded.fighters[1];
@@ -1170,6 +1213,7 @@ test('KO clears a pending aim or windup without launching a late projectile', ()
     assert.equal(hero.spearWindup, 0);
     assert.equal(hero.spearLaunchFacing, null);
     assert.equal(state.projectiles.length, 0);
+    assert.equal(state.spearRemaining, SPEARS_PER_LEVEL, 'KO cannot spend an unthrown spear');
     assert.ok(state.events.some((entry) => entry.type === 'ko' && entry.target === hero.id));
   }
 });

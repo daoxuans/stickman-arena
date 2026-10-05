@@ -229,7 +229,7 @@ export class CampaignSession {
       target.grounded = false;
       return { target: target.id, x: target.x, y: target.y - target.height * .57, damage: before - target.hp };
     });
-    return { x: player.x, y: player.y - player.height * .52, hits };
+    return { hits };
   }
 
   #beginAftermath(player) {
@@ -310,7 +310,8 @@ export class CampaignSession {
     if (special) {
       this.combat.events.push({
         id: `${this.combat.tick}:special-wave`, type: 'special-wave',
-        x: special.x, y: special.y, source: player.id, radius: this.combat.arena.width,
+        x: player.x, y: player.y - player.height * .52, source: player.id,
+        facing: player.facing < 0 ? -1 : 1, radius: this.combat.arena.width,
       });
       for (const hit of special.hits) {
         this.combat.events.push({
@@ -391,6 +392,7 @@ export class CampaignSession {
       specialEligible: this.specialEligible,
       specialKills: this.specialKills,
       specialCharges: this.specialCharges,
+      spearRemaining: this.combat?.spearRemaining ?? 0,
       aftermathRemainingTicks: this.phase === 'aftermath'
         ? Math.max(0, this.aftermathUntilTick - this.combat.motionTick) : 0,
       progress: { ...this.progress, cleared: [...this.progress.cleared] },

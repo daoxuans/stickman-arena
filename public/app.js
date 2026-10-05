@@ -1,4 +1,4 @@
-import { cancelSpearAim, createDuelState, SPEAR_MAX_ANGLE, SPEAR_MIN_ANGLE,
+import { cancelSpearAim, createDuelState, SPEARS_PER_LEVEL, SPEAR_MAX_ANGLE, SPEAR_MIN_ANGLE,
   TICK_RATE } from '../shared/combat.js';
 import { LEVELS, MAX_LEVEL, THEMES, getLevel } from '../shared/levels.js';
 import { CampaignSession } from './campaign.js';
@@ -14,7 +14,8 @@ const IDS = [
   'room-code', 'room-input', 'create-room', 'join-room', 'copy-room',
   'room-message', 'leave-room', 'rematch', 'sound-toggle', 'toast',
   'special-status', 'special-key-guide', 'special-button',
-  'spear-status', 'spear-key-guide', 'spear-button', 'spear-aim-controls', 'spear-angle',
+  'spear-status', 'spear-key-guide', 'spear-guide-remaining',
+  'spear-button', 'spear-aim-controls', 'spear-angle',
   'aim-up-button', 'aim-down-button', 'aim-cancel-button', 'touch-tip',
 ];
 const ui = Object.fromEntries(IDS.map((id) => [id, document.getElementById(id)]));
@@ -361,8 +362,9 @@ function queueCampaignPress(button) {
     && (campaignView.phase === 'playing' || (campaignView.phase === 'aftermath' && button === 'jump'))
     && campaignActions.has(button)) {
     // Keep distinct I taps even when both land between two simulation frames.
-    if (button === 'spear') pendingSpearPresses = Math.min(2, pendingSpearPresses + 1);
-    else {
+    if (button === 'spear') {
+      if (campaignView.spearRemaining > 0) pendingSpearPresses = Math.min(2, pendingSpearPresses + 1);
+    } else {
       // A cancellation must also discard a second I tap still waiting behind
       // the release tick, otherwise it can silently start a new aim afterward.
       if (['aimCancel', 'jump', 'attack', 'kick', 'dodge'].includes(button)) pendingSpearPresses = 0;
@@ -540,7 +542,7 @@ function drawMap() {
 
 function updateCampaignHud() {
   const { level, combat, progress, waveNumber, waveCount,
-    specialEligible, specialCharges, specialKills } = campaignView;
+    specialEligible, specialCharges, specialKills, spearRemaining } = campaignView;
   const hero = combat?.fighters.find((fighter) => fighter.team === 0);
   const opponents = combat?.fighters.filter((fighter) => fighter.team === 1 && fighter.hp > 0) ?? [];
   const opponent = opponents[0];
@@ -566,26 +568,31 @@ function updateCampaignHud() {
   ui['spear-status'].hidden = false;
   ui['spear-key-guide'].hidden = false;
   ui['spear-button'].hidden = false;
+  const count = `${spearRemaining}/${SPEARS_PER_LEVEL}`;
+  if (ui['spear-guide-remaining'].textContent !== count) ui['spear-guide-remaining'].textContent = count;
   const active = campaignView.phase === 'playing' && !campaignPaused && hero?.hp > 0;
   const aiming = active && hero.spearAiming === true;
   const winding = active && hero.spearWindup > 0;
   const busy = hero && (hero.stun > 0 || hero.attackStage > 0 || hero.kickType
     || hero.dodgeTicks > 0);
   const spearText = campaignView.phase === 'aftermath'
-    ? '胜利收尾 · 退开再走过倒地敌人，落稳后约 3 秒结算'
+    ? `胜利收尾 · 投矛剩余 ${count}，退开再走过倒地敌人`
     : aiming
-    ? '瞄准中 · ↑↓ / W S 或上下拖动调角，再按 I 发射，Esc 取消'
-    : winding ? '投矛蓄势中 · 被击中会打断'
-      : busy ? '投矛不限次数 · 出招结束后按 I 瞄准'
-        : '投矛不限次数 · 按 I 瞄准，再按 I 发射';
+    ? `投矛剩余 ${count} · 瞄准中，用 ↑↓ / W S 或上下拖动调角，再按 I 发射，Esc 取消`
+    : winding ? `投矛剩余 ${count} · 蓄势中，实际投出才扣次；被击中会打断`
+      : spearRemaining === 0 ? `投矛已用尽（${count}）· 下一关或失败回档重试后恢复`
+        : busy ? `投矛剩余 ${count} · 出招结束后按 I 瞄准`
+          : `投矛剩余 ${count} · 按 I 瞄准，再按 I 发射`;
   if (ui['spear-status'].textContent !== spearText) ui['spear-status'].textContent = spearText;
-  ui['spear-status'].classList.toggle('is-ready', active && !busy && !winding);
+  ui['spear-status'].classList.toggle('is-ready', active && spearRemaining > 0 && !busy && !winding);
   ui['spear-status'].classList.toggle('is-aiming', aiming);
-  ui['spear-button'].textContent = aiming ? '发射' : winding ? '蓄势中' : '投矛';
-  ui['spear-button'].disabled = !active || winding || (!aiming && Boolean(busy));
+  ui['spear-button'].textContent = aiming ? `发射 ×${spearRemaining}`
+    : winding ? `蓄势 ×${spearRemaining}` : `投矛 ×${spearRemaining}`;
+  ui['spear-button'].disabled = !active || spearRemaining === 0 || winding || (!aiming && Boolean(busy));
   ui['spear-button'].setAttribute('aria-label', aiming
-    ? `确认发射投矛，当前仰角 ${Math.round(hero.spearAimAngle)} 度`
-    : winding ? '投矛蓄势中' : '进入投矛瞄准，不限次数');
+    ? `确认投矛，剩余 ${spearRemaining} 次，当前仰角 ${Math.round(hero.spearAimAngle)} 度`
+    : winding ? `投矛蓄势中，剩余 ${spearRemaining} 次，飞出后扣一次`
+      : spearRemaining === 0 ? '本关投矛次数已用尽' : `进入投矛瞄准，剩余 ${spearRemaining} 次`);
   ui['spear-aim-controls'].hidden = !aiming;
   if (aiming) updateAimAngle(hero);
   for (const id of ['aim-up-button', 'aim-down-button', 'aim-cancel-button']) ui[id].disabled = !aiming;
@@ -593,9 +600,10 @@ function updateCampaignHud() {
   ui['touch-tip'].textContent = campaignView.phase === 'aftermath'
     ? '左右走动 · 退开再走过倒地敌人可触发散骨'
     : aiming
-    ? '上下拖动画面或按「抬高/压低」调角 · 点「发射」确认，战斗不会暂停'
-    : winding ? '投矛蓄势中 · 被击中会打断'
-      : '空中按「踢腿」释放跳踢大招 · 投矛先瞄准、再发射';
+    ? `投矛剩余 ${count} · 上下拖动或按「抬高/压低」调角，点「发射」确认`
+    : winding ? `投矛剩余 ${count} · 蓄势中，被击中会打断且不扣次`
+      : spearRemaining === 0 ? `投矛已用尽（${count}）· 空中按「踢腿」释放跳踢大招`
+        : `投矛剩余 ${count} · 空中按「踢腿」释放跳踢大招，投矛先瞄准再发射`;
   for (const button of aftermathActionButtons) button.disabled = campaignView.phase === 'aftermath';
   if (specialEligible) {
     const needed = 2 - (specialKills % 2);
@@ -661,7 +669,7 @@ function campaignOverlay() {
   } else {
     showOverlay({
       title: level.number === 1 && progress.cleared.length === 0 ? '准备开战' : '继续征程',
-      body: `第 ${level.number} / ${MAX_LEVEL} 关 · ${level.themeName}「${level.name}」。A/D 移动，J 攻击，空格跳跃，Shift 闪避。按 I 预览投矛弧线，↑↓ 调角，再按 I 确认发射；Esc 取消。${campaignView.specialEligible ? '每击倒两名敌人可按 L 释放一次无敌光波。' : ''}`,
+      body: `第 ${level.number} / ${MAX_LEVEL} 关 · ${level.themeName}「${level.name}」。A/D 移动，J 攻击，空格跳跃，Shift 闪避。每关最多投矛 ${SPEARS_PER_LEVEL} 次；按 I 预览弧线，↑↓ 调角，再按 I 确认发射，真正投出才扣次；Esc 取消。${campaignView.specialEligible ? '每击倒两名敌人可按 L 释放一次无敌光波。' : ''}`,
       primary: '开始挑战',
       onPrimary: () => { resumeCampaign(); hideOverlay(); },
     });
@@ -682,6 +690,9 @@ function consumeEvents(events) {
     renderer.effect(effect);
     sound.play(effect);
     if (mode === 'campaign' && ['spear-aim-cancel', 'special-wave', 'wave'].includes(effect.type)) {
+      pendingSpearPresses = 0;
+    }
+    if (mode === 'campaign' && effect.type === 'spear-throw' && campaignView.spearRemaining === 0) {
       pendingSpearPresses = 0;
     }
     if (mode === 'campaign' && effect.type === 'special-ready') {
