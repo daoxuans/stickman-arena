@@ -1047,6 +1047,47 @@ test('browser controller boots, switches modes, starts a fight and renders a fra
     assert.equal(elements.get('avatar-open').disabled, false,
       'leaving the room restores local portrait setup in the waiting lobby');
 
+    // An expired waiting-room notice must clear only the room it names, close
+    // the stale waiting overlay, and make both room actions available again.
+    elements.get('create-room').fire('click');
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(socket.sent.at(-1).type, 'create');
+    socket.fire('message', { data: JSON.stringify({ type: 'created', code: '654321', role: 'p1', theme: 'forest' }) });
+    assert.equal(elements.get('duel-theme').value, 'forest', 'the server-confirmed room theme is reflected in the selector');
+    socket.fire('message', { data: JSON.stringify({
+      type: 'room-expired', code: '123456', message: 'old room expired',
+    }) });
+    assert.equal(elements.get('room-code').textContent, '654321', 'an old room expiration cannot clear a newer room');
+    socket.fire('message', { data: JSON.stringify({
+      type: 'room-expired', code: '654321', message: '等待房已过期，请重新创建或加入其他房间',
+    }) });
+    assert.equal(elements.get('room-code').textContent, '—— —— ——');
+    assert.equal(elements.get('screen-overlay').hidden, true, 'expiration closes the old waiting overlay');
+    assert.match(elements.get('room-message').textContent, /等待房已过期/);
+    assert.equal(elements.get('create-room').disabled, false);
+    assert.equal(elements.get('join-room').disabled, false);
+    assert.equal(elements.get('leave-room').hidden, true);
+    assert.equal(elements.get('duel-theme').disabled, false);
+
+    elements.get('create-room').fire('click');
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(socket.sent.at(-1).type, 'create', 'the owner can create a fresh room without manually leaving the expired one');
+    socket.fire('message', { data: JSON.stringify({ type: 'created', code: '765432', role: 'p1', theme: 'city' }) });
+    socket.fire('message', { data: JSON.stringify({
+      type: 'room-expired', code: '654321', message: 'stale expiration',
+    }) });
+    assert.equal(elements.get('room-code').textContent, '765432', 'a delayed expiration cannot evict the replacement room');
+
+    elements.get('leave-room').fire('click');
+    elements.get('duel-theme').value = 'land';
+    socket.fire('message', { data: JSON.stringify({ type: 'joined', code: '876543', role: 'p2', theme: 'ocean' }) });
+    assert.equal(elements.get('duel-theme').value, 'ocean', 'P2 sees the host-selected theme instead of its old local choice');
+    assert.equal(elements.get('duel-theme').disabled, true);
+    elements.get('duel-theme').value = 'land';
+    socket.fire('message', { data: JSON.stringify({ type: 'start', code: '876543', role: 'p2', theme: 'ocean' }) });
+    assert.equal(elements.get('duel-theme').value, 'ocean', 'the start packet also restores the authoritative theme');
+    elements.get('leave-room').fire('click');
+
     // A single-enemy room must stay walkable after the real final KO so the
     // player can pass the fallen enemy before the clear panel takes over.
     elements.get('campaign-button').fire('click');

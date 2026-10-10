@@ -1687,6 +1687,13 @@ function previewDuel() {
   updateDuelHud();
 }
 
+function syncDuelTheme(theme) {
+  if (!Object.hasOwn(THEMES, theme)) return false;
+  duel.theme = theme;
+  if (themeSelect) themeSelect.value = theme;
+  return true;
+}
+
 function send(message) {
   if (duel.socket?.readyState !== WebSocket.OPEN) return false;
   duel.socket.send(JSON.stringify(message));
@@ -1732,14 +1739,14 @@ function handleServerMessage(message) {
     send({ type: 'leave' });
     return;
   }
-  if (['waiting', 'countdown', 'start', 'state', 'finished', 'rematch', 'peer-left'].includes(message.type)
+  if (['waiting', 'countdown', 'start', 'state', 'finished', 'rematch', 'peer-left', 'room-expired'].includes(message.type)
     && message.code !== duel.code) return;
   switch (message.type) {
     case 'created':
     case 'joined':
       duel.code = message.code;
       duel.role = message.role;
-      duel.theme = message.theme;
+      syncDuelTheme(message.theme);
       duel.phase = 'waiting';
       releaseInput();
       ui['room-message'].textContent = `房间 ${message.code} · ${message.role === 'p1' ? '已创建，等待朋友加入' : '已加入，准备开战'}`;
@@ -1774,7 +1781,7 @@ function handleServerMessage(message) {
       releaseInput();
       duel.phase = 'playing';
       duel.role = message.role;
-      duel.theme = message.theme;
+      syncDuelTheme(message.theme);
       duel.inputSeq = 0;
       duel.lastInputAt = 0;
       duel.seenEvents.clear();
@@ -1851,6 +1858,11 @@ function handleServerMessage(message) {
       break;
     case 'left':
       resetDuelRoom();
+      if (mode === 'duel') hideOverlay();
+      break;
+    case 'room-expired':
+      resetDuelRoom();
+      ui['room-message'].textContent = message.message || '等待房已过期，请重新创建或加入其他房间。';
       if (mode === 'duel') hideOverlay();
       break;
     case 'error':

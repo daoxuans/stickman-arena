@@ -5,7 +5,7 @@
 ## 开工前先读
 
 1. [README.md](README.md)：启动、操作、局域网使用和安全边界。
-2. [现行版 PRD](outputs/PRD-火柴人竞技场-20261004.md)：关卡、状态、字段、验收项和已知差异 G-01/G-02。它描述当前实现，待确认问题不是默认开发任务。
+2. [现行版 PRD](outputs/PRD-火柴人竞技场-20261004.md)：关卡、状态、字段、验收项和 G-01/G-02 历史缺陷回归口径。它描述当前实现，待确认问题不是默认开发任务。
 3. [架构与数据边界](docs/ARCHITECTURE.md) 和 [设计基线](docs/DESIGN_BASELINE.md)：定位模块、保留现有视觉语言。
 4. [决策记录](docs/DECISIONS.md) 与 [协作流程](CONTRIBUTING.md)：区分用户明确要求、代码现状和未决事项。
 
@@ -28,7 +28,7 @@
 - 用户明确要求低音量背景音乐且不可盖过击打音效；四主题短循环、独立低音量音乐支路及命中/KO 时短暂压低音乐为本版实现选择，不是用户逐项指定。音乐与音效共用页头“声音”开关和首次用户手势限制；只在闯关战斗/末敌收尾或联机正式对战播放，联机随房主主题。结算只停音乐及其声部，不截断已触发的 KO 番茄/结果短音；失焦/隐藏、静音或切模式/切局才清理旧场景所有声音尾音。合成音乐无需外部文件，不进入固定帧判定、房间协议或存档；原有击打声的并发容量不能被循环音乐挤占。自动化检查不等于真实扬声器/耳机/手机音量已试听。
 - 联机为一房两人、服务端判定生命和胜负；房主离开关闭房间，加入者离开使房主返回等待，重赛须双方同意。闯关进度及正式背包只在本浏览器，联机房间只在服务运行期；不要把这两类状态混用。
 - 共享战斗计算使用固定步长并可重放；不要在核心判定中引入随机数、DOM 或真实墙钟。画面平滑可以由客户端处理，但 PvP 命中、生命和胜负由服务判定。
-- 当前没有账号认证、TLS、公网部署承诺、云存档、未通关跳关或断线续局。已通关临时重打不构成正式回档进度变更。PRD 的 G-01/G-02 是待修的现状差异，不是推荐交互。
+- 当前没有账号认证、TLS、公网部署承诺、云存档、未通关跳关或断线续局。已通关临时重打不构成正式回档进度变更。PRD 的 G-01/G-02 已修复并由回归测试守护；它们记录的是缺陷处置，不是其他功能的交互先例。
 
 ## 改动落点与验证
 
@@ -38,7 +38,7 @@
 | 战斗/AI/动效 | `shared/combat.js`、`public/render.js`、`public/app.js` | `test/combat.test.js`、`test/render.test.js`、`test/sound.test.js`、尸体散骨的有效帧/镜头/减少动态效果、设计基线 |
 | Boss 装备/背包 | `shared/equipment.js`、`shared/combat.js`、`public/campaign.js`、`public/app.js`、`public/render.js`、`public/index.html`、`public/styles.css` | `test/equipment.test.js`、`test/campaign.test.js`、`test/bootstrap.test.js`、`test/render.test.js`；九 Boss 保底/去重、Boss 真 KO 时仅本人召唤兵同步 KO 且不影响预设敌/其他来源、仍有其他活敌须清空、移动平台与世界镜头、过关收纳/回档快照、旧档补发、练习/PvP 隔离、收尾禁用装备技、PRD/设计基线/决策 D-027/D-030 |
 | 背景音乐/混音 | `public/app.js` 的 `SoundEffects` 与 `syncMusic()` | `test/sound.test.js`、四主题/房主主题与战斗阶段门控、手势/静音/失焦/切局、打击与 KO 同时发生时的音乐避让；实机音量待试听 |
-| 联机房间/输入/技能与陷阱 | `server/index.js`、`shared/combat.js`、`public/app.js`、`public/render.js`、`public/index.html` | `test/server.test.js`、`test/combat.test.js`、`test/render.test.js`、`test/bootstrap.test.js`；短按/第二次投矛边沿、充能与无敌、双方机关扣血/重赛重置、长世界两端镜头、跨模式/断线边界、PRD |
+| 联机房间/输入/技能与陷阱 | `server/index.js`、`shared/combat.js`、`public/app.js`、`public/render.js`、`public/index.html` | `test/server.test.js`、`test/combat.test.js`、`test/render.test.js`、`test/bootstrap.test.js`；短按/第二次投矛边沿、充能与无敌、双方机关扣血/重赛重置、长世界两端镜头、等待房过期释放会话/拒绝旧码/房主重建、旧过期事件隔离、P2 主题同步、跨模式/断线边界、PRD |
 | 页面样式/触控/本地头像 | `public/index.html`、`public/styles.css`、`public/app.js`、`public/avatar.js`、`public/render.js` | `test/bootstrap.test.js`、`test/avatar.test.js`、`test/render.test.js`、上传/拍照失败、联机仅本端头像、桌面/窄屏/减少动态效果检查、设计基线 |
 
 运行 `npm ci`（首次安装）、`npm test`、`git diff --check`。受限 Windows 终端若测试运行器启动子进程时报 `spawn EPERM`，可使用 README 记录的 `node --test --test-isolation=none`，并在交接中注明采用的命令。视觉或操作变更在浏览器可用时做手动走查；若环境受阻，明确标记未验证。单元测试通过不等于跨设备手感或公网稳定性已验证。

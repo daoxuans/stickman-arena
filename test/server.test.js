@@ -159,6 +159,29 @@ test('creates six-digit room codes and synchronizes two players from one authori
   assert.ok(kicked.state.fighters[0].kickType, 'valid kick input should reach the authoritative simulation');
 });
 
+test('expires idle waiting rooms, rejects the old code, and lets the owner create another room', async (t) => {
+  const game = await createTestServer(t, { waitingRoomTimeoutMs: 50 });
+  const owner = await connect(game.port);
+  const guest = await connect(game.port);
+
+  owner.send({ type: 'create', theme: 'forest' });
+  const original = await owner.inbox.next((message) => message.type === 'created');
+  await owner.inbox.next((message) => message.type === 'waiting' && message.code === original.code);
+
+  const expired = await owner.inbox.next((message) => message.type === 'room-expired');
+  assert.equal(expired.code, original.code);
+  assert.match(expired.message, /等待房已过期/);
+
+  guest.send({ type: 'join', code: original.code });
+  assert.equal((await guest.inbox.next((message) => message.type === 'error')).message, '房间不存在或已结束');
+
+  owner.send({ type: 'create', theme: 'ocean' });
+  const replacement = await owner.inbox.next((message) => message.type === 'created');
+  assert.equal(replacement.role, 'p1');
+  assert.equal(replacement.theme, 'ocean');
+  await owner.inbox.next((message) => message.type === 'waiting' && message.code === replacement.code);
+});
+
 test('a press released between simulation ticks still triggers each edge-based action once', async (t) => {
   for (const [key, activated] of [
     ['kick', (state) => state.fighters[0].kickType === 'ground'

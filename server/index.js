@@ -14,6 +14,7 @@ const projectRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '
 const publicRoot = path.join(projectRoot, 'public');
 const sharedRoot = path.join(projectRoot, 'shared');
 const themes = new Set(['forest', 'city', 'ocean', 'land']);
+const DEFAULT_WAITING_ROOM_TIMEOUT_MS = 15 * 60_000;
 const inputKeys = ['left', 'right', 'jump', 'attack', 'kick', 'dodge',
   'spear', 'aimUp', 'aimDown', 'aimCancel', 'special'];
 const inputFields = new Set([...inputKeys, 'aimAngle']);
@@ -175,8 +176,9 @@ function validateInput(input) {
 
 /**
  * Create a local HTTP + WebSocket game server.
- * countdownSeconds and roundSeconds are configurable so integration tests do
- * not need to wait through a full match; normal play uses three/99 seconds.
+ * countdownSeconds, roundSeconds, and waitingRoomTimeoutMs are configurable so
+ * integration tests do not need to wait through a full match or idle timeout;
+ * normal play uses three/99 seconds and a 15-minute waiting-room timeout.
  */
 export async function createGameServer({
   port = 0,
@@ -184,6 +186,7 @@ export async function createGameServer({
   tickRate = TICK_RATE,
   countdownSeconds = 3,
   roundSeconds = 99,
+  waitingRoomTimeoutMs = DEFAULT_WAITING_ROOM_TIMEOUT_MS,
 } = {}) {
   if (!Number.isInteger(port) || port < 0 || port > 65535) throw new RangeError('Invalid port');
   if (typeof host !== 'string' || !host) throw new TypeError('Invalid host');
@@ -193,6 +196,9 @@ export async function createGameServer({
   }
   if (!Number.isFinite(roundSeconds) || roundSeconds <= 0 || roundSeconds > 600) {
     throw new RangeError('Invalid round duration');
+  }
+  if (!Number.isFinite(waitingRoomTimeoutMs) || waitingRoomTimeoutMs <= 0) {
+    throw new RangeError('Invalid waiting room timeout');
   }
 
   const rooms = new Map();
@@ -474,10 +480,18 @@ export async function createGameServer({
     let steps = 0;
     while (accumulated >= frameMs && steps < 5) {
       for (const room of rooms.values()) {
-        if (room.phase === 'waiting' && now - room.lastActivity > 15 * 60_000) {
-          send(room.p1, { type: 'error', message: '房间已过期，请重新创建' });
+        if (room.phase === 'waiting' && now - room.lastActivity > waitingRoomTimeoutMs) {
+          send(room.p1, {
+            type: 'room-expired',
+            code: room.code,
+            message: '等待房已过期，请重新创建或加入其他房间',
+          });
           const owner = sessions.get(room.p1);
-          if (owner) { owner.room = null; owner.role = null; }
+          if (owner) {
+            owner.room = null;
+            owner.role = null;
+            owner.lastSeq = -1;
+          }
           rooms.delete(room.code);
           continue;
         }
